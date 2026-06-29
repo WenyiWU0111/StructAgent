@@ -29,3 +29,7 @@ evaluation_examples/settings/googledrive/client_secrets.json
 evaluation_examples/settings/googledrive/credentials.json
 
 # NOTE: evaluation_examples/examples/mind2web/ IS tracked (vendored tasks).
+
+# memory-bank packaging (upload tarball to HF, do not commit)
+_membank_stage/
+structagent_memory.tar.gz

@@ -57,10 +57,16 @@ Set any of these to `0` to ablate that component.
 | `ENABLE_VERIFIER_EXPERIENCE_MEMORY` | `0` | retrieve verification recipes into the ledger initializer |
 | `MEMORY_TOP_K` | `10` | retrieval depth |
 
-> **Memory requires prebuilt FAISS banks** (mined offline from a trajectory pool)
-> that are **not shipped** in this repo. With `MEMORY=on` but no banks, retrieval
-> degrades silently to no-op (the agent still runs, just without retrieved advice).
-> See *Building memory banks* below.
+> **Memory requires prebuilt FAISS banks** (mined offline from solved
+> trajectories, ~64 MB). They are hosted on Hugging Face, not committed to git.
+> Download them once:
+> ```bash
+> pip install huggingface_hub
+> python scripts/download_memory.py            # installs into results/
+> MEMORY=on bash scripts/run.sh                # then enable
+> ```
+> With `MEMORY=on` but no banks, retrieval degrades silently to no-op (the agent
+> still runs, just without retrieved hints).
 
 ## Ablations (advanced)
 
@@ -71,12 +77,17 @@ Set any of these to `0` to ablate that component.
 | `ENABLE_DOMAIN_CODING_GATE` | `0` | bar GUI-only domains from shell/file actions |
 | `QWEN35_THINKING` | `0` | enable Qwen3.5 reasoning mode (slower, more tokens) |
 
-## Building memory banks
+## Memory banks: download or build
 
-The memory banks are built offline from successful trajectories with the tools
+**Download (recommended):** `python scripts/download_memory.py` fetches the
+prebuilt banks from Hugging Face and installs them under `results/`
+(`unified_memory/`, `planner_experience/`, `verifier_memory/`). Point it at a
+custom repo with `--repo <user>/structagent-memory`.
+
+**Build your own:** from a pool of solved trajectories, run the offline pipeline
 under [`mm_agents/structagent/memory/offline/`](../mm_agents/structagent/memory/offline/)
-(load pool → cluster → polish L1/L2/L3 → build FAISS indexes). They are written
-under `results/` and read at runtime via `results/planner_experience/` and
-`results/unified_memory/`. If you have your own pool of solved tasks, run that
-pipeline; otherwise leave memory off — it does not affect correctness, only the
+(load pool → cluster → polish L1/L2/L3 → build FAISS indexes); outputs land under
+`results/` at the same paths the runtime reads.
+
+Either way, memory is **optional** — it does not affect correctness, only the
 quality of retrieved hints.

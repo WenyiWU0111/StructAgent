@@ -107,8 +107,9 @@ MODEL=vllm_qwen35-vl VERIFIER_MODEL=vllm_qwen35-27b MAX_STEPS=50 \
 ```
 
 > Running the paper's open-model SOTA backbone? Use `MODEL=minimax-m3` (OpenRouter,
-> no GPU). The experience-memory layers are **off by default** because they need
-> prebuilt banks — see [`docs/CONFIG.md`](docs/CONFIG.md).
+> no GPU). The experience-memory layers are **off by default**; download the
+> prebuilt banks (`python scripts/download_memory.py`) and run with `MEMORY=on`
+> to enable them. See [`docs/CONFIG.md`](docs/CONFIG.md).
 
 **4. Inspect results:**
 ```bash
