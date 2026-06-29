@@ -1,0 +1,60 @@
+{
+  "id": "mind2web_domain_Info_Info_58",
+  "snapshot": "chrome",
+  "instruction": "Search for part-time administrative assistant jobs in Miami with a minimum salary of $40k.",
+  "source": "https://www.indeed.com/",
+  "config": [
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "google-chrome",
+          "--remote-debugging-port=1337"
+        ]
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "socat",
+          "tcp-listen:9222,fork",
+          "tcp:localhost:1337"
+        ]
+      }
+    },
+    {
+      "type": "chrome_open_tabs",
+      "parameters": {
+        "urls_to_open": [
+          "https://www.indeed.com/"
+        ]
+      }
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": [
+    "chrome"
+  ],
+  "evaluator": {
+    "func": "llm_judge_webvoyager",
+    "result": {
+      "type": "agent_final_response_and_screenshots"
+    },
+    "expected": {
+      "type": "raw_intent",
+      "intent": "Search for part-time administrative assistant jobs in Miami with a minimum salary of $40k."
+    }
+  },
+  "proxy": true,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low",
+  "_mind2web_meta": {
+    "original_task_id": 58,
+    "split": "test_domain_Info",
+    "sites": [
+      "Info"
+    ],
+    "source_path": "data/benchmarks/mind2web_executable/test_domain_Info/Info_58.json"
+  }
+}

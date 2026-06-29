@@ -1,0 +1,27 @@
+# Bring up the two vLLM servers StructAgent uses:
+#   - qwen35-9b  on :8010  (planner / actor / grounding / DONE-auditor)
+#   - qwen35-27b on :8012  (Mind2Web Online-Mind2Web judge; tensor-parallel 2)
+#
+#   docker compose -f scripts/docker-compose.vllm.yml up -d
+#
+# Requires the NVIDIA Container Toolkit. Adjust `device_ids` / TP to your GPUs.
+services:
+  qwen35-9b:
+    image: vllm/vllm-openai:latest
+    command: ["--model", "Qwen/Qwen3.5-9B", "--port", "8010"]
+    ports: ["8010:8010"]
+    volumes: ["${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]
+
+  qwen35-27b:
+    image: vllm/vllm-openai:latest
+    command: ["--model", "Qwen/Qwen3.5-27B", "--port", "8012", "--tensor-parallel-size", "2"]
+    ports: ["8012:8012"]
+    volumes: ["${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["1", "2"], capabilities: [gpu]}]

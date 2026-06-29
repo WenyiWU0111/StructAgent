@@ -1,0 +1,60 @@
+{
+  "id": "mind2web_website_Shopping_30",
+  "snapshot": "chrome",
+  "instruction": "Calculate the estimated car loan payment amount for an average credit-rated person for a 15,000-dollar car with a down payment of 2000 dollars and loan tenure of 48 months in zip 65215 and shop for the lowest priced car.",
+  "source": "https://www.cars.com/",
+  "config": [
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "google-chrome",
+          "--remote-debugging-port=1337"
+        ]
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "socat",
+          "tcp-listen:9222,fork",
+          "tcp:localhost:1337"
+        ]
+      }
+    },
+    {
+      "type": "chrome_open_tabs",
+      "parameters": {
+        "urls_to_open": [
+          "https://www.cars.com/"
+        ]
+      }
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": [
+    "chrome"
+  ],
+  "evaluator": {
+    "func": "llm_judge_webvoyager",
+    "result": {
+      "type": "agent_final_response_and_screenshots"
+    },
+    "expected": {
+      "type": "raw_intent",
+      "intent": "Calculate the estimated car loan payment amount for an average credit-rated person for a 15,000-dollar car with a down payment of 2000 dollars and loan tenure of 48 months in zip 65215 and shop for the lowest priced car."
+    }
+  },
+  "proxy": true,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low",
+  "_mind2web_meta": {
+    "original_task_id": 30,
+    "split": "test_website",
+    "sites": [
+      "Shopping"
+    ],
+    "source_path": "data/benchmarks/mind2web_executable/test_website/Shopping_30.json"
+  }
+}

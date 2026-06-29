@@ -1,0 +1,16 @@
+StructAgent
+Copyright 2026 The StructAgent Authors.
+
+This product includes software developed as a fork of OSWorld
+(https://github.com/xlang-ai/OSWorld), Copyright 2024 XLANG Lab,
+licensed under the Apache License, Version 2.0. The `desktop_env/`
+package and the OSWorld task examples derive from that project.
+
+Web generalization uses the Mind2Web dataset (Deng et al., 2023;
+https://osu-nlp-group.github.io/Mind2Web/) and is graded with the
+answer-blind Online-Mind2Web protocol (arXiv:2504.01382). Mind2Web task
+data under `evaluation_examples/examples/mind2web/` is redistributed for
+research use; please cite the original authors.
+
+Model serving uses vLLM (https://github.com/vllm-project/vllm) and the
+Qwen3.5 / MiniMax-M3 model families.

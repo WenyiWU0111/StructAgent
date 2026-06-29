@@ -1,0 +1,60 @@
+{
+  "id": "mind2web_domain_Info_Info_34",
+  "snapshot": "chrome",
+  "instruction": "Register to watch the webcast on developing Career ready student. My name is John Doe. My email is johndoe@gmail. I worked at UAI with a job title of Accounting",
+  "source": "https://www.coursera.org/",
+  "config": [
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "google-chrome",
+          "--remote-debugging-port=1337"
+        ]
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "socat",
+          "tcp-listen:9222,fork",
+          "tcp:localhost:1337"
+        ]
+      }
+    },
+    {
+      "type": "chrome_open_tabs",
+      "parameters": {
+        "urls_to_open": [
+          "https://www.coursera.org/"
+        ]
+      }
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": [
+    "chrome"
+  ],
+  "evaluator": {
+    "func": "llm_judge_webvoyager",
+    "result": {
+      "type": "agent_final_response_and_screenshots"
+    },
+    "expected": {
+      "type": "raw_intent",
+      "intent": "Register to watch the webcast on developing Career ready student. My name is John Doe. My email is johndoe@gmail. I worked at UAI with a job title of Accounting"
+    }
+  },
+  "proxy": true,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low",
+  "_mind2web_meta": {
+    "original_task_id": 34,
+    "split": "test_domain_Info",
+    "sites": [
+      "Info"
+    ],
+    "source_path": "data/benchmarks/mind2web_executable/test_domain_Info/Info_34.json"
+  }
+}

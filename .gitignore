@@ -1,0 +1,31 @@
+# --- run artifacts (never commit) ---
+results/
+results_baselines/
+logs/
+cache/
+draft/
+*.log
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# --- envs / secrets ---
+.env
+.venv/
+venv/
+*.qcow2
+docker_vm_data/
+
+# --- credentials (provide your own; templates are tracked) ---
+evaluation_examples/settings/googledrive/client_secrets.json
+evaluation_examples/settings/googledrive/credentials.json
+
+# NOTE: evaluation_examples/examples/mind2web/ IS tracked (vendored tasks).

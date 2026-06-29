@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "structagent"
+version = "0.1.0"
+description = "StructAgent — a verifier-centered planner/actor/verifier agent for long-horizon computer use (OSWorld + Mind2Web)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "The StructAgent Authors" }]
+keywords = ["computer-use-agent", "gui-agent", "osworld", "mind2web", "llm-agent"]
+
+# Curated runtime deps. For exact pinned versions used in the paper, see
+# requirements.txt (`pip install -r requirements.txt`).
+dependencies = [
+    "numpy",
+    "Pillow",
+    "opencv-python-headless",
+    "openai",
+    "backoff",
+    "requests",
+    "requests-toolbelt",
+    "tqdm",
+    "pandas",
+    "openpyxl",
+    "python-docx",
+    "python-pptx",
+    "pypdf",
+    "pymupdf",
+    "lxml",
+    "cssselect",
+    "xmltodict",
+    "rapidfuzz",
+    "playwright",
+    "gymnasium",
+    "fabric",
+    "psutil",
+    "python-dotenv",
+    "flask",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/StructAgent"
+Paper = "https://arxiv.org/abs/XXXX.XXXXX"
+
+[tool.setuptools]
+packages = ["mm_agents", "mm_agents.structagent", "desktop_env"]
+
+[tool.setuptools.package-dir]
+"" = "."

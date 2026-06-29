@@ -1,0 +1,60 @@
+{
+  "id": "mind2web_website_Shopping_35",
+  "snapshot": "chrome",
+  "instruction": "Compare prices and find cheapest total price for Granitestone Sandwich Maker from stores which offer free delivery",
+  "source": "https://shopping.google.com/",
+  "config": [
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "google-chrome",
+          "--remote-debugging-port=1337"
+        ]
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": [
+          "socat",
+          "tcp-listen:9222,fork",
+          "tcp:localhost:1337"
+        ]
+      }
+    },
+    {
+      "type": "chrome_open_tabs",
+      "parameters": {
+        "urls_to_open": [
+          "https://shopping.google.com/"
+        ]
+      }
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": [
+    "chrome"
+  ],
+  "evaluator": {
+    "func": "llm_judge_webvoyager",
+    "result": {
+      "type": "agent_final_response_and_screenshots"
+    },
+    "expected": {
+      "type": "raw_intent",
+      "intent": "Compare prices and find cheapest total price for Granitestone Sandwich Maker from stores which offer free delivery"
+    }
+  },
+  "proxy": true,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low",
+  "_mind2web_meta": {
+    "original_task_id": 35,
+    "split": "test_website",
+    "sites": [
+      "Shopping"
+    ],
+    "source_path": "data/benchmarks/mind2web_executable/test_website/Shopping_35.json"
+  }
+}
