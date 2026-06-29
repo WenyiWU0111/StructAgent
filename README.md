@@ -90,22 +90,25 @@ override any endpoint with `VLLM_<KEY>_URL`. See [`docs/MODELS.md`](docs/MODELS.
 **1. Set up the environment** — OSWorld needs a desktop VM (Docker / VMware / AWS) and
 Mind2Web needs a Chrome instance. See [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
 
+All runs go through **`scripts/run.sh`**, whose defaults are the **full agent
+from the paper** (perception, failure attribution, stuck diagnosis, DONE auditor,
+feasibility — all on). Configure it with environment variables; see
+[`docs/CONFIG.md`](docs/CONFIG.md).
+
 **2. Run OSWorld** (default split `test_nogdrive.json` — 360 tasks, no Google account needed):
 ```bash
-python scripts/run_structagent.py \
-  --provider_name docker --headless \
-  --model vllm_qwen35-vl --decomposer_model vllm_qwen35-vl \
-  --test_all_meta_path evaluation_examples/test_nogdrive.json \
-  --max_steps 100 --num_envs 4
+MODEL=vllm_qwen35-vl NUM_ENVS=8 bash scripts/run.sh
 ```
 
 **3. Run Mind2Web** (graded by the answer-blind Online-Mind2Web judge):
 ```bash
-python scripts/run_structagent.py \
-  --model vllm_qwen35-vl --verifier_model vllm_qwen35-27b \
-  --test_all_meta_path evaluation_examples/test_mind2web.json \
-  --max_steps 50
+MODEL=vllm_qwen35-vl VERIFIER_MODEL=vllm_qwen35-27b MAX_STEPS=50 \
+  TEST_ALL_META_PATH=evaluation_examples/test_mind2web.json bash scripts/run.sh
 ```
+
+> Running the paper's open-model SOTA backbone? Use `MODEL=minimax-m3` (OpenRouter,
+> no GPU). The experience-memory layers are **off by default** because they need
+> prebuilt banks — see [`docs/CONFIG.md`](docs/CONFIG.md).
 
 **4. Inspect results:**
 ```bash

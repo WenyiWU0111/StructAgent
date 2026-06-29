@@ -11,25 +11,17 @@ bash scripts/serve_qwen35_27b.sh     # verifier / Mind2Web judge   (:8012)
 
 ## 2. OSWorld (default split, 100-step budget)
 ```bash
-python scripts/run_structagent.py \
-  --provider_name docker --headless \
-  --model vllm_qwen35-vl --decomposer_model vllm_qwen35-vl \
-  --verifier_model vllm_qwen35-27b \
-  --test_all_meta_path evaluation_examples/test_nogdrive.json \
-  --max_steps 100 --num_envs 4 \
-  --version_num repro
+MODEL=vllm_qwen35-vl VERIFIER_MODEL=vllm_qwen35-27b NUM_ENVS=8 \
+  VERSION=repro bash scripts/run.sh
 ```
-Shard across machines with `test_nogdrive_sub{1,2,3}.json`.
-
-To reproduce the **open-model SOTA**, swap the backbone for MiniMax-M3
-(`--model minimax-m3`, requires `OPENROUTER_API_KEY`).
+Shard across machines with `TEST_ALL_META_PATH=evaluation_examples/test_nogdrive_sub{1,2,3}.json`.
+To reproduce the **open-model SOTA**, use `MODEL=minimax-m3` (needs `OPENROUTER_API_KEY`).
+All paper capabilities are on by default; see [`CONFIG.md`](CONFIG.md) to ablate.
 
 ## 3. Mind2Web (answer-blind Online-Mind2Web judge)
 ```bash
-python scripts/run_structagent.py \
-  --model vllm_qwen35-vl --verifier_model vllm_qwen35-27b \
-  --test_all_meta_path evaluation_examples/test_mind2web.json \
-  --max_steps 50
+MODEL=vllm_qwen35-vl VERIFIER_MODEL=vllm_qwen35-27b MAX_STEPS=50 \
+  TEST_ALL_META_PATH=evaluation_examples/test_mind2web.json bash scripts/run.sh
 ```
 Per-category splits: `test_mind2web_test_domain_{Info,Service}.json`,
 `test_mind2web_test_website.json`. Re-score finished runs offline with
