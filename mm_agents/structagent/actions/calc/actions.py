@@ -1,35 +1,25 @@
 """Structured Calc action handlers — flat JSON kwargs, no nested Python.
 
-Small decomposer models (qwen3.5-9b) reliably fail when asked to emit
-Python source as a string inside JSON: bracket-mismatch in nested
-lists, ``, print(`` instead of ``)\\n``, missing ``=`` prefix on
-formulas, hallucinated imports, etc. Each failure is a different
-emission bug; rule-based repair cannot exhaustively cover them.
+Small decomposer models (qwen3.5-9b) can't reliably emit Python source
+inside a JSON string — bracket mismatches, missing ``=`` on formulas,
+hallucinated imports, etc. So Calc mutations are expressed as a small
+set of ``calc_*`` actions with flat JSON kwargs; the framework builds
+the equivalent ``op_*`` call server-side, guaranteed valid Python.
 
-Root fix: stop asking the actor to write Python for Calc. Define a
-small set of structured ``calc_*`` actions whose payload is a flat
-JSON object with named kwargs. The actor emits the JSON; the
-framework deterministically builds the equivalent ``op_*`` call. The
-Python source is generated server-side — guaranteed syntactically
-correct.
+Three slices:
+  * :data:`CALC_ACTION_NAMES` — membership gate, shared by both
+    dispatchers.
+  * :func:`step_to_wire` — decomposer JSON action dict → AST-parseable
+    ``calc_xxx(arg=val, ...)`` wire string (called from
+    ``decomposer_actor._step_to_uitars_line``).
+  * :func:`action_to_runtime_script` — action_type + parsed kwargs →
+    wrapped runtime script ready to ``exec`` on the VM (called from
+    ``qwen25vl_agent_planner._pa_action_to_pyautogui_code``).
 
-This module centralises three slices:
-
-  * :data:`CALC_ACTION_NAMES` — membership gate for "is this one of
-    mine?" Single source of truth for both dispatchers.
-  * :func:`step_to_wire` — convert a decomposer's JSON action dict to
-    an AST-parseable ``calc_xxx(arg=val, ...)`` wire string. Called
-    from ``decomposer_actor._step_to_uitars_line``.
-  * :func:`action_to_runtime_script` — given an ``action_type`` and
-    parsed kwargs, build the wrapped runtime script (boilerplate +
-    op library + actor body) ready to ``exec`` on the VM. Called
-    from ``qwen25vl_agent_planner._pa_action_to_pyautogui_code``.
-
-Adding a new ``calc_*`` action means: add the name to
-:data:`CALC_ACTION_NAMES`, add a ``_wire_xxx`` validator returning a
-wire string, add a ``_build_xxx`` Python-code generator. Both
-dispatchers find the handlers automatically via the action_type →
-function mapping at the bottom of this file.
+A new ``calc_*`` action needs: a name in :data:`CALC_ACTION_NAMES`, a
+``_wire_xxx`` validator, and a ``_build_xxx`` code generator. The
+action_type → function maps at the bottom wire it into both
+dispatchers automatically.
 """
 from __future__ import annotations
 
@@ -71,16 +61,11 @@ CALC_ACTION_NAMES: frozenset = frozenset({
 # calc_verify — structured JSON verify checks
 # ====================================================================
 #
-# Companion to ``CALC_ACTION_NAMES`` for the verify side. Each
-# ``calc_checks`` item is ``{"op": <op>, ...kwargs}``. Kwargs are
-# passed through 1:1 to the matching ``verify_*`` helper in
-# ``calc_ops_lib.py`` (no renaming, no validation magic — what you
-# write is what gets called). The framework builds the python3 -c
-# body server-side so the init_ledger LLM never writes Python.
-#
-# ``CALC_VERIFY_OPS`` is the canonical op → helper mapping; new ops
-# get added here and the rest (validator, prompt schema, verifier
-# dispatch) follows automatically.
+# Verify-side companion to CALC_ACTION_NAMES. Each calc_checks item is
+# {"op": <op>, ...kwargs}; kwargs pass 1:1 to the matching verify_*
+# helper in calc_ops_lib.py. Framework builds the python3 -c body so
+# init_ledger never writes Python. CALC_VERIFY_OPS is the canonical
+# op → helper map; add new ops here and the rest follows.
 
 CALC_VERIFY_OPS: Dict[str, str] = {
     "sheet_exists":      "verify_sheet_exists",
@@ -100,8 +85,8 @@ CALC_VERIFY_OPS: Dict[str, str] = {
     "clipboard_has_content": "verify_clipboard_has_content",
 }
 
-# Required kwargs per op. Optional ones are not enforced at validation
-# time — the underlying ``verify_*`` helper applies its own defaults.
+# Required kwargs per op. Optional ones aren't enforced here — the
+# verify_* helper applies its own defaults.
 _CALC_VERIFY_REQUIRED_KWARGS: Dict[str, Tuple[str, ...]] = {
     "sheet_exists":      ("name",),
     "cell_value":        ("sheet", "a1_ref"),
@@ -121,8 +106,8 @@ _CALC_VERIFY_REQUIRED_KWARGS: Dict[str, Tuple[str, ...]] = {
     "clipboard_has_content": (),
 }
 
-# For cell_value, exactly one of these expectation kwargs MUST appear
-# (anything else is a no-op check). The validator enforces this.
+# cell_value requires exactly one of these expectation kwargs (else
+# the check is a no-op). Enforced by the validator.
 _CELL_VALUE_EXPECT_KEYS: Tuple[str, ...] = (
     "expected_value", "expected_substring",
     "expected_formula", "expected_formula_contains",
@@ -133,10 +118,9 @@ _CELL_VALUE_EXPECT_KEYS: Tuple[str, ...] = (
 def validate_calc_verify_check(chk: Dict[str, Any]) -> bool:
     """True iff ``chk`` is a well-formed calc_verify check item.
 
-    Used by ``VerifySpec.is_valid`` so malformed checks drop the whole
-    spec (outcome falls back to LLM KeyNode). Validation is structural
-    only — value types / sheet existence are checked at run time inside
-    the verify_* helper.
+    Used by VerifySpec.is_valid; a malformed check drops the whole spec
+    (outcome falls back to LLM KeyNode). Structural only — value types /
+    sheet existence are checked at run time in the verify_* helper.
     """
     op = chk.get("op")
     if op not in CALC_VERIFY_OPS:
@@ -154,15 +138,11 @@ def _normalize_lo_format_string(s):
     """Strip spurious ``\\$`` / ``\\[`` / ``\\]`` escapes from a LO
     number-format string.
 
-    init_ledger writes calc_verify specs as JSON. When the LLM is asked
-    to embed a locale-prefix like ``[$-419]0.0`` inside a JSON string
-    value, it frequently emits ``[\\$-419]0.0`` — defensively escaping
-    ``$`` as if the string were a regex / shell / template literal.
-    LO's ``queryKey`` sees the literal backslash, does not recognize the
-    string, and returns ``-1`` — so ``verify_cell_format`` permanently
-    FAILs even when the actor applied the correct format. Strip those
-    three escapes (none have valid meaning in a LO locale prefix) so
-    the LLM's hallucinated escape no longer locks the verify.
+    LLMs writing format strings in JSON tend to over-escape ``$`` (e.g.
+    ``[\\$-419]0.0`` instead of ``[$-419]0.0``). LO's ``queryKey`` sees
+    the literal backslash, returns ``-1``, and verify_cell_format FAILs
+    forever even when the format was applied correctly. None of these
+    escapes are meaningful in a LO locale prefix, so drop them.
     """
     if not isinstance(s, str):
         return s
@@ -170,14 +150,12 @@ def _normalize_lo_format_string(s):
 
 
 def build_calc_verify_python_body(checks: List[Dict[str, Any]]) -> str:
-    """Return the python3 -c body string for a list of calc_verify
-    checks. ``all`` semantics — the body prints ``PASS`` iff every
-    check returns truthy; otherwise prints ``FAIL: check[<i>] (<op>)``
-    naming the first failing check.
+    """python3 -c body for a list of calc_verify checks.
 
-    The boilerplate (UNO connect block + Calc helper definitions) is
-    NOT included here — ``_maybe_wrap_calc_verify_command`` in
-    verifiers.py prepends it via cli_run_uno_helpers.build_runtime_script.
+    Prints ``PASS`` iff every check is truthy, else ``FAIL: check[<i>]
+    (<op>)`` naming the first failure. Boilerplate (UNO connect + Calc
+    helpers) is prepended by _maybe_wrap_calc_verify_command in
+    verifiers.py, not here.
     """
     if not checks:
         return "print('FAIL: no checks')"
@@ -201,17 +179,15 @@ def build_calc_verify_python_body(checks: List[Dict[str, Any]]) -> str:
             idx_to_op="repr(_OPS[_i])",
         )
     )
-    # _OPS list precedes the body so the error message can name which op
+    # _OPS precedes the body so the FAIL message can name the op
     ops_repr = [chk["op"] for chk in checks]
     return "_OPS = " + repr(ops_repr) + "\n" + "\n".join(lines)
 
 
 def calc_verify_schema_block() -> str:
-    """Prompt block describing the structured ``calc_verify`` kind for
-    init_ledger. Injected into the init_ledger user content ONLY for
-    libreoffice_calc tasks (Writer / Impress still use the python3 -c
-    shape since their verify needs raw UNO; Calc has the structured
-    helpers).
+    """Prompt block for the structured ``calc_verify`` kind, injected
+    into init_ledger only for libreoffice_calc tasks. Writer / Impress
+    keep the raw python3 -c shape (no structured helpers there).
     """
     return _CALC_VERIFY_SCHEMA_BLOCK
 
@@ -499,47 +475,34 @@ uses.
 
 
 def action_schema_block() -> str:
-    """Return the prompt block describing every ``calc_*`` action.
-    Injected into the actor's system prompt only for the
-    ``libreoffice_calc`` domain — Writer / Impress / browser actors
-    aren't cluttered with these.
-
-    The block is the SINGLE SOURCE OF TRUTH the actor reads — Calc
-    tasks never go through ``cli_run_uno`` from the actor's side.
+    """Prompt block describing every ``calc_*`` action, injected into
+    the actor's system prompt only for libreoffice_calc. This is the
+    actor's single source of truth — Calc never goes through
+    cli_run_uno on the actor side.
     """
     return _SCHEMA_BLOCK
 
 
 def data_layout_init_block() -> str:
-    """Append-only schema requirement for init_ledger when the task
-    domain is libreoffice_calc.
+    """Extra init_ledger schema requirement for libreoffice_calc tasks.
 
-    The domain knowledge block (libreoffice_calc.md) defines a
-    Q1-Q4 STOP chain — row semantics / task pattern / output target
-    / lookup spec — that anchors verify spec choices to the actual
-    workbook structure. Without an enforced output slot, the LLM
-    skips the chain and produces verify specs against guessed
-    coordinates (e.g. F23 expected '32' when 32 is column E's mark
-    value, not column F's message). Forcing a structured
-    ``data_layout`` field BEFORE ``required_outcomes`` makes the
-    reasoning visible and gives downstream verify-spec building a
-    grounded anchor to copy column letters from.
+    Forces a structured ``data_layout`` (the Q1-Q4 STOP chain from
+    libreoffice_calc.md) BEFORE ``required_outcomes``, so verify specs
+    are anchored to the real workbook structure. Without it the LLM
+    skips the chain and guesses coordinates (e.g. F23 expected '32'
+    when 32 is column E's value, not column F's).
     """
     return _DATA_LAYOUT_INIT_BLOCK
 
 
 def data_layout_planner_block() -> str:
-    """Append-only requirement for the planner's <plan> emission when
-    the task domain is libreoffice_calc.
+    """Planner-side mirror of :func:`data_layout_init_block` for
+    libreoffice_calc <plan> emission.
 
-    Mirrors :func:`data_layout_init_block` for the planner side. The
-    planner currently emits GUI-shape subgoals ("Click F10, type
-    formula, press Enter, drag fill handle") even when the actor's
-    cleanest path is one ``calc_fill_column`` JSON. Forcing a
-    ``<data_layout>`` block before ``<strategy>`` makes the planner
-    pick the calc_* action up front and write the subgoal in that
-    vocabulary, so the actor doesn't have to reverse-engineer GUI
-    text back to a structured action.
+    Forces a ``<data_layout>`` block before ``<strategy>`` so the
+    planner commits to a calc_* action up front and phrases subgoals in
+    that vocabulary, instead of GUI-shape steps ("Click F10, type
+    formula, drag fill handle") the actor would have to reverse-engineer.
     """
     return _DATA_LAYOUT_PLANNER_BLOCK
 
@@ -1456,8 +1419,8 @@ actions defined in the FROZEN block.
 # ====================================================================
 
 def step_to_wire(step: Dict[str, Any]) -> Optional[str]:
-    """Convert a decomposer JSON action dict to AST-parseable wire
-    string. Returns ``None`` on validation failure — caller logs."""
+    """Decomposer JSON action dict → AST-parseable wire string. None on
+    validation failure (caller logs)."""
     action = step.get("action")
     handler = _WIRE_HANDLERS.get(action)
     if handler is None:
@@ -1466,11 +1429,10 @@ def step_to_wire(step: Dict[str, Any]) -> Optional[str]:
 
 
 def _kw_wire(action_name: str, kwargs: Dict[str, Any]) -> str:
-    """Render kwargs to ``action_name(k=v, k=v, ...)`` wire format.
+    """Render kwargs to a single-line ``action_name(k=v, ...)`` string.
 
-    Skips None values (treated as "not provided"). Uses ``repr`` for
-    JSON-safe scalars + collections — the downstream
-    ``ast.literal_eval`` reverses it exactly. Returns a single line."""
+    Skips None (not-provided). ``repr`` keeps it round-trippable by the
+    downstream ``ast.literal_eval``."""
     parts = []
     for k, v in kwargs.items():
         if v is None:
@@ -1530,7 +1492,7 @@ def _wire_set_cell(step):
     formula = step.get("formula")
     if not (sheet and a1_ref):
         return None
-    # Exactly one of value / formula
+    # exactly one of value / formula
     if (value is None) == (formula is None):
         return None
     return _kw_wire("calc_set_cell", {
@@ -1766,15 +1728,14 @@ def _wire_insert_chart(step):
     data_range = step.get("data_range")
     categories = step.get("categories")
     values = step.get("values")
-    # Two forms accepted (see op_insert_chart):
-    #   (1) data_range — single contiguous A1 range
-    #   (2) categories (optional) + values (list of A1 ranges)
+    # Two forms (see op_insert_chart): (1) data_range, single
+    # contiguous range; (2) optional categories + values (list of A1).
     if not sheet:
         return None
     if not data_range and not values:
         return None
     kwargs = {"sheet": sheet, "data_sheet": data_sheet}
-    # Same precedence rule as build layer: form (2) wins.
+    # form (2) wins, same as the build layer
     if values is not None:
         if isinstance(values, str):
             values = [values]
@@ -1876,9 +1837,8 @@ def action_to_runtime_script(
     *,
     logger: Optional[Any] = None,
 ) -> Optional[str]:
-    """Build the wrapped Python runtime script for a parsed ``calc_*``
-    action. Returns the script ready for ``exec`` on the VM, or
-    ``None`` on validation failure."""
+    """Wrapped runtime script for a parsed ``calc_*`` action, ready to
+    ``exec`` on the VM. None on validation failure."""
     builder = _BUILD_HANDLERS.get(action_type)
     if builder is None:
         return None
@@ -1886,9 +1846,8 @@ def action_to_runtime_script(
 
 
 def _kw_call(op_name: str, kwargs: Dict[str, Any]) -> str:
-    """Render ``op_name(k=v, k=v, ...)`` Python call. Skips None
-    values so optional op-kwargs default. Uses ``repr`` for all
-    values so the generated source is syntactically valid."""
+    """Render an ``op_name(k=v, ...)`` Python call. Skips None (lets
+    optional op-kwargs default); ``repr`` keeps the source valid."""
     parts = []
     for k, v in kwargs.items():
         if v is None:
@@ -1900,16 +1859,16 @@ def _kw_call(op_name: str, kwargs: Dict[str, Any]) -> str:
 def _emit_script(call_lines: List[str], domain: Optional[str],
                  logger: Optional[Any]) -> Optional[str]:
     """Append ``print('PASS')`` and run through the wrapper."""
-    # cli_run_uno_helpers lives in the sibling ``uno`` package (the single
-    # canonical copy; verifiers.py imports the same absolute path). The
-    # bare ``.cli_run_uno_helpers`` here looked for a calc-local module that
-    # never existed → ModuleNotFoundError at first new-sheet action.
+    # build_runtime_script lives in the sibling ``uno`` package — the one
+    # canonical copy (verifiers.py imports the same path). A bare
+    # ``.cli_run_uno_helpers`` here was a calc-local module that never
+    # existed → ModuleNotFoundError on the first new-sheet action.
     from ..uno.cli_run_uno_helpers import build_runtime_script
     code = "\n".join(list(call_lines) + ["print('PASS')"])
     try:
-        # Ops library/setup must match the ACTION's domain (calc), not the
-        # active-window __current_domain (cli_run_uno binds ``doc`` by service
-        # type; focus is irrelevant). See impress/actions for the bug context.
+        # Ops setup follows the ACTION domain (calc), not the active-window
+        # __current_domain: cli_run_uno binds ``doc`` by service type, so
+        # focus is irrelevant. See impress/actions for the bug context.
         return build_runtime_script(code, domain="libreoffice_calc")
     except ValueError as e:
         if logger:
@@ -1957,7 +1916,7 @@ def _build_fill_row(inputs, logger):
                 sheet, row, first_col, last_col,
                 (formula_template or "")[:60])
         return None
-    # Convert column letters to 0-based indices for iteration.
+    # column letter <-> 0-based index
     def _letter_to_idx(s):
         s = str(s).strip().upper()
         n = 0
@@ -1986,18 +1945,11 @@ def _build_fill_row(inputs, logger):
             logger.warning("[calc_fill_row] first_col %r > last_col %r",
                            first_col, last_col)
         return None
-    # Substitute placeholders per cell. Mirrors calc_fill_column's
-    # ``{r}`` / ``{seq}`` but with COLUMN semantics:
-    #   {c}      — current column letter (B, C, D, …). Use in cell refs
-    #              for SUM-down or other vertical aggregates.
-    #   {prev_c} — previous column letter (one to the LEFT of {c}).
-    #              Use for growth-style cross-column formulas like
-    #              ``=({c}12-{prev_c}12)/{prev_c}12``. When applied to
-    #              the FIRST column in the range, the template is
-    #              skipped — the cell is left empty (matches the
-    #              "Jan growth = blank" / "first month has no prev"
-    #              shape of growth rows).
-    #   {seq}    — 1-based sequence number from first_col (1, 2, 3, …).
+    # Per-cell placeholder substitution (column analogue of
+    # calc_fill_column's {r}/{seq}): {c}=current col letter,
+    # {prev_c}=col to the left, {seq}=1-based from first_col. A
+    # {prev_c} template skips the FIRST column (left blank) — matches
+    # the "first month has no prev" shape of growth rows.
     row_values = []
     for k, idx in enumerate(range(first_idx, last_idx + 1)):
         c_letter = _idx_to_letter(idx)
@@ -2015,10 +1967,9 @@ def _build_fill_row(inputs, logger):
                 "{c}", c_letter).replace(
                 "{seq}", str(k + 1))
         row_values.append(cell_text)
-    # Mirror calc_fill_column's auto `=` prefix for missing-equals
-    # formulas — same detection (formula markers present, no leading
-    # `=`). Applies element-wise; None entries (e.g. {prev_c} skip
-    # for first col) are left untouched.
+    # Auto-prefix `=` on formula-looking cells missing it (same
+    # detection as calc_fill_column). None entries (first-col {prev_c}
+    # skip) are left alone.
     import re as _re_r
     _FORMULA_HINT_RE_R = _re_r.compile(
         r"[+\-*/&^()]|"
@@ -2035,10 +1986,9 @@ def _build_fill_row(inputs, logger):
                         "formula_template: %r", formula_template[:80])
     lines = []
     if label and isinstance(label, str):
-        # Label sits one column to the LEFT of first_col. If first_col
-        # is already 'A', the planner needs to embed the label inside
-        # the formula_template / values list instead — skip the side
-        # write rather than overwrite some unrelated cell.
+        # Label goes one column left of first_col. If first_col is
+        # already 'A', skip the side write (rather than clobber an
+        # unrelated cell) — the planner must embed the label itself.
         if first_idx >= 1:
             lbl_col = _idx_to_letter(first_idx - 1)
             lines.append(_kw_call("op_set_cell", {
@@ -2079,27 +2029,17 @@ def _build_fill_column(inputs, logger):
             logger.warning("[calc_fill_column] first_row %d > last_row %d",
                            first_row, last_row)
         return None
-    # Substitute placeholders so a template can use whichever
-    # semantics it needs (or both):
-    #   {r}        — sheet row index. Use to build CELL REFERENCES
-    #                (``=VLOOKUP(E{r};$D$2:$E$7;2;1)``).
-    #   {r+N}/{r-N} — row index OFFSET by N (positive int). Use for
-    #                cross-row formulas like year-on-year growth:
-    #                ``=(B{r+1}-B{r})/B{r}``. Substitution is done
-    #                BEFORE the bare ``{r}`` replacement so the
-    #                offset form isn't mangled.
-    #   {seq}      — 1-based sequence number from ``first_row``
-    #                (1, 2, 3, ...). Use when the LITERAL VALUE
-    #                depends on position (``"No. {seq}"`` →
-    #                "No. 1", "No. 2", ...).
+    # Placeholders: {r}=sheet row index (cell refs), {r+N}/{r-N}=row
+    # offset (cross-row formulas), {seq}=1-based from first_row
+    # (position-dependent literals). Offsets are expanded BEFORE the
+    # bare {r} so they aren't mangled.
     import re as _re
     _offset_re = _re.compile(r"\{r([+-])(\d+)\}")
     def _expand(tpl, r):
         def _sub(m):
             sign, n = m.group(1), int(m.group(2))
             return str(r + n if sign == "+" else r - n)
-        # Offset form FIRST so a literal `{r}` inside an offset like
-        # `{r-1}` isn't replaced too early.
+        # offsets first, so the {r} inside {r-1} isn't replaced early
         tpl = _offset_re.sub(_sub, tpl)
         return tpl.replace("{r}", str(r)).replace(
             "{seq}", str(r - first_row + 1))
@@ -2107,15 +2047,11 @@ def _build_fill_column(inputs, logger):
         _expand(formula_template, r)
         for r in range(first_row, last_row + 1)
     ]
-    # Auto-prefix `=` when the template OBVIOUSLY emits a formula but
-    # the actor forgot the leading equals sign. ``op_set_range_values``
-    # uses ``startswith("=")`` to decide formula vs literal text — a
-    # `(A{r}-B{r-1})/B{r-1}` template without `=` lands as TEXT and
-    # the `expected_formula_contains` verify reports got_type='TEXT'.
-    # Detection: not already a formula AND contains a formula marker
-    # (arithmetic / function call / cross-sheet ref). Pure-text
-    # templates like `"No. {seq}"` / `"Item_{seq}"` carry no markers
-    # and stay untouched.
+    # Auto-prefix `=` when a template clearly emits a formula but the
+    # actor dropped the leading `=`. op_set_range_values keys formula
+    # vs text off startswith("="), so an unprefixed `(A{r}-B{r-1})...`
+    # lands as TEXT and fails expected_formula_contains. Pure-text
+    # templates ("No. {seq}") carry no formula marker and stay as-is.
     _FORMULA_HINT_RE = _re.compile(
         r"[+\-*/&^()]|"                              # arithmetic / concat / paren
         r"[A-Za-z_][A-Za-z0-9_]*\([^)]*\)|"          # function call e.g. SUM(...)
@@ -2236,7 +2172,7 @@ def _build_pivot_table(inputs, logger):
             logger.warning(
                 "[calc_pivot_table] missing source / dest / data_fields")
         return None
-    # JSON list-of-2-lists → tuple for the op call
+    # JSON list-of-2-lists → tuples for the op
     try:
         data_tuples = [tuple(df) for df in data_fields
                        if isinstance(df, (list, tuple)) and len(df) == 2]
@@ -2273,7 +2209,7 @@ def _build_sort_range(inputs, logger):
             logger.warning(
                 "[calc_sort_range] missing sheet / range_ref / sort_columns")
         return None
-    # JSON list-of-2-lists → tuple
+    # JSON list-of-2-lists → tuples
     try:
         sort_tuples = [(int(sc[0]), bool(sc[1])) for sc in sort_columns
                        if isinstance(sc, (list, tuple)) and len(sc) == 2]
@@ -2326,8 +2262,7 @@ def _build_format_number(inputs, logger):
     kw = {"sheet": sheet, "range_ref": range_ref,
           "format_string": format_string}
     if locale is not None:
-        # Locale arrives as JSON list [lang, country, variant]; the op
-        # expects a tuple. Convert if list-shaped.
+        # locale arrives as JSON [lang, country, variant]; op wants a tuple
         if isinstance(locale, list) and len(locale) == 3:
             locale = tuple(locale)
         kw["locale"] = locale
@@ -2527,9 +2462,9 @@ def _build_insert_chart(inputs, logger):
                 sheet, data_range, values)
         return None
     kwargs = {"sheet": sheet, "data_sheet": data_sheet}
-    # If both forms were emitted, prefer form (2) — the actor explicitly
-    # naming categories+values is the more careful signal. Drop the
-    # redundant data_range silently so the op call doesn't ValueError.
+    # If both forms are present, prefer form (2) — explicit
+    # categories+values is the more careful signal. Drop the redundant
+    # data_range so the op doesn't ValueError.
     if values is not None:
         if isinstance(values, str):
             values = [values]

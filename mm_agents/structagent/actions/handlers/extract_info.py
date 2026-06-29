@@ -1,13 +1,10 @@
 """Host-side handler for the ``extract_info`` actor action.
 
-Reads N files from the VM via ``controller.get_file``, dispatches each to
-the planner LLM (vision-capable) with a structured-output prompt, and
-returns an aggregate dict the agent stores on ``self._last_extract_output``
-for rendering into the next planner prompt.
+Reads N files from the VM (``controller.get_file``), runs one structured-output
+LLM call per file (vision-capable planner model), and returns an aggregate dict
+the agent stores on ``self._last_extract_output`` for the next planner prompt.
 
-Sequential by design — one file at a time, one LLM call per file. The
-user explicitly chose sequential over concurrent to avoid race conditions
-in the inference server and keep failure modes simple to reason about.
+Sequential by design: avoids inference-server races and keeps failure modes simple.
 """
 from __future__ import annotations
 
@@ -22,19 +19,14 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger("mm_agents.extract_info")
 
 
-# Per-file LLM call timeout — chosen so the whole extract_info action
-# (≤ 8 files in the typical receipts/papers tasks) stays under a few
-# minutes even in the worst case.
+# Per-file LLM call timeout, sized so a full call stays under a few minutes.
 PER_FILE_TIMEOUT_S = 60
-# Cap on N files per extract_info call. Larger collections should be
-# chunked across multiple actions so the planner gets intermediate
-# results sooner. Hard cap to bound worst-case latency.
+# Hard cap on files per call (bounds worst-case latency; chunk larger sets
+# across multiple actions for sooner intermediate results).
 MAX_FILES_PER_CALL = 12
-# Max bytes pulled per file (the planner LLM context window dictates
-# this; bigger files get tail-truncated for text, downscaled for images).
+# Max bytes per file (LLM context limit). Bigger: tail-truncate text, downscale images.
 MAX_FILE_BYTES = 8 * 1024 * 1024     # 8 MiB
-# Truncation budget for raw text excerpt returned to the agent (kept
-# small — planner only needs evidence the extraction is grounded).
+# Raw text excerpt budget — just enough to show the extraction is grounded.
 RAW_EXCERPT_CHARS = 600
 
 
@@ -73,9 +65,8 @@ def _bytes_to_data_url(data: bytes, mime: str) -> str:
 
 
 def _maybe_downscale_image(data: bytes, ext: str) -> bytes:
-    """Downscale very large images so the VLM doesn't blow up context.
-    Keep aspect ratio, long edge ≤ 1600px. Returns original bytes when
-    PIL unavailable or downscale not needed."""
+    """Downscale to long-edge ≤ 1600px (keeping aspect) so the VLM context
+    doesn't blow up. Returns original bytes if PIL is missing or not needed."""
     try:
         from PIL import Image
     except ImportError:
@@ -99,15 +90,14 @@ def _maybe_downscale_image(data: bytes, ext: str) -> bytes:
 
 
 def _extract_pdf_text(data: bytes) -> Tuple[Optional[str], Optional[bytes]]:
-    """Try text extraction first. Returns (text, None) on success.
-    On failure or empty text, returns (None, first_page_image_bytes)
-    for VLM fallback. (None, None) when both fail."""
+    """Text first: (text, None) on success. On empty/failed text, fall back to
+    (None, first_page_image_bytes) for the VLM. (None, None) if both fail."""
     text = ""
     try:
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(data))
         text_parts = []
-        for page in reader.pages[:10]:    # cap pages for context
+        for page in reader.pages[:10]:    # cap pages
             try:
                 text_parts.append(page.extract_text() or "")
             except Exception:
@@ -117,7 +107,7 @@ def _extract_pdf_text(data: bytes) -> Tuple[Optional[str], Optional[bytes]]:
         logger.warning("[extract_info] pypdf failed: %s", e)
     if text:
         return text, None
-    # Fall back to first-page render
+    # Fall back to first-page render.
     try:
         from pdf2image import convert_from_bytes
         images = convert_from_bytes(data, first_page=1, last_page=1, dpi=120)
@@ -163,13 +153,11 @@ def _build_llm_call(
     text_content: Optional[str], image_bytes: Optional[bytes],
     image_mime: str = "image/jpeg",
 ) -> List[Dict[str, Any]]:
-    """Construct OpenAI-style chat messages for ONE file extraction.
+    """OpenAI-style chat messages for ONE file extraction (caller runs the LLM).
 
-    Returns the messages list (caller calls the LLM). The prompt is
-    deliberately short: file path + query + schema + content. Output
-    constraint: ONE JSON object literally matching `schema` keys (or a
-    documented {"_skip": true, "reason": "..."} when the file doesn't
-    carry the requested info).
+    Prompt is path + query + schema + content; output must be one JSON object
+    matching `schema` keys, or {"_skip": true, "reason": "..."} when the file
+    doesn't carry the requested info.
     """
     sys = (
         "You extract STRUCTURED INFORMATION from a single file's content "
@@ -218,26 +206,24 @@ _JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}")
 
 
 def _parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
-    """Extract a single JSON object from the LLM response. Tolerates
-    optional markdown fences and prose around the object."""
+    """Extract one JSON object from the LLM response, tolerating markdown
+    fences and surrounding prose."""
     if not raw:
         return None
     s = raw.strip()
-    # Strip ```json fences
     m = re.match(r"^```(?:json)?\s*\n([\s\S]*?)\n```\s*$", s)
     if m:
         s = m.group(1).strip()
-    # Strip Qwen <think> trailer if present
+    # Strip Qwen <think> trailer.
     if "</think>" in s:
         s = s[s.rfind("</think>") + len("</think>"):].lstrip()
-    # Try direct parse
     try:
         v = json.loads(s)
         if isinstance(v, dict):
             return v
     except json.JSONDecodeError:
         pass
-    # Fallback: find first/last brace
+    # Fallback: first/last brace.
     m2 = _JSON_OBJECT_RE.search(s)
     if m2:
         try:
@@ -252,9 +238,8 @@ def _parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
 def _validate_against_schema(
     extracted: Dict[str, Any], schema: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], List[str]]:
-    """Light schema check: ensure every schema key is present (fill
-    missing with None). Returns (normalized_dict, missing_keys_list).
-    No type-coercion — caller can use string values as-is."""
+    """Ensure every schema key is present (fill missing with None). No type
+    coercion. Returns (normalized_dict, missing_keys)."""
     if not schema:
         return extracted, []
     missing: List[str] = []
@@ -273,19 +258,13 @@ def run_extract_info(
     per_file_max_tokens: int = 800,
     logger: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Main entry point. Sequentially process each path; call planner
-    LLM once per file. Returns an aggregate dict the agent persists.
+    """Process each path sequentially, one planner-LLM call per file.
+    Returns an aggregate dict the agent persists. Synchronous.
 
-    Caller is the agent — it already has ``call_llm`` (the planner LLM
-    function) and ``env.controller`` for VM file access. Stays sync.
-
-    ``logger``: optional override. When provided (typical), uses the
-    caller's logger (the agent's mm_agents logger that runtime.log is
-    wired to). When None, falls back to the module-level logger — which
-    in the agent process has no handlers, so per-file progress
-    silently disappears. THAT was the bug in v1: handle() got the
-    caller logger but run_extract_info() used the unconfigured module
-    one, so only the wrapping "running"/"done" lines appeared.
+    ``logger``: pass the caller's logger (the agent's mm_agents logger wired to
+    runtime.log). If None, the module logger is used — but in the agent process
+    that has no handlers, so per-file progress vanishes. That was the v1 bug:
+    handle() passed the caller logger but this function used the module one.
     """
     import time as _time
     _log = logger if logger is not None else globals()['logger']
@@ -343,7 +322,7 @@ def run_extract_info(
             except Exception:
                 text_content = None
         else:
-            # Try text decode as a last resort
+            # Last resort: text decode.
             try:
                 text_content = data.decode("utf-8", errors="replace")
             except Exception:
@@ -417,7 +396,7 @@ def run_extract_info(
         if missing:
             file_rec["error"] = f"schema keys missing (filled with null): {missing}"
         result["files"].append(file_rec)
-        # Trim values for log readability
+        # Trim values for log readability.
         _summary = {
             k: (str(v)[:60] + "…" if v is not None and len(str(v)) > 60 else v)
             for k, v in norm.items()
@@ -429,7 +408,7 @@ def run_extract_info(
                     _summary,
                     f" [missing: {missing}]" if missing else "")
 
-    # Overall ok = any file extracted successfully
+    # Overall ok if any file succeeded.
     result["ok"] = any(f["ok"] for f in result["files"])
     _log.info("[extract_info] ALL DONE — %d/%d files ok, total %.1fs",
                 sum(1 for f in result["files"] if f.get("ok")),
@@ -441,23 +420,19 @@ def handle(
     *, env, action_inputs: Dict[str, Any],
     call_llm, model: str, logger: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Decode the decomposer-wire ``action_inputs`` and run the
-    extraction. This is the single entry point the agent's actor
-    pipeline should call when it sees ``action_type == "extract_info"``.
+    """Entry point for ``action_type == "extract_info"``: decode the
+    decomposer-wire ``action_inputs`` and run the extraction.
 
-    Pulls ``paths`` / ``query`` / ``output_schema`` from action_inputs
-    (the decomposer JSON-encoded them so they survive repr + literal_eval
-    round-trip on the way through). Returns the aggregate dict that the
-    agent persists on ``self._last_extract_output`` for the next
-    planner prompt.
+    paths/query/output_schema arrive JSON-encoded (so they survive the
+    repr + literal_eval round-trip). Returns the aggregate dict the agent
+    persists on ``self._last_extract_output``.
     """
     ctrl = getattr(env, "controller", None) if env is not None else None
     if ctrl is None or not hasattr(ctrl, "get_file"):
         return {"ok": False,
                 "error": "no env.controller.get_file available"}
 
-    # JSON-decode each wire field — defensive, accepts either str or
-    # already-decoded value.
+    # JSON-decode wire fields; accept str or already-decoded value.
     paths_raw = action_inputs.get("paths") or "[]"
     try:
         paths = (json.loads(paths_raw) if isinstance(paths_raw, str)
@@ -491,8 +466,7 @@ def handle(
         result = run_extract_info(
             controller=ctrl, call_llm=call_llm, model=model,
             paths=paths, query=query, output_schema=schema,
-            logger=logger,   # thread the caller's logger so per-file
-                              # progress lands in runtime.log
+            logger=logger,   # so per-file progress lands in runtime.log
         )
     except Exception as e:
         if logger:
@@ -512,18 +486,15 @@ def render_for_planner(
 ) -> Optional[str]:
     """Render extract_info result(s) into a planner-prompt block.
 
-    Accepts either a single batch dict (legacy shape) OR a list of batch
-    dicts (multi-step extraction accumulator). Returns None when there's
-    nothing to show. Compact tabular form — one row per file, with
-    extracted JSON inline. Per-file rows are deduped by path within each
-    batch keep the latest occurrence; across batches the same path may
-    appear more than once (the planner sees both attempts so it can pick
-    the better extraction). When rendering a list, batches are labeled
-    so the planner can track which call produced which rows.
+    Accepts a single batch dict (legacy) or a list of batches (multi-step
+    accumulator); None when there's nothing to show. Compact table, one row
+    per file with extracted JSON inline. The same path may recur across
+    batches (planner sees both attempts and picks the better one); batches
+    are labeled so it can track which call produced which rows.
     """
     if not result:
         return None
-    # Normalize to list-of-batches for unified rendering.
+    # Normalize to list-of-batches.
     if isinstance(result, dict):
         batches: List[Dict[str, Any]] = [result]
     elif isinstance(result, list):

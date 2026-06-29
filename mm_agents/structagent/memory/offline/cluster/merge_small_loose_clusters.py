@@ -1,30 +1,14 @@
-"""Centroid-based 2nd-tier merge for the loose-tier small clusters.
+"""Centroid-based 2nd-tier merge for loose-tier small clusters.
 
-Why
----
-After `cluster_unified` produces the loose tier (cosine 0.55, recursive
-cap 30), it leaves 730 singletons + several hundred n=2-4 clusters.
-Polishing those individually is wasteful — they're too thin to abstract
-across — but many of them are "near miss" neighbours that the 0.55
-threshold barely failed to merge. We pool them via 2nd-tier centroid
-clustering at a tighter threshold (0.40), grouping near-miss small
-clusters into polishable super-clusters.
+The loose tier (cosine 0.55) leaves ~730 singletons + many n=2-4 clusters,
+too thin to polish individually but often near-misses of the 0.55 threshold.
+We re-cluster their centroids at a tighter 0.40 into polishable super-clusters.
 
-Output (under ``results/unified_memory/_clusters_v3_loose_merged/``):
-  cluster_NNNN/members.json     — flat member list, ready for polish_l3a
-  _summary.json                 — per-cluster stats + merge provenance
-
-The output is a COMBINED set: every loose-tier cluster (big + merged
-super-clusters + still-unmerged small) is present, renumbered by size.
-polish_l3a points at this dir by default; one pass covers everything.
-
-Provenance:
-  - "big_kept"           — original loose cluster ≥ merge_threshold,
-                          copied as-is
-  - "merged"             — super-cluster combining 2+ original small
-                          clusters (their cluster_ids listed)
-  - "small_kept"         — original small cluster that didn't find a
-                          centroid partner; kept as-is
+Output under ``results/unified_memory/_clusters_v3_loose_merged/`` is a COMBINED
+set (big + merged super-clusters + still-unmerged small), renumbered by size;
+polish_l3a points here by default. Each cluster_NNNN/members.json is a flat
+member list; _summary.json carries stats + provenance ("big_kept" / "merged"
+with constituent cluster_ids / "small_kept" = no centroid partner found).
 
 Run:
   PYTHONPATH=. python -m mm_agents.structagent.memory.offline.cluster.merge_small_loose_clusters
@@ -62,9 +46,8 @@ LOOSE_DIR = REPO_ROOT / "results" / "unified_memory" / "_clusters_v3_loose"
 OUT_DIR = REPO_ROOT / "results" / "unified_memory" / "_clusters_v3_loose_merged"
 
 DEFAULT_MERGE_THRESHOLD = 5     # clusters with n < this are merge candidates
-DEFAULT_CENTROID_THRESHOLD = 0.40   # tighter than loose 0.55; centroids are
-                                    # already summarised, so demand more
-                                    # similarity to merge
+DEFAULT_CENTROID_THRESHOLD = 0.40   # tighter than loose 0.55: centroids are
+                                    # already summarised, demand more similarity
 
 
 def load_loose_clusters() -> List[Dict[str, Any]]:
@@ -89,7 +72,7 @@ def main() -> None:
     merge_threshold: int = args.merge_threshold
     centroid_threshold: float = args.centroid_threshold
 
-    # 1. Load unified pool + build hash → record lookup
+    # 1. Load pool + hash → record lookup
     logger.info("Loading unified pool...")
     pool = pool_all_sources()
     hash_idx = {r.task_hash: r for r in pool}
@@ -103,7 +86,7 @@ def main() -> None:
                 f"big(n>={merge_threshold})={len(big)}  "
                 f"small(n<{merge_threshold})={len(small)}")
 
-    # 3. Load each small cluster's members + compute centroid
+    # 3. Per small cluster: load members, compute centroid
     logger.info(f"Loading {EMBED_MODEL} (need for centroid computation)...")
     model = SentenceTransformer(EMBED_MODEL)
 

@@ -1,17 +1,10 @@
-"""Recovery subsystem.
+"""Recovery subsystem. Re-exports the public names below.
 
-- ``dispatcher.Recovery`` — the mixin that decides per-turn planner
-  mode (the 5 stuck categories + initial / progress_check). Folded
-  into ``StructAgent`` via inheritance.
-- ``state.RecoveryState`` — frozen dataclass mirroring the
-  dispatcher's counters + last-transition receipt. Refreshed once
-  per turn by ``agent._finalize_recovery_state``.
-- ``transitions.Transition`` — Literal enumerating the 5 stuck
-  categories + 2 normal-flow labels.
-
-This module re-exports the public names so existing
-``from mm_agents.structagent.core.recovery import Recovery`` keeps
-working after the file-to-folder restructure.
+- ``dispatcher.Recovery``: mixin deciding per-turn planner mode (5 stuck
+  categories + initial / progress_check); mixed into ``StructAgent``.
+- ``state.RecoveryState``: frozen snapshot of the dispatcher's counters +
+  last-transition receipt, refreshed per turn by ``agent._finalize_recovery_state``.
+- ``transitions.Transition``: Literal over the 5 stuck categories + 2 normal labels.
 """
 
 from mm_agents.structagent.core.recovery.dispatcher import Recovery

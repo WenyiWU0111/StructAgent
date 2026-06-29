@@ -1,29 +1,18 @@
-"""Reformat the verifier intent recipes into boundary CHECK RECIPES.
+"""Reformat verifier intent recipes into boundary CHECK RECIPES.
 
-The old intent recipes (results/successful_ledgers/_intent_recipes_v2/) were built to
-help author VerifySpecs at t=0 (slot_derivation / shape_hint machinery). The
-boundary verifier does something different: at a subgoal boundary it decides "is
-this milestone done?" by either judging the current screen or authoring ONE
-read-only probe. It needs, per milestone class:
+The old intent recipes (_intent_recipes_v2) helped author VerifySpecs at
+t=0. The boundary verifier instead decides "is this milestone done?" by
+judging the screen or authoring one read-only probe, so per milestone
+class it needs: which probe is ground truth (vs the misleading signal),
+the strict success criterion, and the known traps. This distills each
+recipe into that shape with a local LLM (abstracting task-instance
+leakage) and builds a FAISS index keyed by ``when_to_use``.
 
-  - which probe is GROUND TRUTH (and which signal is misleading),
-  - the strict success criterion (anti-leniency),
-  - the known traps.
+Output: results/verifier_memory/_check_recipes/{metadata.jsonl,
+index.faiss, _meta.json}.
 
-This script distills each intent recipe into that shape with a local LLM (Qwen 27B),
-abstracting any task-instance leakage on the way, and builds a FAISS index keyed by
-``when_to_use`` so the boundary verifier can retrieve "how this class of milestone
-has been verified before".
-
-Output:
-  results/verifier_memory/_check_recipes/metadata.jsonl   (one check recipe / line)
-  results/verifier_memory/_check_recipes/index.faiss      (IP over when_to_use)
-  results/verifier_memory/_check_recipes/_meta.json
-
-Run (local 27B, free):
-  PYTHONPATH=. python -m mm_agents.structagent.memory.offline.build_check_recipes --local
-Smoke (no LLM, just show what would be sent for N):
-  PYTHONPATH=. python -m mm_agents.structagent.memory.offline.build_check_recipes --dry-run 5
+Run:    python -m mm_agents.structagent.memory.offline.build_check_recipes --local
+Smoke:  ... --dry-run 5   (show LLM input for N, no calls/writes)
 """
 from __future__ import annotations
 
@@ -204,10 +193,9 @@ def main() -> None:
         if cr is None:
             n_fail += 1
             continue
-        # NB: do NOT carry the source intent_id — those slugs still embed brand /
-        # site names (e.g. apple_iphone_…); retrieval is by when_to_use embedding,
-        # not by id, so the recipe needs no id. Infer domain from the abstracted
-        # when_to_use only.
+        # Drop the source intent_id — its slug still embeds brand/site
+        # names (e.g. apple_iphone_…), and retrieval is by when_to_use
+        # embedding anyway. Infer domain from the abstracted when_to_use.
         cr["domain"] = _infer_domain(cr.get("when_to_use") or "")
         out.append(cr)
     print(f"distilled {len(out)}/{len(srcs)} ({n_fail} failed) in {time.time()-t0:.0f}s")

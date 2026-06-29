@@ -1,22 +1,15 @@
-"""LibreOffice Writer structured actions — the Writer counterpart of
-``calc_actions`` / ``impress_actions``.
+"""LibreOffice Writer structured actions — counterpart of ``calc_actions``
+/ ``impress_actions``.
 
-The actor emits a flat-JSON ``writer_*`` action; this module
-deterministically builds the ``op_*`` runtime script (no UNO Python
-written by the model). It is the first piece of the Writer
-structured-action subsystem; today it exposes one action:
-
-  * ``writer_paste_at`` — paste the clipboard at a precise document
-    location (by paragraph index, or after a heading).
+The actor emits a flat-JSON ``writer_*`` action; this module builds the
+``op_*`` runtime script deterministically (model never writes UNO Python).
 
 Public surface (mirrors ``calc_actions``):
   * :data:`WRITER_ACTION_NAMES` — membership gate.
-  * :func:`step_to_wire` — decomposer JSON dict → AST-parseable wire
-    string.
+  * :func:`step_to_wire` — decomposer JSON → AST-parseable wire string.
   * :func:`action_to_runtime_script` — action + inputs → VM script.
-  * :func:`action_schema_block` — prompt block describing the actions,
-    injected into the actor's system prompt for the
-    ``libreoffice_writer`` domain.
+  * :func:`action_schema_block` — prompt block for the actor's system
+    prompt (``libreoffice_writer`` domain).
 """
 from __future__ import annotations
 
@@ -24,8 +17,7 @@ from typing import Any, Dict, List, Optional
 
 
 # Spec-driven actions: action_name -> (op_func, required, optional).
-# A generic wire/build pair handles all of them — the actor emits flat
-# JSON kwargs, the framework renders the op_* call deterministically.
+# A generic wire/build pair handles all of them.
 _WRITER_OP_SPECS: Dict[str, tuple] = {
     "writer_line_spacing":      ("op_line_spacing",
                                  ("multiplier",), ("target_indices",)),
@@ -89,15 +81,15 @@ WRITER_ACTION_NAMES: frozenset = frozenset(
 # --------------------------------------------------------------------
 
 def _kw_wire(action_name: str, kwargs: Dict[str, Any]) -> str:
-    """Render ``action_name(k=v, ...)``. Skips None; ``repr`` for
-    JSON-safe round-trip through the AST parser."""
+    """Render ``action_name(k=v, ...)``. Skips None; ``repr`` for AST-safe
+    round-trip."""
     parts = [f"{k}={v!r}" for k, v in kwargs.items() if v is not None]
     return f"{action_name}({', '.join(parts)})"
 
 
 def _paste_at_kwargs(step: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Validate + normalize writer_paste_at inputs. Exactly one of
-    ``paragraph_index`` / ``after_heading`` is required."""
+    """Validate/normalize writer_paste_at inputs. Requires exactly one of
+    ``paragraph_index`` / ``after_heading``."""
     pidx = step.get("paragraph_index")
     heading = step.get("after_heading") or step.get("heading")
     if pidx is not None:
@@ -119,9 +111,8 @@ def _wire_paste_at(step: Dict[str, Any]) -> Optional[str]:
 
 
 def _spec_kwargs(action: str, src: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Collect a spec-driven action's kwargs from ``src`` (decomposer
-    step or build inputs). Returns None when a required kwarg is
-    missing/empty."""
+    """Collect a spec-driven action's kwargs from ``src``. None if a
+    required kwarg is missing/empty."""
     _, required, optional = _WRITER_OP_SPECS[action]
     kw: Dict[str, Any] = {}
     for k in required:
@@ -151,8 +142,8 @@ _WIRE_HANDLERS.update({name: _wire_spec for name in _WRITER_OP_SPECS})
 
 
 def step_to_wire(step: Dict[str, Any]) -> Optional[str]:
-    """Convert a decomposer JSON action dict to an AST-parseable wire
-    string. Returns None on validation failure — caller logs."""
+    """Decomposer JSON action dict → AST-parseable wire string. None on
+    validation failure (caller logs)."""
     handler = _WIRE_HANDLERS.get(step.get("action"))
     return handler(step) if handler else None
 
@@ -169,15 +160,14 @@ def _kw_call(op_name: str, kwargs: Dict[str, Any]) -> str:
 
 def _emit_script(call_lines: List[str], domain: Optional[str],
                  logger: Optional[Any]) -> Optional[str]:
-    """Append ``print('PASS')`` and run through the cli_run_uno wrapper
-    (which prepends the connect + Writer setup + WRITER_OPS_LIBRARY)."""
-    # canonical module lives in the sibling ``uno`` package (see calc/impress)
+    """Append ``print('PASS')`` and wrap via cli_run_uno (prepends connect +
+    Writer setup + WRITER_OPS_LIBRARY)."""
     from ..uno.cli_run_uno_helpers import build_runtime_script
     code = "\n".join(list(call_lines) + ["print('PASS')"])
     try:
-        # Ops library/setup must match the ACTION's domain (writer), not the
-        # active-window __current_domain (cli_run_uno binds ``doc`` by service
-        # type; focus is irrelevant). See impress/actions for the bug context.
+        # Ops library must match the ACTION's domain (writer), not the
+        # active-window __current_domain — cli_run_uno binds ``doc`` by
+        # service type, focus is irrelevant. See impress/actions for the bug.
         return build_runtime_script(code, domain="libreoffice_writer")
     except ValueError as e:
         if logger:
@@ -384,9 +374,8 @@ distinction per op.
 
 
 def action_schema_block() -> str:
-    """Prompt block describing every ``writer_*`` action — injected
-    into the actor's system prompt for the ``libreoffice_writer``
-    domain only."""
+    """Prompt block describing every ``writer_*`` action — for the actor's
+    system prompt (``libreoffice_writer`` domain only)."""
     return _SCHEMA_BLOCK
 
 
@@ -395,9 +384,9 @@ def action_schema_block() -> str:
 # ====================================================================
 #
 # Counterpart of calc_verify. A ``writer_checks`` item is
-# ``{"op": <op>, ...kwargs}``; kwargs pass 1:1 to the matching
-# ``verify_*`` helper in writer_ops_lib.py. The framework builds the
-# python3 -c body server-side so init_ledger never writes UNO Python.
+# ``{"op": <op>, ...kwargs}``; kwargs pass 1:1 to the matching ``verify_*``
+# helper in writer_ops_lib.py. Body is built server-side so init_ledger
+# never writes UNO Python.
 
 WRITER_VERIFY_OPS: Dict[str, str] = {
     "table_count":          "verify_table_count",
@@ -411,9 +400,8 @@ _WRITER_VERIFY_REQUIRED_KWARGS: Dict[str, tuple] = {
 
 
 def validate_writer_verify_check(chk: Dict[str, Any]) -> bool:
-    """True iff ``chk`` is a well-formed writer_verify check item.
-    Structural-only — value correctness is checked at run time inside
-    the verify_* helper."""
+    """True iff ``chk`` is structurally well-formed. Value correctness is
+    checked at run time inside the verify_* helper."""
     op = chk.get("op")
     if op not in WRITER_VERIFY_OPS:
         return False
@@ -424,14 +412,12 @@ def validate_writer_verify_check(chk: Dict[str, Any]) -> bool:
 
 
 def build_writer_verify_python_body(checks: List[Dict[str, Any]]) -> str:
-    """Return the python3 -c body for a list of writer_verify checks.
+    """Build the python3 -c body for a list of writer_verify checks.
 
-    Each ``verify_*`` op returns ``(ok, reason)``. ``all`` semantics —
-    prints ``PASS`` iff every check's ``ok`` is truthy, else
-    ``FAIL: <op> -- <reason>`` naming the first failing check AND why
-    (so the planner gets actionable feedback, not an opaque FAIL).
-    The UNO connect + WRITER_OPS_LIBRARY boilerplate is prepended by
-    the verifier wrapper."""
+    Each ``verify_*`` op returns ``(ok, reason)``. Prints ``PASS`` iff all
+    are truthy, else ``FAIL: <op> -- <reason>`` for the first failure (so
+    the planner gets actionable feedback). The verifier wrapper prepends the
+    UNO connect + WRITER_OPS_LIBRARY boilerplate."""
     if not checks:
         return "print('FAIL: no checks')"
     lines: List[str] = ["_results = []"]
@@ -498,6 +484,6 @@ truthy.
 
 
 def writer_verify_schema_block() -> str:
-    """Prompt block describing the structured ``writer_verify`` kind —
-    injected into the init_ledger prompt for libreoffice_writer tasks."""
+    """Prompt block for the ``writer_verify`` kind — injected into the
+    init_ledger prompt for libreoffice_writer tasks."""
     return _WRITER_VERIFY_SCHEMA_BLOCK

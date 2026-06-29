@@ -1,26 +1,15 @@
 """Recovery dispatcher state — per-turn snapshot of counters + last
 transition receipt.
 
-A frozen dataclass that aggregates the recovery counters used by
-``recovery.dispatcher._decide_planner_mode_and_reason`` plus the
-receipt of which transition fired most recently. Replaces today's
-scattered ``self._<counter>`` surface on the agent with a single
-value that can be:
+Frozen dataclass aggregating the recovery counters used by
+``recovery.dispatcher._decide_planner_mode_and_reason`` plus a receipt
+of the transition that fired. Bundles the scattered ``self._<counter>``
+fields into one value that's easy to construct in tests, advance via
+``dataclasses.replace``, and read downstream (T3 done-auditor).
 
-  - constructed in unit tests (no need to mock ``self.*`` fields)
-  - copied via ``dataclasses.replace`` to advance to the next turn
-  - read by downstream escalation (T3 done-auditor) via a single
-    field rather than 5 separate ``self.*`` lookups
-
-T1 scope: this is a *read-only mirror*, refreshed once per
-``predict()`` call by ``_finalize_recovery_state`` immediately after
-the dispatcher decides this turn's mode. The agent's ``self._*``
-counters remain source of truth — ``RecoveryState`` mirrors them at a
-fixed checkpoint. Future work can migrate ownership onto
-``self._recovery_state`` and convert recovery handlers into pure
-functions.
-
-See plan file Part I.1.
+Currently a read-only mirror: ``_finalize_recovery_state`` refreshes it
+once per ``predict()`` after the dispatcher picks the turn's mode; the
+agent's ``self._*`` counters stay source of truth.
 """
 
 from dataclasses import dataclass, replace
@@ -33,16 +22,13 @@ from mm_agents.structagent.core.recovery.transitions import Transition
 class RecoveryState:
     """Per-turn snapshot of recovery counters + transition receipt.
 
-    Receipt model (Claude Code T1 pattern):
-        ``last_transition`` is written *after* the turn's mode
-        dispatcher ran, so it answers "why did the previous turn fire
-        what it fired" — not "what should the next turn do". Tests can
-        assert ``state.last_transition == 'done_rejected'`` to check a
-        recovery path fired without inspecting message contents.
+    ``last_transition`` is written *after* the mode dispatcher runs, so it
+    records why the previous turn fired what it did (not what the next
+    turn should do). Tests can assert on it without inspecting messages.
     """
 
-    # 5 stuck-related counters mirrored from agent.* (T1 scope:
-    # read-only mirror; agent.* still owns the increment/reset).
+    # Stuck-related counters mirrored from agent.* (which still owns
+    # increment/reset).
     replans_since_last_progress: int = 0
     last_search_fired_at_replan: int = -99  # matches agent.__init__ default
     total_replan_count: int = 0

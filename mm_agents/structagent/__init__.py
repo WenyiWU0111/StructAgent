@@ -1,8 +1,8 @@
-"""StructAgent — a verifier-centered planner / actor / verifier loop with a
-typed, evidence-backed outcome ledger (the task *State*).
+"""StructAgent — verifier-centered planner/actor/verifier loop with a typed,
+evidence-backed outcome ledger (the task *State*).
 
-Package layout — ROLES (what the agent does each step) live under ``core/``;
-SUBSYSTEMS (the State / tools the roles operate on) are top-level siblings:
+Package layout — ROLES (per-step behavior) live under ``core/``; SUBSYSTEMS (the
+State and tools the roles operate on) are top-level siblings:
 
     structagent/
       ├── loop.py              — StructAgent class (public entry point)
@@ -23,7 +23,7 @@ SUBSYSTEMS (the State / tools the roles operate on) are top-level siblings:
       ├── domain/              — per-app knowledge + evidence guides
       └── utils/               — llm_client / image / a11y helpers
 
-Public usage:
+Usage:
 
     from mm_agents.structagent import StructAgent
     agent = StructAgent(model="vllm_qwen35-vl")

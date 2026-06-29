@@ -1,20 +1,11 @@
 """SlidePerceiver — impress-side analogue of SheetPerceiver.
 
-Probes the live LibreOffice Impress presentation via UNO and produces a
-compact "PRESENTATION STRUCTURE" text block describing each slide's
-inventory: layout, background, speaker-notes preview, and per-shape
-attributes (type, name, position, size, text preview, font props).
+Probes the live Impress deck via UNO and emits a compact "PRESENTATION
+STRUCTURE" text block per slide: layout, background, notes preview, and
+per-shape attributes (type, name, pos, size, text, font).
 
-Read-only — never calls ``doc.store()``. Triggered at task start and
-after every mutation that may have changed slide structure, mirroring
-the calc-side SheetPerceiver.
-
-Token-budget strategy:
-  * Per-slide: render every shape (presentations rarely exceed ~20
-    shapes per slide).
-  * Text preview: first 60 chars of first paragraph.
-  * Cap total slides rendered at K_SLIDES (default 20); summarize the
-    rest as a one-line count.
+Read-only (never calls ``doc.store()``). Caps rendered slides at
+K_SLIDES; the rest get a one-line count.
 """
 from __future__ import annotations
 import json
@@ -553,14 +544,12 @@ _ALIGN_INT_TO_NAME = {0: "left", 1: "right", 2: "justify", 3: "center",
 
 
 def _render_shape(sh: Dict[str, Any], depth: int = 0) -> str:
-    """Render one shape record as a single text block.
+    """Render one shape record as a text block.
 
-    ``depth`` controls indentation: 0 = direct slide child, 1 = inside
-    a group, 2+ = nested group. Children of group shapes are rendered
-    inline with extra indent so the planner can see the text they
-    contain — many imported decks (Google Slides → pptx) wrap real
-    title/body text in ``GroupShape`` and a non-recursive render would
-    leave the planner thinking the slide has no editable text.
+    ``depth`` = indent level (0=slide child, 1=in group, 2+=nested).
+    Group children render inline so the planner sees their text —
+    imported decks (Google Slides → pptx) wrap real title/body text in
+    a GroupShape that a non-recursive render would hide.
     """
     indent = "  " * (depth + 1)
     parts = [
@@ -596,7 +585,7 @@ def _render_shape(sh: Dict[str, Any], depth: int = 0) -> str:
                 font_parts.append(align_name)
         if font_parts:
             parts.append(" ".join(font_parts))
-    # Tables expose rows × cols + a preview of the first cell.
+    # Tables: rows × cols + first-cell preview.
     if sh.get("kind") == "table":
         r = sh.get("rows"); c = sh.get("cols")
         if r is not None and c is not None:
@@ -610,17 +599,11 @@ def _render_shape(sh: Dict[str, Any], depth: int = 0) -> str:
     paras = sh.get("paragraphs")
     text_indent = "  " * (depth + 2)
     if paras:
-        # Multi-paragraph shape — list each paragraph with its 1-based
-        # index so the planner can pick paragraph_index= precisely.
-        # When a non-bullet paragraph is IMMEDIATELY FOLLOWED by one
-        # or more bullet paragraphs, tag it as ``(title)`` — it is
-        # acting as a section header for the bullets that follow.
-        # Other non-bullet paragraphs (no bullets after them) get no
-        # tag. Bullet paragraphs get ``•``.
-        # The planner can then count ``•`` rows as list items and
-        # treat ``(title)`` rows as structural headers (skipped when
-        # ordinal references like "line N" / "item N" refer to the
-        # list itself).
+        # List each paragraph with its 1-based index for paragraph_index=.
+        # A non-bullet paragraph immediately followed by bullets is a
+        # section header → tag ``(title)``; bullets get ``•``. Lets the
+        # planner count list items and skip headers when "line N" / "item
+        # N" refers to the list itself.
         real_paras = [p for p in paras if p.get("i") != -1]
         n_real = len(real_paras)
         for idx, p in enumerate(paras):
@@ -634,7 +617,7 @@ def _render_shape(sh: Dict[str, Any], depth: int = 0) -> str:
             if bullet is True:
                 bullet_tag = " •"
             elif bullet is False:
-                # Look ahead — is the NEXT real paragraph a bullet?
+                # Is the next real paragraph a bullet?
                 next_is_bullet = False
                 for j in range(idx + 1, len(paras)):
                     nxt = paras[j]
@@ -650,12 +633,12 @@ def _render_shape(sh: Dict[str, Any], depth: int = 0) -> str:
                      f"{indent_pad}\"{t_}\"")
     elif text:
         line += f"\n{text_indent}\"{text}\""
-    # Master-driven field placeholders (slide-number, footer, date, …)
-    # carry an extra hint line so the planner knows to route through
-    # impress_set_master_color instead of impress_set_text_color.
+    # Master-driven placeholders (slide-number, footer, date, …): hint
+    # the planner to route through impress_set_master_color, not
+    # impress_set_text_color.
     if sh.get("master_driven"):
         kind = sh.get("kind") or "?"
-        # Map perceiver kind → impress_set_master_color role.
+        # perceiver kind → impress_set_master_color role
         role_map = {"slide_num": "slide_number"}
         role = role_map.get(kind)
         if role:
@@ -664,8 +647,8 @@ def _render_shape(sh: Dict[str, Any], depth: int = 0) -> str:
         else:
             line += (f"\n{text_indent}→ master-driven placeholder "
                      f"({kind}); color lives on the slide MASTER")
-    # Group children get rendered inline at depth+1. Drop purely
-    # decorative children (no text, no font) to keep the block small.
+    # Render group children inline at depth+1; drop purely decorative
+    # ones (no text, no font) to keep the block small.
     children = sh.get("children") or []
     if children:
         kept = []
@@ -673,9 +656,7 @@ def _render_shape(sh: Dict[str, Any], depth: int = 0) -> str:
             c_kind = c.get("kind") or ""
             has_text = bool((c.get("text") or "").strip())
             has_font = bool(c.get("font"))
-            # Always render non-empty text/font; skip purely decorative
-            # children unless this group has ≤4 children (in which case
-            # show all for context).
+            # Keep text/font children; show all if the group has ≤4.
             if has_text or has_font or len(children) <= 4 \
                     or c_kind in ("group", "table", "title", "subtitle", "outline"):
                 kept.append(c)
@@ -690,9 +671,8 @@ def _render_shape(sh: Dict[str, Any], depth: int = 0) -> str:
 
 
 def _slide_role_label(is_focus: bool, is_active: bool) -> str:
-    """Inline English label appended to a slide header to tell the
-    planner what the slide's role is in this task. Explicit words
-    instead of symbols so a 9B model never has to consult a legend."""
+    """English role label for a slide header. Words not symbols so a 9B
+    model never needs a legend."""
     tags = []
     if is_focus:
         tags.append("task target")
@@ -710,12 +690,10 @@ _DECOR_RE = re.compile(r"^[\d\W_]+$")
 def _shape_is_off_canvas(sh: Dict[str, Any],
                           slide_w: Optional[float],
                           slide_h: Optional[float]) -> bool:
-    """A shape is considered off-canvas if its top-left anchor is
-    outside the slide rectangle. Top-left only (not bbox-intersection)
-    is intentional — Impress decks frequently contain template
-    artifacts whose anchor sits above the canvas (Y<0) even though
-    their bbox technically overlaps. Practically those are never
-    user-visible task targets."""
+    """Off-canvas iff the top-left anchor is outside the slide rect.
+    Anchor-only (not bbox-intersection) is intentional: template
+    artifacts often anchor above the canvas (Y<0) with an overlapping
+    bbox but are never user-visible task targets."""
     x = sh.get("x_cm")
     y = sh.get("y_cm")
     if x is None or y is None:
@@ -730,16 +708,13 @@ def _shape_is_off_canvas(sh: Dict[str, Any],
 
 
 def _shape_is_empty_text(sh: Dict[str, Any]) -> bool:
-    """Text-bearing or generic ``shape`` record with no actual text
-    content. These are layout-template residue / decorative
-    CustomShape outlines — useless to the planner.
+    """Text-kind or generic ``shape`` record with no text — template
+    residue / decorative CustomShape outlines, useless to the planner.
 
-    Includes plain ``"shape"`` (untagged drawing.CustomShape) on top
-    of the text-kind set. Without this, empty CustomShapes that fail
-    the BITMAP overclassify path leak into the SP block as anonymous
-    decorative noise. ``"pic"`` is NOT included even when its text
-    is empty — pictures are first-class targets that the planner
-    addresses by Name / shape_index for resize / move ops.
+    Includes plain ``"shape"`` (untagged CustomShape) so empty ones that
+    miss the BITMAP overclassify don't leak in as noise. ``"pic"`` is
+    excluded even when empty — pictures stay first-class resize/move
+    targets addressed by Name / shape_index.
     """
     if sh.get("kind") not in _TEXT_KINDS and sh.get("kind") != "shape":
         return False
@@ -750,10 +725,9 @@ def _shape_is_empty_text(sh: Dict[str, Any]) -> bool:
 def _pick_title_candidate(shapes: List[Dict[str, Any]],
                            slide_h: Optional[float]
                            ) -> Optional[Dict[str, Any]]:
-    """Mirror of impress_ops_lib._impress_pick_text_shape_by_role for
-    role='title', but operating on the perceiver's already-extracted
-    shape records (so it runs host-side, no UNO calls). Picks the
-    largest-font, top-positioned, non-decorative text shape.
+    """Host-side mirror of impress_ops_lib._impress_pick_text_shape_by_role
+    (role='title') over the perceiver's shape records (no UNO calls).
+    Picks the largest-font, top-positioned, non-decorative text shape.
     """
     if not shapes or not slide_h or slide_h <= 0:
         return None
@@ -805,10 +779,9 @@ def _render_slide(rec: Dict[str, Any], *, is_focus: bool = False,
             f"shapes={n_shapes} ──")
     lines = [head]
 
-    # Filter: collapse off-canvas + empty-text shapes (still counted
-    # in the per-slide total so the planner sees "shapes=25" matches
-    # actual UNO shape count; collapsed ones are summarized at the
-    # tail). Visible shapes preserve full detail.
+    # Collapse off-canvas + empty-text shapes, but still count them in
+    # the per-slide total (so "shapes=25" matches the UNO count);
+    # collapsed ones are summarized at the tail.
     visible: List[Dict[str, Any]] = []
     off_idx: List[int] = []
     empty_idx: List[int] = []
@@ -822,9 +795,9 @@ def _render_slide(rec: Dict[str, Any], *, is_focus: bool = False,
         visible.append(sh)
     n_off = len(off_idx); n_empty = len(empty_idx)
 
-    # Title-candidate hint (★) — runs the same heuristic used at the
-    # op layer's placeholder='title' fallback, so the planner can pick
-    # a shape Name directly instead of guessing across the SP body.
+    # Title-candidate hint (★): same heuristic as the op layer's
+    # placeholder='title' fallback, so the planner can pick a Name
+    # directly instead of guessing across the SP body.
     title_cand = _pick_title_candidate(shapes_all, slide_h)
     if title_cand is not None:
         font = title_cand.get("font") or {}
@@ -837,12 +810,10 @@ def _render_slide(rec: Dict[str, Any], *, is_focus: bool = False,
             + (f'  "{text}"' if text else "")
         )
 
-    # Sort visible shapes by VISUAL position (top → bottom, then
-    # left → right) so the planner's "first textbox / second textbox"
-    # reasoning matches what a human reading the slide top-down would
-    # call them. Each shape still prints its own ``[N]`` (UNO z-order
-    # index), so ``shape_index=N`` selectors continue to point at the
-    # same shape — only the render ORDER changed.
+    # Sort by visual position (top→bottom, then left→right) so "first
+    # textbox / second textbox" matches a top-down read. Each shape
+    # still prints its own ``[N]`` (UNO z-order), so shape_index=N is
+    # unaffected — only render order changes.
     def _sort_key(sh):
         y = sh.get("y_cm"); x = sh.get("x_cm")
         return (float(y) if y is not None else 1e9,
@@ -853,10 +824,9 @@ def _render_slide(rec: Dict[str, Any], *, is_focus: bool = False,
     for sh in visible_sorted:
         lines.append(_render_shape(sh))
 
-    # Collapsed summary line — list the shape indices so the planner
-    # can still target them via shape_index= for delete / move tasks
-    # ("delete the icons" on contact-style slides often targets
-    # empty-text decorative shapes that lack their own text content).
+    # List collapsed shape indices so the planner can still target them
+    # via shape_index= ("delete the icons" often hits empty-text
+    # decorative shapes).
     if n_off or n_empty:
         bits = []
         if n_off:
@@ -873,11 +843,9 @@ def _render_slide(rec: Dict[str, Any], *, is_focus: bool = False,
 
 def _render_slide_summary(rec: Dict[str, Any], *,
                           is_active: bool = False) -> str:
-    """One-line collapsed summary used for slides outside the focus set.
-
-    Keeps slide count + layout + background + shape-kind census so the
-    planner can still spot e.g. "slide 7 has a chart" without rendering
-    every shape on every off-focus slide.
+    """One-line summary for slides outside the focus set: layout, bg, and
+    shape-kind census (so "slide 7 has a chart" is still visible without
+    rendering every shape).
     """
     idx = rec.get("index")
     layout = rec.get("layout")
@@ -900,16 +868,12 @@ def _render_slide_summary(rec: Dict[str, Any], *,
 
 def render_block(parsed: Dict[str, Any],
                  focus_slides: Optional[List[int]] = None) -> str:
-    """Build the human-readable PRESENTATION STRUCTURE block.
+    """Build the PRESENTATION STRUCTURE block.
 
     Args:
         parsed: JSON output of the inspect script.
-        focus_slides: optional list of 1-based slide indices to render
-            in FULL detail. Slides not in this set get a one-line
-            summary (kind census + bg + layout). ``None`` (default) →
-            render every slide full (legacy behaviour). Use this to
-            keep the prompt budget small when the task targets only a
-            few specific slides.
+        focus_slides: 1-based indices to render in full; others get a
+            one-line summary. ``None`` → render every slide full.
     """
     if "error" in parsed:
         return (f"═══ PRESENTATION STRUCTURE (SlidePerceiver) ═══\n"
@@ -917,11 +881,8 @@ def render_block(parsed: Dict[str, Any],
                 f"═══════════════════════════════")
     n = parsed.get("n_slides", 0)
     active = parsed.get("active")
-    # Presentation-level dims (read off the first slide — every slide
-    # in a deck shares the same page size). Planner needs this for
-    # "stretch to fill the slide" / "set background full-bleed" /
-    # similar tasks where the action's width/height kwargs must
-    # match the actual deck dimensions.
+    # Deck dims off the first slide (all slides share page size). Needed
+    # for "stretch to fill" / "full-bleed background" width/height kwargs.
     deck_dims = ""
     try:
         first = (parsed.get("slides") or [{}])[0]
@@ -970,20 +931,17 @@ _ORDINAL_WORDS = {
 def _regex_extract_focus(instruction: str,
                          n_slides: int,
                          active_idx: Optional[int]) -> Optional[List[int]]:
-    """Pure regex / ordinal / pronoun parse. Returns:
-      * ``None`` — "all slides" / "every page" / universal scope.
-      * ``[]``   — no explicit slide reference detected.
-      * sorted list — explicit indices found.
+    """Regex / ordinal / pronoun parse. Returns:
+      ``None`` — universal scope ("all slides" / "every page");
+      ``[]``   — no explicit reference;
+      list     — explicit indices.
     """
     if not instruction or n_slides <= 0:
         return []
     text = instruction.lower()
-    # Quote-stripping: instructions like ``Add "Page 1" into the content
-    # textbox on Slide 2`` should match ONLY ``Slide 2``, not the
-    # ``Page 1`` quoted text content. Replace single- and double-quoted
-    # spans with a placeholder before the digit scan; the original text
-    # is kept for the "all" / pronoun checks (those never trigger
-    # inside quotes anyway).
+    # Strip quoted spans before the digit scan so e.g. `Add "Page 1" ...
+    # on Slide 2` matches only Slide 2, not the quoted "Page 1". Keep
+    # the original text for "all" / pronoun checks.
     digit_text = re.sub(
         r"\"[^\"]*\"|'[^']*'|“[^”]*”|‘[^’]*’",
         " __Q__ ", text)
@@ -991,8 +949,6 @@ def _regex_extract_focus(instruction: str,
         return None
     indices: set = set()
     # Numeric refs "slide N" / "page N" + ranges "slide 2 to 5".
-    # Uses the quote-stripped text so quoted strings like "Page 1"
-    # inside the instruction don't get mistaken for slide refs.
     for m in re.finditer(
             r"(?:slide|page)s?\s+(\d+)(?:\s*(?:-|to|–|—|through)\s*(\d+))?",
             digit_text):
@@ -1002,9 +958,7 @@ def _regex_extract_focus(instruction: str,
         for i in range(lo, hi + 1):
             if 1 <= i <= n_slides:
                 indices.add(i)
-    # Comma + "and" lists: "slides 2, 3, 5", "slides 2 and 4",
-    # "slides 2, 3 and 5". Capture the whole digit-conjunction run
-    # starting after the slide/page keyword.
+    # Comma/"and" lists: "slides 2, 3, 5", "slides 2 and 4".
     for m in re.finditer(
             r"(?:slide|page)s?\s+(\d+(?:\s*(?:,|\band\b)\s*\d+)+)",
             digit_text):
@@ -1015,9 +969,7 @@ def _regex_extract_focus(instruction: str,
                     indices.add(i)
             except ValueError:
                 pass
-    # Standalone numeric refs separated by "and" or "," anywhere after
-    # an initial slide/page anchor (e.g. "on slide 1 and on slide 2")
-    # — already covered by the first loop, no extra handling needed.
+    # ("on slide 1 and on slide 2" already covered by the first loop.)
     # Ordinal words ("first slide" / "third page")
     for word, num in _ORDINAL_WORDS.items():
         if re.search(rf"\b{word}\s+(?:slide|page)\b", text):
@@ -1036,7 +988,7 @@ def _regex_extract_focus(instruction: str,
             i = n_slides - off
             if 1 <= i <= n_slides:
                 indices.add(i)
-    # Pronominal "this/current/the slide" → active
+    # "this/current/the slide" → active
     if (active_idx is not None
             and re.search(r"\b(?:this|current|the)\s+(?:slide|page)\b", text)):
         indices.add(active_idx)
@@ -1049,14 +1001,13 @@ def _slide_brief_for_llm(rec: Dict[str, Any]) -> str:
     layout = rec.get("layout", "?")
     bg = rec.get("background") or "-"
     shapes = rec.get("shapes", []) or []
-    # kind census
     census: Dict[str, int] = {}
     for sh in shapes:
         k = sh.get("kind") or "shape"
         census[k] = census.get(k, 0) + 1
     census_str = ", ".join(f"{c}×{k}" for k, c in sorted(
         census.items(), key=lambda x: -x[1])) or "empty"
-    # first text-bearing shape's text preview for semantic queries
+    # first text preview, for semantic queries
     first_text = ""
     for sh in shapes:
         if sh.get("text"):
@@ -1073,14 +1024,11 @@ def _llm_extract_focus(instruction: str,
                        call_llm,
                        model: Optional[str],
                        logger: Optional[logging.Logger] = None) -> Optional[List[int]]:
-    """Lightweight LLM call resolving semantic slide references the
-    regex misses ("the title slide" / "the about-us page" / "the slide
-    before the conclusion").
+    """LLM fallback for semantic slide refs the regex misses ("the title
+    slide" / "the slide before the conclusion").
 
-    Returns same shape as ``_regex_extract_focus``:
-      ``None``  — task targets all slides
-      ``[]``    — LLM couldn't decide
-      ``[...]`` — explicit indices
+    Same return shape as ``_regex_extract_focus``: ``None`` = all,
+    ``[]`` = undecided, ``[...]`` = explicit indices.
     """
     n = parsed.get("n_slides", 0)
     if n <= 0:
@@ -1174,9 +1122,8 @@ def _llm_extract_focus(instruction: str,
         except (ValueError, TypeError):
             continue
     uniq = sorted(set(out))
-    # Safety net — if the LLM enumerated nearly every slide, the
-    # intent was "all". Saves us from a truncated list (rendered as
-    # missing indices) being mistaken for a narrow subset.
+    # If the LLM enumerated every slide, treat as "all" — guards against
+    # a truncated list being read as a narrow subset.
     if n > 0 and len(uniq) >= n:
         return None
     return uniq
@@ -1190,22 +1137,12 @@ def extract_focus_slides(instruction: Optional[str],
                          logger: Optional[logging.Logger] = None) -> Optional[List[int]]:
     """Decide which slide indices to render in full.
 
-    Pipeline:
-      1. Regex / ordinal / pronoun parse (deterministic, fast).
-         - Returns ``None`` for explicit "all slides" → no filter.
-         - Returns a list of indices when explicit refs were found.
-         - Returns ``[]`` when nothing was detected.
-      2. If regex returned ``[]`` and ``call_llm`` is supplied, fall
-         back to a single LLM call resolving semantic references
-         ("the title slide" / "the about-us page"). LLM may also
-         return ``"all"`` to disable filtering.
-      3. The initial active slide is always merged into the focus
-         set (when known), because most "this slide" / implicit
-         tasks operate on whatever was open at task start.
+    1. Regex/ordinal/pronoun parse (fast). 2. On empty, fall back to one
+    LLM call for semantic refs (may also say "all"). 3. The active slide
+    is always merged in (implicit "this slide" tasks target it).
 
-    Returns ``None`` → no filter (show all slides full).
-    Returns ``[]``   → no information; caller decides (typically full).
-    Returns list    → focus set, sorted, bounded to [1..n_slides].
+    Returns ``None`` → no filter (all slides full); ``[]`` → no info,
+    caller decides; list → sorted focus set bounded to [1..n_slides].
     """
     n = parsed.get("n_slides", 0)
     active = parsed.get("active")
@@ -1219,7 +1156,7 @@ def extract_focus_slides(instruction: Optional[str],
         if active is not None:
             focus.add(active)
         return sorted(i for i in focus if 1 <= i <= n)
-    # Regex empty → try LLM
+    # Regex empty → LLM
     if call_llm is not None and instruction:
         llm_result = _llm_extract_focus(
             instruction, parsed, call_llm, model, logger=logger)
@@ -1230,7 +1167,7 @@ def extract_focus_slides(instruction: Optional[str],
             if active is not None:
                 focus.add(active)
             return sorted(i for i in focus if 1 <= i <= n)
-    # Last resort: just the active slide (task start most-relevant signal)
+    # Last resort: the active slide.
     if active is not None:
         return [active]
     return []
@@ -1241,11 +1178,8 @@ def extract_focus_slides(instruction: Optional[str],
 # ---------------------------------------------------------------------- #
 
 def probe(env, logger: Optional[logging.Logger] = None) -> Optional[Dict[str, Any]]:
-    """Run the inspector script on the VM and return the parsed JSON.
-
-    Pure side-effect-free probe — the caller decides what to do with
-    the result (render, extract focus, cache). Returns ``None`` on
-    failure after retries.
+    """Run the inspector script on the VM, return parsed JSON (or ``None``
+    after retries). Side-effect-free; caller renders/caches.
     """
     if env is None or not hasattr(env, "controller"):
         if logger:
@@ -1287,14 +1221,12 @@ def run_inspect(env, logger: Optional[logging.Logger] = None,
                 results_dir: Optional[str] = None,
                 step_idx: Optional[int] = None,
                 focus_slides: Optional[List[int]] = None) -> Optional[str]:
-    """Convenience: probe + render in one call. Used by calc-style
-    integrations that don't need to cache the parsed JSON / focus.
-    For impress, prefer the explicit ``probe()`` + ``render_block()``
-    pair so the caller can extract and cache focus_slides once.
+    """probe + render in one call, for callers that don't cache the
+    parsed JSON / focus. Prefer explicit ``probe()`` + ``render_block()``
+    when you want to extract and cache focus_slides once.
 
-    ``focus_slides``: list of 1-based indices to render in FULL
-    detail; others get a one-line summary. ``None`` → render every
-    slide full.
+    ``focus_slides``: 1-based indices to render in full (others get a
+    one-line summary); ``None`` → all full.
     """
     parsed = probe(env, logger=logger)
     if parsed is None:

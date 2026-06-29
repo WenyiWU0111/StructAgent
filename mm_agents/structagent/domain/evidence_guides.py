@@ -1,20 +1,14 @@
-"""Per-domain *evidence guide* — a SHORT block telling the planner which
-observation channel is authoritative when it judges whether the previous
-subgoal's ``expected_post_state`` is satisfied.
+"""Per-domain evidence guide: a short block telling the planner which
+observation channel is authoritative when judging the previous subgoal's
+``expected_post_state``.
 
-Distinct from ``get_domain_knowledge()``:
+Distinct from ``get_domain_knowledge()``, which returns the big ``<domain>.md``
+planning framing injected once at task start. Done-judgment rules must ride on
+the ``<last_subgoal_assessment>`` block (emitted every turn), so they live here
+rather than in the step-0-only ``.md``.
 
-  - ``get_domain_knowledge(domain)`` returns the big ``<domain>.md``
-    planning framing. It is injected ONCE, into the initial-plan prompt
-    at task start.
-  - ``get_evidence_guide(domain)`` returns a compact rules block embedded
-    into the ``<last_subgoal_assessment>`` block — which the planner
-    emits on EVERY turn. The per-domain done-judgment rules must travel
-    with that block, so they cannot live in the step-0-only ``.md``.
-
-Keep each guide short (it is paid for on every planner turn) and strictly
-about *which evidence source to read and how to read it* — NOT about how
-to plan the task.
+Keep each guide short (paid on every planner turn) and strictly about which
+evidence source to read and how — not how to plan the task.
 """
 from __future__ import annotations
 from typing import Optional
@@ -34,9 +28,8 @@ _ALIAS = {
 
 
 # --- a11y-driven domains (Chrome, Thunderbird) ----------------------------
-# The a11y tree is the primary done-judgment channel; the screenshot only
-# corroborates. These reading rules are a frequent source of false-positive
-# done=YES, hence they ride along on every turn.
+# a11y tree is the primary done-judgment channel; screenshot only corroborates.
+# These reading rules are a frequent source of false-positive done=YES.
 _A11Y_GUIDE = """\
 EVIDENCE SOURCE — a11y tree is primary, screenshot corroborates:
   • a11y rows are tab-separated <tag>\\t<text>\\t<state>. The state
@@ -94,8 +87,8 @@ _GUIDES = {
 }
 
 
-# Used for domains without a specific guide (gimp, vlc, vs_code, multi_apps,
-# unknown). Domain-neutral: name the reliable channels without assuming one.
+# Fallback for domains without a specific guide (gimp, vlc, vs_code, multi_apps,
+# unknown). Domain-neutral: names the reliable channels without assuming one.
 _GENERIC_GUIDE = """\
 EVIDENCE SOURCE: judge the previous subgoal from the most reliable
 channel available — a deterministic verifier result when one covers it,
@@ -105,12 +98,8 @@ needs `checked`/`selected`."""
 
 
 def get_evidence_guide(domain: Optional[str]) -> str:
-    """Return the compact evidence-reading block for ``domain``.
-
-    Always returns a non-empty string — falls back to a domain-neutral
-    guide for unknown / unmapped domains so the assessment block never
-    ships without evidence-source guidance.
-    """
+    """Evidence-reading block for ``domain``. Always non-empty: unknown/unmapped
+    domains get the domain-neutral guide so the assessment block always has one."""
     if not domain:
         return _GENERIC_GUIDE
     canonical = _ALIAS.get(domain.lower().strip(), domain.lower().strip())

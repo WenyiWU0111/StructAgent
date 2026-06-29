@@ -1,39 +1,17 @@
 """Normalise an AgentNet trajectory to Causal-Agent ingest shape.
 
-AgentNet records human-driven trajectories with rich freeform `observation /
-thought / action / reflection` per step + per-task `task_completed`, `reason`,
-`alignment_score` etc. — but the wording style and granularity don't match
-our internal mining pipeline's expectations (subgoal templates / typical
-actions / done-gate exemplars).
+AgentNet's freeform per-step (observation/thought/action/reflection) text
+doesn't match the mining pipeline's expected shape. One LLM call per task
+condenses the trajectory into structured JSON (subgoals / key_actions /
+outcome / pitfalls) the L1/L2/L3 miners can consume directly. See
+``_SYSTEM_PROMPT`` for the exact output schema.
 
-This module wraps a single LLM call per task that condenses the trajectory
-into a structured JSON the downstream mining pipeline (L2 / L1 / L_v3) can
-consume directly without further parsing.
+Model selectable for cost/quality ablation:
+  - "qwen"        local Qwen3.5-9B at :8001
+  - "qwen35-27b"  OpenRouter qwen/qwen3.5-27b
+  - "sonnet"      OpenRouter claude-sonnet-4-5
 
-The same prompt is sent to one of three models (selectable for cost / quality
-ablation):
-  - "qwen"         → local Qwen3.5-9B at :8001
-  - "qwen35-27b"   → OpenRouter qwen/qwen3.5-27b
-  - "sonnet"       → OpenRouter claude-sonnet-4-5
-
-Output schema (the model is asked to emit this JSON verbatim):
-  {
-    "subgoals": [<3-7 short subgoal strings>],
-    "key_actions": [
-      {"subgoal_idx": int, "action": str, "tool_or_widget": str}
-    ],
-    "outcome": {
-      "completed": bool,
-      "final_observation_excerpt": str,
-      "final_action": str,
-      "failure_modes": [str],     // empty if completed
-      "recovery_attempts": [str]
-    },
-    "pitfalls": [str]             // lessons learned that future agents should heed
-  }
-
-Designed to be cheap (one LLM call per task) and bounded (trajectory truncated
-to first/last K steps if too long).
+Bounded: long trajectories are truncated to first/last K steps.
 """
 from __future__ import annotations
 
@@ -48,15 +26,14 @@ logger = logging.getLogger(__name__)
 
 # ─── Trajectory condensation ─────────────────────────────────────────────────
 def _condense_trajectory(traj: List[Dict[str, Any]], max_steps: int = 30) -> str:
-    """Produce a compact text rendering of the trajectory. Drops the per-step
-    base64 image (kept as `<screenshot>` placeholder), keeps observation /
-    thought / action / reflection text. Truncates middle if too long."""
+    """Compact text rendering of the trajectory (text fields only, images
+    dropped). Truncates the middle if longer than ``max_steps``."""
     if not traj:
         return "<empty trajectory>"
     if len(traj) <= max_steps:
         kept_indices = list(range(len(traj)))
     else:
-        # Keep first N/2 + last N/2 steps; middle gets a "[... skipped K steps ...]"
+        # Keep first/last N/2 steps; middle gets a "[... skipped ...]" marker.
         half = max_steps // 2
         kept_indices = list(range(half)) + list(range(len(traj) - half, len(traj)))
 
@@ -161,11 +138,11 @@ def _call_model(model_choice: str, messages: List[Dict[str, str]],
                 ) -> tuple[str, str]:
     """Returns (raw_response_text, resolved_model_name).
 
-    model_choice ∈ {"qwen", "qwen35-27b", "sonnet", "opus"} or a fully-
-    qualified OpenRouter model name. Reuses recheck/_common.resolve_reviewer_model
-    which already routes these correctly + handles OpenRouter vs vLLM
-    thinking-off wire-format mismatch (which would otherwise leave Qwen
-    thinking ON, blowing past max_tokens before reaching the JSON answer)."""
+    model_choice is a known alias or a full OpenRouter model name.
+    resolve_reviewer_model handles the OpenRouter-vs-vLLM thinking-off
+    wire-format mismatch — otherwise Qwen keeps thinking ON and blows
+    past max_tokens before reaching the JSON answer.
+    """
     from mm_agents.structagent.memory.offline.normalize_external._llm_dispatch import (
         resolve_reviewer_model, load_dotenv,
     )
@@ -199,7 +176,7 @@ def parse_response(text: str) -> Dict[str, Any]:
     """Tolerant: find the LAST balanced JSON object in the response."""
     if not text:
         return {"_unparsed": True, "_reason": "<empty>"}
-    # Find balanced { ... } pairs from the tail
+    # Scan balanced { ... } pairs from the tail
     depth, end = 0, None
     for i in range(len(text) - 1, -1, -1):
         c = text[i]
@@ -227,8 +204,7 @@ def parse_response(text: str) -> Dict[str, Any]:
 
 
 def normalize_one(task: Dict[str, Any], model_choice: str = "qwen") -> Dict[str, Any]:
-    """Run a single AgentNet task through the normaliser. Returns a dict with
-    the parsed JSON + provenance fields."""
+    """Normalise one AgentNet task. Returns parsed JSON + provenance fields."""
     messages = build_messages(task)
     raw, resolved_model = _call_model(model_choice, messages)
     parsed = parse_response(raw)

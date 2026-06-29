@@ -1,13 +1,12 @@
 """Ledger initialization: one LLM call at task start.
 
-Input: the user's natural-language instruction + the initial observation
-(screenshot + a11y tree + URL). Output: a fully-seeded ``ProgressLedger``
-with ``initial_context`` captured and 2–6 ``required_outcomes`` inferred.
+Input: instruction + initial observation (screenshot + a11y tree + URL).
+Output: a seeded ``ProgressLedger`` with ``initial_context`` and 2-6
+``required_outcomes``.
 
-Hard constraint (from user): target derivation must NOT use
-``example["config"]`` or ``example["evaluator"]``. Only the instruction
-and the current screen are available inputs — the same information a
-human would have on first glance of the task.
+Constraint: target derivation must NOT use ``example["config"]`` or
+``example["evaluator"]`` — only the instruction and current screen, the
+same information a human has on first glance.
 """
 from __future__ import annotations
 import base64
@@ -807,12 +806,10 @@ Worked example for kind="shell_command" — shape (1) "binary on PATH"
 # LLM call
 # --------------------------------------------------------------------------- #
 
-# Appended to the init prompt in boundary mode (always on, Phase 2):
-# author milestone DESCRIPTIONS only; the verify METHOD is authored later at
-# the boundary, with full execution context (see boundary_verify.py). Reuses
-# all the milestone-selection wisdom above and only switches off verify-spec /
-# value_provenance / slots authoring. verify is additionally forced to None in
-# init_ledger, so this override is belt-and-suspenders.
+# Appended to the init prompt in boundary mode: author milestone DESCRIPTIONS
+# only; the verify METHOD is authored later at the boundary (boundary_verify.py).
+# Keeps all milestone-selection rules, drops verify-spec/value_provenance/slots.
+# init_ledger also forces verify=None, so this is belt-and-suspenders.
 _DESC_ONLY_OVERRIDE = (
     "\n\n════════ OUTPUT OVERRIDE — DESCRIPTIONS-ONLY MODE ════════\n"
     "For THIS run the verification METHOD is authored LATER — when each "
@@ -853,25 +850,19 @@ def init_ledger(
     """Build a fresh :class:`ProgressLedger` for a new task.
 
     Args:
-        instruction:   user's raw task instruction.
-        initial_obs:   the first observation (must have ``screenshot``; may
-                        have ``accessibility_tree``).
-        call_llm:      callable signature-compatible with the planner's
+        instruction:   raw task instruction.
+        initial_obs:   first observation (must have ``screenshot``; may have
+                        ``accessibility_tree``).
+        call_llm:      callable compatible with the planner's
                         ``self.call_llm(payload, model)``.
-        model:         model name to use. If ``None``, caller should default
-                        elsewhere. The returned ledger is cheap text-only
-                        by preference, but accepts multimodal models too.
-        a11y_text:     pre-linearized a11y tree text (optional; avoids
-                        re-linearizing if caller already has it).
+        model:         model name; ``None`` lets the caller default elsewhere.
+        a11y_text:     pre-linearized a11y tree (optional; avoids re-linearizing).
         active_url:    pre-extracted active tab URL (optional).
 
-    Returns:
-        A :class:`ProgressLedger` with ``initial_context`` and
-        ``required_outcomes`` filled; ``done`` and ``failed_paths`` empty.
-
-        On any parsing failure, returns an empty-outcome ledger with the
-        known ``initial_context``. Failure is logged. The caller should
-        tolerate a best-effort ledger rather than crashing.
+    Returns a :class:`ProgressLedger` with ``initial_context`` and
+    ``required_outcomes``; ``done``/``failed_paths`` empty. On parse failure,
+    returns an empty-outcome ledger with the known ``initial_context`` — caller
+    should tolerate a best-effort ledger rather than crash.
     """
     screenshot_bytes = initial_obs.get("screenshot") if isinstance(initial_obs, dict) else None
 
@@ -888,31 +879,27 @@ def init_ledger(
         except Exception as e:
             logger.warning("[LedgerInit] failed to encode screenshot: %s", e)
 
-    # Task-agnostic VM environment probe + per-task digestion. Output
-    # is plain text listing only the binaries / config files / GSettings
-    # schemas / processes that actually exist on the VM — the LLM
-    # downstream is told to ground identifiers in this list rather than
-    # invent them. Skipped silently when env is missing or probe fails.
+    # VM environment probe + per-task digestion. Plain-text inventory of
+    # binaries / config files / GSettings schemas / processes that actually
+    # exist on the VM, so the LLM grounds identifiers instead of inventing
+    # them. Skipped silently when env is missing or probe fails.
     environment_probe_text: Optional[str] = None
     raw_probe: Optional[str] = None
     # ─────────────────────────────────────────────────────────────────
-    # [FIX env_probe_unconditional] Two layers — both ALWAYS run.
-    #   ① probe_environment — bash inventory (VM-side, ~5s):
-    #     ``~/Desktop`` + ``~/Documents`` + ``~/Downloads`` listings,
-    #     binaries, gsettings, running procs. Cheap, deterministic.
-    #     Raw artifact saved to environment_probe_raw.txt.
-    #   ② perceive_environment — pure host-side LLM compression of ①
-    #     into digest sections (`[Identity]` / `[Possibly useful files]`
-    #     / `[Running processes]` / ...). No VM interaction → cannot
-    #     cause /run_python timeouts. The `[Possibly useful files]`
-    #     section is critical context for multi-app office tasks where
+    # [FIX env_probe_unconditional] Two layers, both ALWAYS run.
+    #   ① probe_environment — VM-side bash inventory (~5s): Desktop/
+    #     Documents/Downloads listings, binaries, gsettings, procs. Raw
+    #     artifact saved to environment_probe_raw.txt.
+    #   ② perceive_environment — host-side LLM compression of ① into
+    #     digest sections ([Identity] / [Possibly useful files] / ...).
+    #     No VM interaction, so it can't cause /run_python timeouts.
+    #     [Possibly useful files] is key for multi-app office tasks where
     #     the open document is paired with other files on disk.
     #
-    # The heavyweight ``file_probes.probe_useful_files`` step (③ —
-    # reads CONTENT of each file via soffice→csv etc.) is what caused
-    # VM contention in earlier runs. That step stays gated off by
-    # default via ``OSWORLD_FILE_PROBE`` further down. Roll back to the
-    # old domain-skip behavior by restoring ``_skip_probe_for_office``.
+    # The heavyweight file_probes.probe_useful_files step (③, reads file
+    # CONTENT via soffice→csv) caused VM contention before; stays gated off
+    # by default via OSWORLD_FILE_PROBE below. Roll back to the old
+    # domain-skip behavior by restoring ``_skip_probe_for_office``.
     try:
         from mm_agents.structagent.ledger.core.probes import probe_environment
         raw_probe = probe_environment(env, domain=domain)
@@ -933,17 +920,13 @@ def init_ledger(
             logger.info("[LedgerInit] env probe (digest) failed: %s", e)
             environment_probe_text = None
     # ──── end FIX env_probe_unconditional ────
-    # Disk-content probe — for each file the env perceiver surfaced
-    # under ``[Possibly useful files]``, read the actual on-disk
-    # contents (via soffice --convert-to + stdlib csv/text). Without
-    # this, init_ledger / the verify-author guess at cell positions
-    # (and ship placeholder a1_refs like ``"new_day_cell"``) or the
-    # task shape (insert-a-row when the grid is fixed). Graceful
-    # degrade: ``None`` on any failure → init proceeds without it.
-    # DISABLED — see file_probes.py; was implicated in env-side timeouts
-    # during a real batch run. Re-enable after the root cause (could be
-    # VM contention, env API server health, or our per-call cadence) is
-    # identified. Flip via the env var to A/B test without code churn.
+    # Disk-content probe — read on-disk contents of each [Possibly useful
+    # files] entry (soffice --convert-to + stdlib csv/text). Without it,
+    # init_ledger / the verify-author guess cell positions (placeholder
+    # a1_refs like "new_day_cell") or the task shape. None on any failure.
+    # DISABLED — implicated in env-side timeouts during a batch run (root
+    # cause unconfirmed: VM contention / env API health / call cadence).
+    # Re-enable after diagnosis; flip via the env var to A/B without churn.
     useful_file_contents: Optional[str] = None
     from mm_agents.structagent.config import CAConfig
     if CAConfig.from_env().file_probe:
@@ -971,10 +954,9 @@ def init_ledger(
             logger.info("[LedgerInit] on_probe_dump raised: %s", e)
 
     text_parts: List[str] = [f"Task instruction:\n{instruction.strip()}"]
-    # Multi-app tasks (OSWorld ``multi_apps`` domain): tell the author
-    # to tag every outcome with the app whose state proves it. Single-
-    # app tasks skip this entirely → their prompt is byte-identical to
-    # before. The tags drive the agent's per-app context switching.
+    # Multi-app tasks (OSWorld multi_apps): tell the author to tag every
+    # outcome with the app whose state proves it (drives per-app context
+    # switching). Single-app tasks skip this → byte-identical prompt.
     _ma_apps = [a for a in (related_apps or []) if a and str(a).strip()]
     if len(_ma_apps) > 1:
         text_parts.append(
@@ -1019,15 +1001,12 @@ def init_ledger(
             "pure navigation phase) — that is allowed."
         )
     if doc_inspect_block:
-        # Structured perceiver block (SheetPerceiver / DocPerceiver
-        # output) — character-wide-aligned cell types + formulas + head
-        # rows for Calc, paragraph list + styles for Writer. This is
-        # the authoritative source-of-truth for the open document's
-        # structure. When present, the a11y tree below is REDUNDANT
-        # NOISE (it flattens cells / paragraphs into individual lines
-        # that can't distinguish FORMULA from VALUE from EMPTY, which
-        # is exactly the signal needed to pick the right answer cell),
-        # so we skip it.
+        # Structured perceiver block (SheetPerceiver / DocPerceiver):
+        # aligned cell types + formulas + head rows (Calc), paragraph list +
+        # styles (Writer). Authoritative for document structure. When present
+        # we skip the a11y tree below — it flattens cells/paragraphs into
+        # lines that can't tell FORMULA from VALUE from EMPTY, the exact
+        # signal needed to pick the answer cell.
         text_parts.append(
             "Live document structure (authoritative — produced by a "
             "framework-side UNO probe of the actual open document):\n"
@@ -1069,14 +1048,14 @@ def init_ledger(
             "column-letter / row-number coordinate system applies.\n\n"
             + useful_file_contents
         )
-    # Domain-specific knowledge (only for the matching domain — empty
-    # string for unknown / mismatched domains, so it never bleeds across).
+    # Domain-specific knowledge — only for the matching domain (empty for
+    # unknown/mismatched, so it never bleeds across).
     if domain:
         try:
             from mm_agents.structagent.domain import get_verifier_knowledge
             if len(_ma_apps) > 1:
-                # Multi-app: init_ledger plans the WHOLE cross-app task,
-                # so inject every related app's knowledge, each headed.
+                # Multi-app plans the whole cross-app task — inject every
+                # related app's knowledge, each headed.
                 for _dk_app in _ma_apps:
                     dk = get_verifier_knowledge(_dk_app)
                     if dk:
@@ -1091,41 +1070,33 @@ def init_ledger(
                         f"Domain-specific knowledge for `{domain}` "
                         f"(applies ONLY to this task's domain):\n{dk}"
                     )
-            # Verify specs for the three LibreOffice domains now use the
-            # structured calc_verify / impress_verify / writer_verify
-            # kinds — the framework builds the UNO verify body
-            # deterministically, so no raw-UNO verify template is
-            # injected here anymore. The per-domain VERIFY schema block
-            # is injected separately (see the verify-schema section).
+            # The three LibreOffice domains use structured calc_verify /
+            # impress_verify / writer_verify kinds; the framework builds the
+            # UNO body deterministically, so no raw-UNO template here. The
+            # per-domain VERIFY schema block is injected separately below.
         except Exception as e:
             logger.info("[LedgerInit] domain_knowledge load failed: %s", e)
 
-    # Verifier experience memory: in boundary mode (always on) t=0 emits
-    # milestone DESCRIPTIONS only (no VerifySpec), so the spec-authoring recipe
-    # block is not injected here — ENABLE_VERIFIER_EXPERIENCE_MEMORY instead
-    # feeds the boundary verifier via retrieved CHECK RECIPES at the boundary
-    # (see query_check_recipes).
+    # Verifier experience memory: boundary-mode t=0 emits descriptions only
+    # (no VerifySpec), so the spec-authoring recipe block isn't injected here.
+    # ENABLE_VERIFIER_EXPERIENCE_MEMORY instead feeds the boundary verifier
+    # retrieved CHECK RECIPES at the boundary (see query_check_recipes).
 
-    # Phase B: structured Q1-Q4 reasoning block for Calc tasks. The
-    # WORKBOOK STRUCTURE block + the Q1-Q4 STOP chain in the domain
-    # knowledge block give the model the input + the question shape;
-    # the data_layout block forces the answer slot in the JSON output
-    # so the reasoning is visible and downstream verify-spec building
-    # has a grounded column-letter / row-range anchor to copy from.
-    # Phase C: structured kind="calc_verify" / "impress_verify" verify
-    # spec block — the framework builds the python3 -c body server-side
-    # so the LLM no longer writes Python source for verify (eliminates
-    # the ``from uno_helper import`` hallucination class).
+    # Phase B: Q1-Q4 reasoning block for Calc. WORKBOOK STRUCTURE + the
+    # Q1-Q4 STOP chain in domain knowledge give the input + question shape;
+    # data_layout forces an answer slot in the output so reasoning is visible
+    # and verify-spec building has a grounded column/row anchor to copy.
+    # Phase C: calc_verify / impress_verify schema block — framework builds
+    # the python3 -c body server-side, so the LLM never writes verify Python
+    # (kills the ``from uno_helper import`` hallucination class).
     #
-    # MULTI-APP: a multi_apps task plans outcomes across EVERY related
-    # app, but ``domain`` is only related_apps[0]. Gating these blocks
-    # on ``domain == "libreoffice_calc"`` therefore SKIPPED them for a
-    # multi-app task whose first app isn't calc — the prompt then told
-    # the LLM (directive 6a/6b) to emit calc_verify/impress_verify but
-    # never showed the schema, so it fell back to a hand-written (often
-    # broken) shell_command UNO one-liner. Inject for EVERY office app
-    # the task spans. Single-app tasks: ``_verify_apps == [domain]`` →
-    # byte-identical to before.
+    # MULTI-APP: a multi_apps task plans across EVERY related app, but
+    # ``domain`` is only related_apps[0]. Gating on domain=="libreoffice_calc"
+    # skipped these blocks when the first app isn't calc — directive 6a/6b
+    # then told the LLM to emit calc_verify/impress_verify without showing the
+    # schema, so it fell back to a broken shell_command UNO one-liner. Inject
+    # for every office app the task spans. Single-app: _verify_apps==[domain]
+    # → byte-identical to before.
     _verify_apps = {
         (a or "").lower()
         for a in (_ma_apps if len(_ma_apps) > 1 else [domain])
@@ -1161,12 +1132,11 @@ def init_ledger(
             logger.info("[LedgerInit] writer_verify block load "
                         "failed: %s", e)
 
-    # Multi-app JSON schema update — placed LAST so it is the
-    # authoritative output template. The office ``data_layout`` block
-    # injected above ships its own "JSON schema update" that omits
-    # ``phases``; without this final schema the LLM follows that one
-    # and drops the phase board. This block restates the full shape
-    # with ``phases`` in it, and shows ``data_layout`` coexisting.
+    # Multi-app JSON schema update — placed LAST so it's the authoritative
+    # output template. The office data_layout block above ships its own
+    # "JSON schema update" that omits ``phases``; without this final schema
+    # the LLM follows that one and drops the phase board. Restates the full
+    # shape with ``phases`` and shows ``data_layout`` coexisting.
     if len(_ma_apps) > 1:
         text_parts.append(
             "JSON schema update for MULTI-APP tasks (authoritative — "
@@ -1207,9 +1177,8 @@ def init_ledger(
     )
     user_content.append({"type": "text", "text": "\n\n".join(text_parts)})
 
-    # Boundary-verify mode (always on): author milestone DESCRIPTIONS only at
-    # t=0; the verify METHOD is authored later at the boundary with full
-    # context. Append a forceful override here + force verify=None below.
+    # Boundary-verify mode: author descriptions only at t=0; verify METHOD
+    # comes later at the boundary. Append override here + force verify=None below.
     user_content.append({"type": "text", "text": _DESC_ONLY_OVERRIDE})
 
     messages = [
@@ -1218,12 +1187,10 @@ def init_ledger(
     ]
 
     def _call_once(_messages: List[Dict[str, Any]]) -> str:
-        """Single LLM invocation. Follows the global thinking-mode env
-        (``QWEN35_THINKING``) — when enabled, the model walks the verify-
-        kind decision tree (key in probe? value uniquely grounded? glob-
-        forbidden?) before emitting JSON, which empirically cuts the
-        invented-key class of bugs. ``_parse_seed_json`` strips any
-        ``<think>...</think>`` prefix before parsing."""
+        """Single LLM invocation. Honors QWEN35_THINKING: when on, the model
+        walks the verify-kind decision tree before emitting JSON, which cuts
+        the invented-key bug class. ``_parse_seed_json`` strips any
+        ``<think>...</think>`` prefix."""
         try:
             return call_llm(
                 {"model": model, "messages": _messages,
@@ -1234,32 +1201,26 @@ def init_ledger(
             logger.warning("[LedgerInit] LLM call failed: %s", e)
             return ""
 
-    # Up to 3 outer attempts. Same temperature=0.0 still produces
-    # non-trivial variance on OpenRouter qwen3.5-9b (observed: same
-    # input, different outcome counts / setting keys across runs).
-    # When the LLM yields zero outcomes, parsing failed, or no
-    # file_grep emerged, retry — the cost is small and avoids
-    # dropping the entire ledger to empty on one bad sample.
+    # Up to 3 attempts. temperature=0.0 still varies on OpenRouter qwen3.5-9b
+    # (same input → different outcome counts/keys across runs). Retry on zero
+    # outcomes / parse failure — cheap, avoids an empty ledger from one bad
+    # sample.
     parsed: Optional[Dict[str, Any]] = None
     outcomes: List[Outcome] = []
     raw: Optional[str] = None
     for attempt in range(1, 4):
         raw_attempt = _call_once(messages)
-        # Side-effect: dump the exact prompt + raw LLM response for offline
-        # inspection so we can audit why the author LLM produced a given
-        # outcome shape / verifier code. Only on attempt 1 to keep
-        # disk usage bounded; subsequent attempts use the same messages
-        # but a fresh LLM sample.
+        # Dump prompt + raw response for offline audit of why the author LLM
+        # produced a given outcome/verifier shape.
         if on_prompt_dump is not None:
             try:
                 on_prompt_dump(messages, attempt, raw_attempt or "")
             except Exception as e:
                 logger.info("[LedgerInit] on_prompt_dump raised: %s", e)
         parsed_attempt = _parse_seed_json(raw_attempt) if raw_attempt else None
-        # If raw parsing failed (e.g. the model misnests
-        # `expected_substring` INSIDE the `command` array), one extra
-        # LLM-driven repair pass usually rescues the response —
-        # cheaper than discarding the whole attempt.
+        # On parse failure (e.g. model nests `expected_substring` inside the
+        # `command` array), one LLM repair pass usually rescues the response —
+        # cheaper than discarding the attempt.
         if parsed_attempt is None and raw_attempt:
             try:
                 from mm_agents.structagent.ledger.support.json_repair import repair_json_via_llm
@@ -1276,11 +1237,10 @@ def init_ledger(
                 logger.info("[LedgerInit] json_repair raised: %s", e)
         outcomes_attempt = _build_outcomes(parsed_attempt)
         if outcomes_attempt:
-            # VALUE PROVENANCE enforcement: any value the model marked UNKNOWN
-            # must not still be a hardcoded literal in a verify spec (it should
-            # be a ${slot} or omitted). When it is, push back with the specific
-            # offenders and retry — the model's own self-classification is the
-            # signal, so this needs no per-task knowledge.
+            # VALUE PROVENANCE: a value the model marked UNKNOWN must not stay
+            # a hardcoded literal in a verify spec (should be ${slot} or
+            # omitted). Push back with the offenders and retry — uses the
+            # model's own classification, so no per-task knowledge needed.
             _viol = _value_provenance_violations(parsed_attempt)
             if _viol and attempt < 3:
                 logger.warning(
@@ -1308,11 +1268,10 @@ def init_ledger(
                     "[LedgerInit] attempt %d yielded 0 outcomes; giving up",
                     attempt)
 
-    # Descriptions-only (boundary mode, always on): the verify METHOD is
-    # authored at the boundary, not now. Force verify=None even if the author
-    # LLM emitted one despite the override, and SKIP repair-or-drop (it would
-    # otherwise rewrite or drop every spec-less outcome — exactly the t=0 specs
-    # we're deferring).
+    # Descriptions-only (boundary mode): verify METHOD is authored at the
+    # boundary. Force verify=None even if the LLM emitted one despite the
+    # override, and skip repair-or-drop (it would otherwise rewrite/drop every
+    # spec-less outcome — exactly the t=0 specs we're deferring).
     for _o in outcomes:
         _o.verify = None
 
@@ -1322,10 +1281,9 @@ def init_ledger(
     if useful_file_contents:
         ctx.useful_file_contents = useful_file_contents
 
-    # Multi-app: build the PhaseBoard from the LLM's ``phases`` array
-    # and assign each SURVIVING outcome to its phase. Single-app tasks
-    # have no ``phases`` key → from_init_payload returns None → no
-    # phase board → every downstream phase call site is a no-op.
+    # Multi-app: build the PhaseBoard from the LLM's ``phases`` array and
+    # assign each surviving outcome to its phase. Single-app has no ``phases``
+    # → from_init_payload returns None → downstream phase call sites no-op.
     phase_board = None
     if len(_ma_apps) > 1:
         try:
@@ -1333,9 +1291,8 @@ def init_ledger(
             phase_board = PhaseBoard.from_init_payload(
                 (parsed or {}).get("phases"))
             if phase_board is not None:
-                # id → 1-based phase index, read from the parsed outcome
-                # list. Match by id (not index): fact-check / repair may
-                # have dropped or reordered outcomes since the draft.
+                # id → 1-based phase index. Match by id, not position:
+                # fact-check/repair may have dropped or reordered outcomes.
                 _id2phase: Dict[str, int] = {}
                 for _o in (parsed or {}).get("required_outcomes", []) or []:
                     if isinstance(_o, dict) and _o.get("id") is not None:
@@ -1343,13 +1300,13 @@ def init_ledger(
                             _id2phase[str(_o["id"])] = int(_o.get("phase"))
                         except (TypeError, ValueError):
                             pass
-                _unplaced = []                     # §7: outcomes with no phase
+                _unplaced = []                     # outcomes with no phase
                 for _oc in outcomes:
                     _pi = _id2phase.get(_oc.id)
                     if _pi is not None and 1 <= _pi <= len(phase_board.phases):
                         phase_board.phases[_pi - 1].outcome_ids.append(_oc.id)
                     else:
-                        _unplaced.append(_oc)      # collected (no phase); not surfaced
+                        _unplaced.append(_oc)      # collected; not surfaced
                 logger.info(
                     "[LedgerInit] PhaseBoard: %d phases — %s%s",
                     len(phase_board.phases),
@@ -1387,15 +1344,13 @@ def init_ledger(
 # --------------------------------------------------------------------------- #
 
 def _value_provenance_violations(parsed: Optional[Dict[str, Any]]) -> List[str]:
-    """Return the UNKNOWN-classified values that the model STILL hardcoded as
-    literals inside some verify spec — each should have been a ``${slot}`` or
-    omitted. Empty list = clean (or no value_provenance emitted).
+    """Return UNKNOWN-classified values still hardcoded as literals in some
+    verify spec (each should be a ``${slot}`` or omitted). Empty = clean or no
+    value_provenance.
 
-    Mechanism: the model self-classifies each literal in ``value_provenance``;
-    we only enforce its own verdict, so no per-task knowledge is needed. A
-    value that was correctly slotted appears in the specs as ``${slot}`` (not
-    the literal), so it does not trip this check. Short values (≤3 chars) are
-    skipped to avoid coincidental substring matches.
+    Enforces the model's own ``value_provenance`` verdict, so no per-task
+    knowledge needed. Correctly slotted values appear as ``${slot}`` and don't
+    trip this. Short values (<=3 chars) skipped to avoid coincidental matches.
     """
     if not isinstance(parsed, dict):
         return []
@@ -1423,23 +1378,19 @@ def _value_provenance_violations(parsed: Optional[Dict[str, Any]]) -> List[str]:
 def _parse_seed_json(raw: str) -> Optional[Dict[str, Any]]:
     """Extract the JSON object from an LLM response, tolerating prose fences.
 
-    Uses ``json.JSONDecoder.raw_decode`` rather than naive brace-counting —
-    raw_decode is JSON-aware (it tracks string boundaries and escape
-    sequences), so it correctly stops at the matching outer brace even
-    when the JSON contains escaped curly braces inside string values
-    (e.g. regex patterns like ``"\\{"`` for proximity-matching nested
-    JSON objects). The previous balance-counting implementation
-    silently dropped any outcome whose verify.patterns included an
-    escaped brace, returning ``None`` and yielding a 0-outcome ledger.
+    Uses ``json.JSONDecoder.raw_decode``, not brace-counting: raw_decode is
+    JSON-aware (tracks strings + escapes), so it stops at the right outer brace
+    even when string values contain escaped curly braces (e.g. regex ``"\\{"``).
+    The old balance-counter silently dropped any outcome whose verify.patterns
+    held an escaped brace, returning ``None`` → empty ledger.
     """
     if not raw:
         return None
     s = raw.strip()
 
-    # Strip Qwen3.5-VL thinking-mode prefix. When QWEN35_THINKING=1 the
-    # model emits ``<reasoning>...</think>\n{JSON}``; the find-first-`{`
-    # heuristic below would otherwise hit a brace inside the reasoning
-    # block (e.g. an inline example) and raw_decode would fail.
+    # Strip Qwen3.5-VL thinking prefix. With QWEN35_THINKING=1 the model emits
+    # ``<reasoning>...</think>\n{JSON}``; without stripping, find-first-`{`
+    # could land on a brace inside the reasoning block and raw_decode fails.
     think_end = s.rfind("</think>")
     if think_end >= 0:
         s = s[think_end + len("</think>"):].lstrip()
@@ -1468,7 +1419,7 @@ def _build_context(
     active_url: Optional[str],
 ) -> InitialContext:
     ctx_d = (parsed or {}).get("initial_context") or {}
-    # Prefer LLM-parsed, fall back to caller-provided hints.
+    # Prefer LLM-parsed, fall back to caller hints.
     return InitialContext(
         open_tabs=list(ctx_d.get("open_tabs") or []),
         active_url=(ctx_d.get("active_url") or active_url),
@@ -1480,9 +1431,8 @@ def _build_context(
 def _parse_verify_spec(raw: Any) -> Optional["VerifySpec"]:
     """Parse a verify dict from LLM output into a VerifySpec.
 
-    Returns None if the dict is missing, malformed, or has an
-    unknown kind. Invalid specs are dropped silently — the outcome
-    falls back to the legacy LLM KeyNode path."""
+    Returns None on missing/malformed/unknown-kind input. Invalid specs are
+    dropped silently — the outcome falls back to the legacy LLM KeyNode path."""
     from mm_agents.structagent.ledger.core.ledger import VerifySpec
     if not isinstance(raw, dict):
         return None
@@ -1491,18 +1441,16 @@ def _parse_verify_spec(raw: Any) -> Optional["VerifySpec"]:
                     "shell_command", "calc_verify", "impress_verify",
                     "writer_verify"):
         return None
-    # Cap proximity_lines at 4 to prevent cross-entry false positives in
-    # list-style files (e.g. keybindings.json): same-entry "key" + "command"
-    # sit ~1 line apart in pretty-printed JSON, so a 3-line window catches
-    # them; a 5+ line window starts swallowing the next entry's fields.
+    # Cap proximity_lines at 4 to avoid cross-entry false positives in
+    # list-style files (keybindings.json): same-entry "key"+"command" sit ~1
+    # line apart, so 3 catches them; 5+ swallows the next entry's fields.
     prox_raw = raw.get("proximity_lines")
     if isinstance(prox_raw, int) and prox_raw > 0:
         prox = min(prox_raw, 4)
     else:
         prox = None
-    # Dual-channel safety net (consumed by KeyNode LLM path for
-    # a11y_match outcomes). Both fields accept lists of free-form
-    # single-sentence clauses; non-string elements are dropped.
+    # Dual-channel safety net (KeyNode LLM path, a11y_match outcomes). Lists of
+    # free-form single-sentence clauses; non-string elements dropped.
     must_hold = [
         s for s in (raw.get("visual_must_hold") or [])
         if isinstance(s, str) and s.strip()
@@ -1518,7 +1466,7 @@ def _parse_verify_spec(raw: Any) -> Optional["VerifySpec"]:
     )
     exit_raw = raw.get("expected_exit_code", 0)
     if isinstance(exit_raw, bool):
-        # Python's bool is a subclass of int; treat True/False as bogus.
+        # bool is an int subclass; treat True/False as bogus.
         exit_code: Optional[int] = 0
     elif isinstance(exit_raw, int):
         exit_code = exit_raw
@@ -1567,9 +1515,8 @@ def _parse_verify_spec(raw: Any) -> Optional["VerifySpec"]:
     )
     if not spec.is_valid():
         return None
-    # Soft-validate that a11y_match outcomes carry the dual-channel
-    # net. Missing visual_must_hold is logged but not fatal — falls
-    # back to legacy a11y-only LLM judging.
+    # Soft-validate the dual-channel net on a11y_match. Missing
+    # visual_must_hold is logged, not fatal — falls back to a11y-only judging.
     if kind == "a11y_match" and not must_hold:
         logger.warning(
             "[LedgerInit] a11y_match outcome missing visual_must_hold "
@@ -1593,38 +1540,27 @@ def _repair_or_drop_unverifiable_outcomes(
 ) -> List[Outcome]:
     """Guarantee every shipped outcome has a RUNNABLE verify.
 
-    An outcome left with ``verify=None`` (the LLM emitted no usable
-    verify, or one that failed ``is_valid()``) can never be verified:
-    the deterministic path has nothing to run, and the LLM
-    soft-detector cannot observe states like "data is on the
-    clipboard". It then sits ``pending`` the whole task and traps
-    ``next_focus_outcome`` (focus never advances past it, and its
-    downstream is never focusable). DONE is already shielded by the
-    leaf-gate, but the focus trap and the misleading prompt remain.
+    An outcome with ``verify=None`` (LLM emitted none, or one failing
+    ``is_valid()``) can never be verified — deterministic path has nothing to
+    run, soft-detector can't observe states like "data on clipboard". It sits
+    ``pending`` and traps ``next_focus_outcome`` (focus never advances, its
+    downstream never focusable). The leaf-gate shields DONE, but the focus trap
+    and misleading prompt remain.
 
-    For every outcome without a valid verify:
-      1. REPAIR — one focused ``reauthor_outcome_verifier`` call
-         (injects the structured verify schema for the outcome's app,
-         e.g. calc_verify incl. ``clipboard_has_content``).
-      2. If repair still fails:
-         * Whether INTERMEDIATE or LEAF, KEEP the outcome with
-           ``verify=None``. [FIX keep_unverifiable_outcomes] The
-           previous behavior dropped intermediates here, on the
-           reasoning "a downstream leaf proves the intermediate ran".
-           That reasoning failed for tasks like 82e3c869 (put images
-           in folder → zip): the intermediate "images_moved" had no
-           verify, was dropped, the leaf "zip exists" passed on an
-           EMPTY zip, agent declared DONE on an empty deliverable.
-           Keeping the unverifiable outcome leaves a visible
-           "no_verify" entry in the ledger / planner prompt so the
-           agent at least sees the imperative exists, and the
-           soft-detector can still judge it from screenshots.
-           Roll back the keep-by-default by reverting this block to
-           the prior drop+re-wire branch.
+    Per outcome without a valid verify:
+      1. REPAIR — one ``reauthor_outcome_verifier`` call (injects the app's
+         structured verify schema, e.g. calc_verify incl. clipboard_has_content).
+      2. If repair fails: KEEP it with ``verify=None`` (leaf or intermediate).
+         [FIX keep_unverifiable_outcomes] We used to drop intermediates here on
+         "a downstream leaf proves the intermediate ran". That broke 82e3c869
+         (put images in folder → zip): "images_moved" had no verify, was
+         dropped, "zip exists" passed on an EMPTY zip → DONE on nothing.
+         Keeping it leaves a visible "no_verify" entry so the agent sees the
+         imperative exists, and the soft-detector can still judge from
+         screenshots. Roll back by restoring the prior drop+re-wire branch.
 
-    The guarantee does NOT rely on the LLM — repair is best-effort,
-    the soft-detector is the deterministic backstop. Single-app tasks
-    whose outcomes all carry valid verifies are returned unchanged.
+    Does NOT rely on the LLM — repair is best-effort, soft-detector is the
+    backstop. Outcomes that all carry valid verifies return unchanged.
     """
     if not outcomes:
         return outcomes
@@ -1672,16 +1608,12 @@ def _repair_or_drop_unverifiable_outcomes(
                 logger.info("[LedgerInit] repaired null verify: "
                             "outcome=%s -> kind=%s", o.id, new_spec.kind)
                 continue
-        # repair failed — [FIX a11y_fallback_verify] Synthesize an
-        # ``a11y_match`` verify whose grounding is a single visual
-        # clause (the outcome's evidence_hint, used verbatim) for
-        # KeyNode's LLM to judge against the current screenshot.
-        # No rule-based keyword extraction — the description IS the
-        # judge prompt, the model uses visual + context to decide.
-        # Better than ``verify=None`` (which leaves the outcome
-        # inert) and more honest than fabricating a shell verify.
-        # Roll back by replacing this branch with the prior
-        # ``logger.warning(... kept with verify=None ...)`` one-liner.
+        # Repair failed — [FIX a11y_fallback_verify] Synthesize an a11y_match
+        # verify grounded on a single visual clause (the evidence_hint
+        # verbatim) for KeyNode's LLM to judge against the screenshot. No
+        # keyword extraction: the description IS the judge prompt. Better than
+        # inert ``verify=None`` and more honest than a fabricated shell verify.
+        # Roll back to the prior ``kept with verify=None`` warning one-liner.
         _role = "INTERMEDIATE" if o.id in depended else "LEAF"
         _hint = (getattr(o, "evidence_hint", None) or "").strip() \
                 or (getattr(o, "description", None) or "").strip()
@@ -1709,10 +1641,9 @@ _SLOT_TYPES = {"url", "text", "path", "numeric", "cell_ref"}
 def _build_slots(parsed: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Parse the top-level ``slots`` array into ``{name: Slot}``.
 
-    Drops malformed entries silently — the verifier handles an unknown
-    ``${name}`` by treating it as unresolved (returns None), so a missing
-    slot is safe (just degrades to the LLM judge path) rather than a
-    crash. Coerces unknown ``type`` to "text" (the most permissive)."""
+    Drops malformed entries silently — an unknown ``${name}`` is treated as
+    unresolved (returns None), so a missing slot degrades to the LLM judge path
+    rather than crashing. Unknown ``type`` coerces to "text" (most permissive)."""
     from mm_agents.structagent.ledger.core.ledger import VerifySpecSlot
     raw_list = (parsed or {}).get("slots") or []
     out: Dict[str, VerifySpecSlot] = {}
@@ -1741,12 +1672,11 @@ def _build_outcomes(parsed: Optional[Dict[str, Any]]) -> List[Outcome]:
     raw_list = (parsed or {}).get("required_outcomes") or []
     out: List[Outcome] = []
     seen_ids = set()
-    # Two-pass: first collect normalized ids so we can validate
-    # depends_on against the actual id set (the LLM sometimes writes
-    # depends_on entries that look semantic but don't match the
-    # normalized id; we'll only keep deps that resolve to a real id).
+    # Two-pass: collect normalized ids first so depends_on can be validated
+    # against the real id set (the LLM emits semantic-looking deps that don't
+    # match the normalized id; keep only deps that resolve).
     parsed_items: List[Dict[str, Any]] = []
-    for item in raw_list[:8]:  # hard cap to avoid runaway
+    for item in raw_list[:8]:  # hard cap
         if not isinstance(item, dict):
             continue
         oid = (item.get("id") or "").strip()
@@ -1762,10 +1692,9 @@ def _build_outcomes(parsed: Optional[Dict[str, Any]]) -> List[Outcome]:
 
     valid_ids = {p["id"] for p in parsed_items}
     for p in parsed_items:
-        # depends_on: list of ids that must already be in valid_ids.
-        # Drop self-references and unknown ids silently — keeps the
-        # cache safe even if the LLM hallucinates a dep on a sibling
-        # outcome that didn't end up parsed.
+        # depends_on: ids that must be in valid_ids. Drop self-refs and unknown
+        # ids silently — safe even if the LLM hallucinates a dep on a sibling
+        # that didn't parse.
         deps_raw = p["raw"].get("depends_on") or []
         if not isinstance(deps_raw, list):
             deps_raw = []
@@ -1777,9 +1706,9 @@ def _build_outcomes(parsed: Optional[Dict[str, Any]]) -> List[Outcome]:
             if d_norm and d_norm != p["id"] and d_norm in valid_ids and d_norm not in deps:
                 deps.append(d_norm)
         verify = _parse_verify_spec(p["raw"].get("verify"))
-        # Multi-app: the author tags each outcome with the app whose
-        # state proves it. Normalized to the underscore form used for
-        # domain routing. Absent / non-string (single-app tasks) → None.
+        # Multi-app: author tags each outcome with the app whose state proves
+        # it. Normalized to the underscore form used for domain routing.
+        # Absent/non-string (single-app) → None.
         app_raw = p["raw"].get("app")
         app = None
         if isinstance(app_raw, str) and app_raw.strip():
@@ -1872,8 +1801,8 @@ def _format_verify_for_reauthor(spec: Optional[VerifySpec]) -> str:
 
 
 def _format_trace_for_reauthor(trace: Optional[Dict[str, Any]]) -> str:
-    """Compact summary of the last failing verifier trace, including
-    file content preview when available — same info the diagnoser saw."""
+    """Compact summary of the last failing verifier trace (with file-content
+    preview when available) — same info the diagnoser saw."""
     if not isinstance(trace, dict) or not trace:
         return "(no trace available)"
     kind = trace.get("kind") or "?"
@@ -1929,18 +1858,13 @@ def reauthor_outcome_verifier(
     domain: Optional[str] = None,
 ) -> Optional[VerifySpec]:
     """Re-author the ``verify`` spec for one outcome whose deterministic
-    verifier keeps rejecting DONE despite (per the diagnoser) the actor
-    having substantially completed the work.
+    verifier keeps rejecting DONE despite (per the diagnoser) the work being
+    substantially complete.
 
-    Reuses :data:`_SYSTEM_PROMPT` so the LLM has the full set of
-    authoring rules (kinds, KNOWN APP CONFIG PATHS, pattern-writing
-    tips, dual-channel gates) in scope, plus a ``REAUTHOR MODE``
-    preamble that constrains it to rewriting a single outcome.
-
-    Returns a fresh :class:`VerifySpec` on success, or ``None`` if the
-    LLM call fails / the response can't be parsed / the produced spec
-    is invalid. The caller decides what to do with ``None`` (typically:
-    leave the existing spec in place and treat it as a no-op patch).
+    Reuses :data:`_SYSTEM_PROMPT` for the full authoring rules, plus a
+    ``REAUTHOR MODE`` preamble constraining it to one outcome. Returns a fresh
+    :class:`VerifySpec`, or ``None`` on LLM/parse/validity failure (caller
+    typically leaves the existing spec as a no-op patch).
     """
     user_content: List[Dict[str, Any]] = []
 
@@ -1984,11 +1908,10 @@ def reauthor_outcome_verifier(
         )
     if active_url:
         text_parts.append(f"\nActive tab URL (aux): {active_url}")
-    # The reauthor targets ONE outcome. For a multi-app task the right
-    # domain is that outcome's own ``app`` tag — NOT ``domain`` (which
-    # is only related_apps[0]). Without this, re-authoring a calc
-    # outcome on a writer-first multi-app task got the writer schema
-    # (or none) and the LLM fell back to a broken shell_command UNO.
+    # Reauthor targets ONE outcome, so the domain is that outcome's own ``app``
+    # tag — NOT ``domain`` (only related_apps[0]). Without this, re-authoring a
+    # calc outcome on a writer-first task got the writer schema (or none) and
+    # the LLM fell back to a broken shell_command UNO.
     _reauthor_dom = (getattr(outcome, "app", None) or domain or "")
     if _reauthor_dom:
         try:
@@ -2001,12 +1924,10 @@ def reauthor_outcome_verifier(
                 )
         except Exception as e:
             logger.info("[ReauthorVerifier] domain_knowledge load failed: %s", e)
-    # Inject the structured-verify schema blocks for the domain so the
-    # reauthor LLM keeps emitting ``calc_verify`` / ``impress_verify``
-    # (with structured ``calc_checks`` / ``impress_checks``) instead of
-    # downgrading to ``shell_command`` + python-pptx (uninstalled on
-    # the VM) or worse, an invented ``uno_helper`` import. Init_ledger
-    # already injects these blocks; the reauthor was missing them.
+    # Inject the domain's structured-verify schema so the reauthor LLM keeps
+    # emitting calc_verify / impress_verify instead of downgrading to
+    # shell_command + python-pptx (uninstalled) or an invented uno_helper
+    # import. init_ledger already injects these; reauthor was missing them.
     dom_lc = _reauthor_dom.lower()
     if dom_lc == "libreoffice_calc":
         try:
@@ -2065,9 +1986,8 @@ def reauthor_outcome_verifier(
             outcome.id,
         )
         return None
-    # Pick the entry whose id matches; fall back to the first entry if
-    # the LLM accidentally renamed it (we keep the original outcome.id
-    # at the call site regardless — only the verify spec changes).
+    # Pick the entry whose id matches; fall back to the first if the LLM
+    # renamed it (call site keeps the original id — only the verify changes).
     target = None
     for item in raw_list:
         if isinstance(item, dict) and (item.get("id") or "").strip().lower() == outcome.id.lower():
@@ -2105,27 +2025,26 @@ def apply_reauthor_pass(
     active_url: Optional[str] = None,
     domain: Optional[str] = None,
 ) -> None:
-    """For each non-verified outcome whose diagnoser has consecutively
-    flagged ``verifier_mismatch``, invoke :func:`reauthor_outcome_verifier`
-    to rewrite its ``verify`` spec.
+    """Rewrite the ``verify`` spec of each non-verified outcome whose diagnoser
+    has consecutively flagged ``verifier_mismatch``, via
+    :func:`reauthor_outcome_verifier`.
 
     Gates (all must hold per outcome):
-      • G1 ``verifier_mismatch_strikes[oid] >= VERIFIER_REAUTHOR_MIN_STRIKES``
-      • G2 ``done_rejected_count[oid]      >= VERIFIER_REAUTHOR_MIN_DONE_REJECTIONS``
-      • G4 ``patch_applied[oid]            <  VERIFIER_REAUTHOR_MAX_PATCHES``
+      • G1 ``verifier_mismatch_strikes >= VERIFIER_REAUTHOR_MIN_STRIKES``
+      • G2 ``done_rejected_count       >= VERIFIER_REAUTHOR_MIN_DONE_REJECTIONS``
+      • G4 ``patch_applied            <  VERIFIER_REAUTHOR_MAX_PATCHES``
 
-    Successful re-author mutates ``outcome.verify`` in place, bumps
-    ``patch_applied[oid]``, resets ``verifier_mismatch_strikes[oid]``
-    and clears ``last_diagnosis_signature[oid]`` so the next force-replan
-    re-diagnoses against the new spec. Failures (parse / invalid spec /
-    LLM error) leave state untouched.
+    On success: mutates ``outcome.verify`` in place, bumps ``patch_applied``,
+    resets ``verifier_mismatch_strikes``, clears ``last_diagnosis_signature``
+    so the next force-replan re-diagnoses against the new spec. Failures leave
+    state untouched.
     """
     from mm_agents.structagent.ledger.core.timeline import (
         VERIFIER_REAUTHOR_MIN_STRIKES,
         VERIFIER_REAUTHOR_MIN_DONE_REJECTIONS,
         VERIFIER_REAUTHOR_MAX_PATCHES,
     )
-    # A1: state lives on each Outcome directly (was OutcomeStateCache).
+    # State lives on each Outcome directly (was OutcomeStateCache).
     candidates: List[Outcome] = []
     for o in bad_outcomes:
         cause = o.last_diagnosis_cause or ""

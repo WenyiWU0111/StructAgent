@@ -1,41 +1,25 @@
-"""DecomposerActor — decomposer LLM with inline grounding, a drop-in
-replacement for the UI-TARS actor call.
+"""Decomposer actor with inline grounding — drop-in replacement for the
+UI-TARS actor call.
 
-Contract
---------
-``call_decomposer_actor`` takes the same args shape as
-``qwen25vl_agent_planner.Qwen25VLAgentPlanner._pa_call_actor`` and returns
-a plain string in UI-TARS's output format:
+``call_decomposer_actor`` takes the same args as
+``Qwen25VLAgentPlanner._pa_call_actor`` and returns a UI-TARS-format string:
 
     Thought: <one-line reasoning>
     Action: click(start_box='(994,445)')
 
     type(content='coffee makers')
 
-    hotkey(key='enter')
+The upstream parser ``_pa_action_to_pyautogui_codes`` only needs the
+``Action:`` split marker, actions separated by blank lines, and each action
+being one of the known forms (click/type/hotkey/scroll/wait/finished or the
+bare ``<Impossible>``). We emit exactly that so downstream needs no changes.
 
-The upstream parser ``_pa_action_to_pyautogui_codes`` (line 1180 in
-qwen25vl_agent_planner) only cares about three things:
-
-  - The literal token ``Action:`` as a split marker.
-  - Actions separated by blank lines (``\\n\\n``).
-  - Each action being one of ``click(start_box=...)``,
-    ``type(content=...)``, ``hotkey(key=...)``, ``scroll(start_box=...,
-    direction=...)``, ``wait()``, ``finished()``, or the bare token
-    ``<Impossible>``.
-
-We emit exactly that format so downstream code needs no changes.
-
-Pipeline
---------
-1. Call the **decomposer** (Qwen3.5-VL @ :8010, reused planner server)
-   with the A2 system prompt + screenshot + subgoal. It returns a JSON
-   list of typed step dicts, each carrying its own 0-1000 grid coordinates
-   (inline grounding — the decomposer reads the location from the
-   screenshot itself; see ``INLINE_GROUNDING_INSTRUCTION``).
-2. Convert each step's normalized coordinates to pixels via
-   ``_point_to_pixels`` (multiply by the physical screen size).
-3. Compose the final UI-TARS-shaped string.
+Pipeline:
+1. Call the decomposer (Qwen3.5-VL @ :8010, the planner server) with the A2
+   prompt + screenshot + subgoal. Returns a JSON list of typed steps, each
+   carrying its own 0-1000 inline coords (see INLINE_GROUNDING_INSTRUCTION).
+2. De-normalize coords to pixels via ``_point_to_pixels``.
+3. Compose the UI-TARS string.
 """
 from __future__ import annotations
 
@@ -52,10 +36,8 @@ import openai
 logger = logging.getLogger("mm_agents.decomposer_actor")
 
 
-# INLINE grounding directive — appended to the decomposer system prompt by
-# actor.py. The decomposer reads each element's location from the screenshot
-# itself and emits 0-1000 grid coordinates. Single source of truth: edit
-# only here.
+# Inline grounding directive — appended to the decomposer system prompt by
+# actor.py. Single source of truth; edit only here.
 INLINE_GROUNDING_INSTRUCTION = (
     "[INLINE GROUNDING MODE]\n"
     "For EVERY action that targets a UI element, in ADDITION to "
@@ -75,91 +57,73 @@ INLINE_GROUNDING_INSTRUCTION = (
 )
 
 
-# Actions the decomposer is allowed to emit. Keep this list mirrored with
-# the seed A2_actor_decomposer_points.txt template AND the UI-TARS action
-# space declared in mm_agents/qwen25vl_agent_planner.py so the downstream
-# parser (``_pa_action_to_pyautogui_codes``) can digest every variant.
+# Actions the decomposer may emit. Keep mirrored with the seed
+# A2_actor_decomposer_points.txt template AND the UI-TARS action space in
+# qwen25vl_agent_planner.py so the downstream parser accepts every variant.
 _ALLOWED_ACTIONS = {
     "click",          # single left click
     "left_double",    # double-click (open folder / file)
     "right_single",   # right-click (context menu)
     "drag",           # click-and-drag from start_target to end_target
     "type",           # keyboard typewrite
-    "hotkey",         # single key or combo (e.g. "ctrl+a", "enter")
+    "hotkey",         # single key or combo
     "scroll",         # scroll in a direction, anchored near anchor_target
     "wait",           # sleep 5s then re-observe
-    "impossible",     # current subgoal cannot be achieved here
+    "impossible",     # subgoal can't be achieved here
     "navigate",       # Chrome page navigation via CDP HTTP endpoint.
-                      # Schema: {"action":"navigate", "url": "https://...",
-                      # "new_tab": false}. One reliable step replacing
-                      # the (hotkey ctrl+l → type URL\\n) GUI dance —
-                      # needed for cross-site multi-hop tasks.
-    "finished",       # Terminal sentinel for text-answer tasks
-                      # (WebVoyager / Mind2Web / MMInA). Schema:
-                      # {"action":"finished", "answer":"<text or URL>"}.
-                      # Detected by agent.py's text-answer sentinel
-                      # block in _pa_predict — terminates the episode
-                      # and hands the answer to the runner / judge.
-    "edit_json",      # safely modify a JSON config file via direct file IO
-                      # (json.load → mutate dict/list → json.dump). Replaces
-                      # GUI ctrl+a + type sequences which corrupt JSON via
-                      # partial-content overwrite. See edit_json_helpers.py.
-    "cli_run",        # one-shot bash command via subprocess on the VM
-                      # (NOT inside any GUI terminal). Use to launch GUI
-                      # apps on a path (`code <path>`, `firefox <url>`),
-                      # do non-JSON file edits via sed/cp, or perform
-                      # nested JSON mutations edit_json's flat ops can't
-                      # express. See cli_run_helpers.py.
-    "extract_info",   # batch-read N files from the VM filesystem and
-                      # ask the planner LLM to extract structured info
-                      # per file (sequential, one LLM call per file).
-                      # Bypasses GUI gymnastics for "open file → read
-                      # → record in spreadsheet" patterns: agent
-                      # receives a JSON aggregate of per-file extracted
-                      # values which the planner can then write to the
-                      # target sheet/doc via calc_*/writer_*. Use for
-                      # receipts, invoices, papers, emails — any local
-                      # files whose CONTENT the agent must read to
-                      # populate a structured deliverable.
-    # ``cli_run_uno`` (raw Python against the OPEN LibreOffice document)
-    # was REMOVED — all three LibreOffice domains now go through the
-    # structured calc_* / impress_* / writer_* action sets, which the
-    # framework deterministically lowers to UNO Python. A raw-UNO escape
-    # hatch only mislead the 9B actor into hand-writing UNO.
-    "open_app",       # deterministically open / focus an application
-                      # (optionally with a file): activates an existing
-                      # window via wmctrl, or launches it. Replaces the
-                      # brittle GUI dock-click / Alt+Tab dance. See
-                      # open_app.py.
-    "note_write",     # persist (key, value) to the agent-side Notebook
-                      # (see actions/handlers/notebook.py). The notebook is
-                      # rendered into BOTH planner and decomposer
-                      # prompts every turn. Use to pin any observed
-                      # concrete value (URL, name, affiliation, count)
-                      # so it survives app switches, outcome REVERTs,
-                      # and perceiver misses. Wire form:
-                      # ``note_write(key="<k>", value="<v>")``. Value
-                      # may be a JSON string for structured data.
-    # "finished" was previously allowed, meaning "this subgoal is done".
-    # Removed in Phase 2: the planner's <last_subgoal_assessment> is now
-    # the single source of truth for done-ness. Keeping "finished" as a
-    # back-compat escape hatch below so a model that ignores the prompt
-    # and emits it doesn't crash the parser.
+                      # {"action":"navigate", "url":..., "new_tab":false}.
+                      # One reliable step vs the (ctrl+l → type URL\\n) GUI
+                      # dance — needed for cross-site multi-hop tasks.
+    "finished",       # Terminal sentinel for text-answer tasks (WebVoyager
+                      # / Mind2Web / MMInA). {"action":"finished",
+                      # "answer":...}. Caught by agent.py's text-answer
+                      # block in _pa_predict, which ends the episode and
+                      # hands the answer to the runner / judge.
+    "edit_json",      # modify a JSON config via file IO (load → mutate →
+                      # dump). Avoids GUI ctrl+a + type, which corrupts JSON
+                      # via partial-content overwrite. See edit_json_helpers.
+    "cli_run",        # one-shot bash via subprocess on the VM (NOT a GUI
+                      # terminal). Launch apps (`code <path>`), non-JSON file
+                      # edits (sed/cp), or nested JSON mutations edit_json's
+                      # flat ops can't express. See cli_run_helpers.py.
+    "extract_info",   # batch-read N VM files and ask the planner LLM to
+                      # extract structured info per file (one LLM call each).
+                      # Bypasses "open file → read → record in spreadsheet"
+                      # GUI gymnastics: returns a JSON aggregate the planner
+                      # writes out via calc_*/writer_*. Use for receipts,
+                      # invoices, papers, emails — any local file whose
+                      # CONTENT must populate a structured deliverable.
+    # ``cli_run_uno`` (raw Python against the open LibreOffice doc) was
+    # REMOVED — all three LibreOffice domains go through the structured
+    # calc_* / impress_* / writer_* sets, which the framework lowers to UNO
+    # Python. A raw-UNO escape hatch only misled the 9B actor into hand-
+    # writing UNO.
+    "open_app",       # deterministic window activate (wmctrl) or launch,
+                      # optionally with a file. Replaces the brittle GUI
+                      # dock-click / Alt+Tab dance. See open_app.py.
+    "note_write",     # persist (key, value) to the agent Notebook (see
+                      # actions/handlers/notebook.py), rendered into both
+                      # planner and decomposer prompts every turn. Pin any
+                      # observed concrete value (URL, name, count) so it
+                      # survives app switches, outcome REVERTs, and perceiver
+                      # misses. Value may be a JSON string.
+    # "finished" used to mean "this subgoal is done"; removed in Phase 2 —
+    # the planner's <last_subgoal_assessment> is now the sole done-ness
+    # source. Kept as a back-compat escape hatch below so a model that
+    # ignores the prompt and emits it doesn't crash the parser.
 }
 
-# Calc structured actions (calc_fill_column, calc_set_cell, …) — actor
-# emits FLAT JSON kwargs that the dispatcher in
-# ``_step_to_uitars_line`` translates to a calc_xxx(…) wire line.
-# These names MUST be in the parser's allow-list or
-# ``_parse_decomposer_response`` silently drops them (one of the
-# subtler regressions: actor produces valid JSON, parser rejects it,
-# actor returns <Impossible> every step, ``traj.jsonl`` never appended).
+# Calc structured actions (calc_fill_column, …). Actor emits flat JSON kwargs
+# that the dispatcher translates to a calc_xxx(…) wire line. These names MUST
+# be in the allow-list or _parse_decomposer_response silently drops them — a
+# subtle regression (valid JSON in, parser rejects, <Impossible> every step,
+# traj.jsonl never appended).
 from mm_agents.structagent.actions.calc.actions import CALC_ACTION_NAMES as _CALC_ACTION_NAMES
 _ALLOWED_ACTIONS = _ALLOWED_ACTIONS | set(_CALC_ACTION_NAMES)
 # Impress structured actions — same allow-list role as calc_*.
 from mm_agents.structagent.actions.impress.actions import IMPRESS_ACTION_NAMES as _IMPRESS_ACTION_NAMES
 _ALLOWED_ACTIONS = _ALLOWED_ACTIONS | set(_IMPRESS_ACTION_NAMES)
-# Writer structured actions — same allow-list role as calc_* / impress_*.
+# Writer structured actions — same allow-list role.
 from mm_agents.structagent.actions.writer.actions import WRITER_ACTION_NAMES as _WRITER_ACTION_NAMES
 _ALLOWED_ACTIONS = _ALLOWED_ACTIONS | set(_WRITER_ACTION_NAMES)
 
@@ -173,17 +137,15 @@ def _screenshot_to_data_url(image_bytes: bytes, mime: str = "image/png") -> str:
 def _point_to_pixels(
     pt: Any, screen_w: int, screen_h: int
 ) -> Optional[Tuple[int, int]]:
-    """INLINE-mode only: convert a decomposer-emitted ``[x, y]`` point to
-    pixel coords. Coordinate-system auto-detect (same lesson as the offline
-    A/B — models emit different grids and ignore prompt instructions):
+    """Convert a decomposer ``[x, y]`` point to pixels. Auto-detects the
+    coordinate system since models emit different grids and ignore the prompt:
 
-      - both <= 1.0     -> already normalized [0, 1]
-      - both <= 1000.0  -> 0-1000 integer grid (Qwen-VL native)
-      - otherwise       -> absolute pixels (divide by screen size)
+      - both <= 1.0     -> normalized [0, 1]
+      - both <= 1000.0  -> 0-1000 grid (Qwen-VL native)
+      - otherwise       -> absolute pixels
 
-    Returns None if ``pt`` is missing or malformed, so the caller skips the
-    action (never blind-clicks a fallback) — mirroring grounding-fail
-    handling in ``_ground_to_pixels``.
+    Returns None on missing/malformed ``pt`` so the caller skips the action
+    rather than blind-clicking a fallback.
     """
     if not isinstance(pt, (list, tuple)) or len(pt) < 2:
         return None
@@ -206,14 +168,11 @@ _CODING_ACTIONS = frozenset({"cli_run", "edit_json"})
 
 
 def _allowed_actions_for_domain(task_domain: Optional[str]) -> set:
-    """``_ALLOWED_ACTIONS`` minus the coding actions (cli_run / edit_json)
-    when the task domain is GUI-only (chrome/gimp/thunderbird) and
-    ENABLE_DOMAIN_CODING_GATE is on. Defense-in-depth: the A2 prompt already
-    omits the coding route for those domains, but this also REJECTS a coding
-    action if the decomposer emits one anyway (e.g. nudged by residual memory
-    or a stray cross-reference) → surfaces as <Impossible> 'unknown action',
-    forcing a GUI retry. Gate off / non-GUI-only domain → full set (current
-    behaviour)."""
+    """``_ALLOWED_ACTIONS`` minus cli_run / edit_json for GUI-only domains
+    (chrome/gimp/thunderbird) when domain_coding_gate is on. Defense-in-depth:
+    the A2 prompt already omits the coding route, but this also rejects a
+    coding action if the decomposer emits one anyway → surfaces as <Impossible>
+    'unknown action', forcing a GUI retry. Gate off / non-GUI-only → full set."""
     try:
         from mm_agents.structagent.config import CAConfig
         from mm_agents.structagent.domain import is_gui_only
@@ -229,15 +188,13 @@ def _parse_decomposer_response_with_diagnostics(
     *,
     task_domain: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Extract step dicts AND collect the names of any actions that
-    were rejected because they aren't in ``_ALLOWED_ACTIONS``.
+    """Extract step dicts; also collect action names rejected as not in
+    ``_ALLOWED_ACTIONS``.
 
-    Returns ``(accepted_steps, rejected_action_names)``. The rejected
-    list lets the caller surface a specific failure reason ("actor
-    rejected unknown action 'X'") to the planner instead of an opaque
-    ``<Impossible>`` — without that signal the planner cannot tell a
-    hallucinated action name apart from a UI-grounding miss, and
-    typically replans into the same hallucination.
+    Returns ``(accepted_steps, rejected_action_names)``. The rejected list lets
+    the caller tell the planner "actor rejected unknown action 'X'" instead of
+    an opaque <Impossible> — without it the planner can't distinguish a
+    hallucinated action name from a grounding miss, and replans the same way.
     """
     if not text:
         return [], []
@@ -245,9 +202,9 @@ def _parse_decomposer_response_with_diagnostics(
     fence = re.match(r"```(?:json)?\s*\n?(.*?)\n?```\s*$", stripped, re.DOTALL)
     if fence:
         stripped = fence.group(1)
-    # Prefer a JSON array; tolerate a single bare object {...} (the model
-    # sometimes emits a lone action object instead of a one-element array) by
-    # wrapping it — same lesson as boundary_verify._extract_json_array.
+    # Prefer a JSON array; tolerate a lone {...} object (the model sometimes
+    # emits one instead of a one-element array) by wrapping it — same as
+    # boundary_verify._extract_json_array.
     start = stripped.find("[")
     end = stripped.rfind("]")
     arr = None
@@ -289,18 +246,17 @@ def _parse_decomposer_response(
     *,
     task_domain: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Backward-compatible wrapper — returns just the accepted steps.
-    Use :func:`_parse_decomposer_response_with_diagnostics` when you
-    need the rejected-unknowns sidechannel."""
+    """Back-compat wrapper returning just the accepted steps. Use
+    :func:`_parse_decomposer_response_with_diagnostics` for the
+    rejected-unknowns sidechannel."""
     steps, _ = _parse_decomposer_response_with_diagnostics(
         text, task_domain=task_domain)
     return steps
 
 
 def _valid_action_names_for_domain(task_domain: Optional[str]) -> List[str]:
-    """Return the impress_* / calc_* action set most relevant to the
-    current task domain. Used in the <Impossible> reason so the
-    planner sees a focused list rather than ALL allowed actions."""
+    """The impress_* / calc_* action set for the current domain. Used in the
+    <Impossible> reason so the planner sees a focused list, not all actions."""
     dom = (task_domain or "").lower()
     if dom == "libreoffice_impress":
         return sorted(_IMPRESS_ACTION_NAMES)
@@ -311,17 +267,15 @@ def _valid_action_names_for_domain(task_domain: Optional[str]) -> List[str]:
 
 def _impossible_with_reason(rejected_unknown: List[str],
                               task_domain: Optional[str]) -> str:
-    """Build an ``<Impossible>`` response that carries a specific
-    failure reason when the decomposer emitted unknown action names.
+    """``<Impossible>`` carrying a specific reason for unknown action names.
 
-    Output format keeps ``<Impossible>`` as the first token so the
-    upstream parser still detects it via the existing case-insensitive
-    substring check, with a ``Reason:`` line below that the planner
-    surfaces in next-turn ``<stuck_analysis>``.
+    Keeps ``<Impossible>`` as the first token so the upstream substring check
+    still detects it, with a ``Reason:`` line the planner surfaces in
+    next-turn <stuck_analysis>.
     """
     if not rejected_unknown:
         return "<Impossible>"
-    # Dedupe while preserving order of first occurrence.
+    # Dedupe, preserving first-seen order.
     seen: set = set()
     unique = []
     for a in rejected_unknown:
@@ -344,9 +298,8 @@ def _impossible_with_reason(rejected_unknown: List[str],
 
 
 def _escape_single_quotes(text: str) -> str:
-    """Mirror qwen25vl_agent_planner._pa_escape_single_quotes so the
-    emitted type(content='...') string survives ast.parse downstream."""
-    # Replace single quotes with escaped single quotes (backslash + quote)
+    """Mirror _pa_escape_single_quotes so the emitted type(content='...')
+    string survives ast.parse downstream."""
     return text.replace("\\", "\\\\").replace("'", "\\'")
 
 
@@ -367,25 +320,21 @@ def _call_decomposer(
 ) -> str:
     """Single LLM call to the decomposer. Returns raw response text.
 
-    A6: ``working_memory_text`` is a pre-rendered ``[Working memory]``
-    block (built by the caller from ``ledger.working_memory()`` via
-    ``render_working_memory``). Replaces the legacy ``notebook`` dict
-    parameter — the decomposer no longer pulls its own renderer.
+    ``working_memory_text`` is a pre-rendered ``[Working memory]`` block (built
+    by the caller from ``ledger.working_memory()``), replacing the legacy
+    ``notebook`` dict — the decomposer no longer renders its own.
     """
-    # Compact history: last 2 turns' FULL responses (Thought + Action lines).
-    # Text-only, no screenshot replay, so the cost stays small — but we
-    # MUST retain the concrete ``Action: click(start_box='(x,y)')`` lines so
-    # the decomposer can tell that e.g. (470, 269) was already clicked and
-    # SEA was already typed. Truncating to the first line (the Thought)
-    # loses the action and causes decomposer loops on no-progress screens.
+    # Compact history: last few turns' FULL responses (text-only, no
+    # screenshot replay). MUST retain the concrete Action: lines so the
+    # decomposer can tell what was already clicked/typed; truncating to just
+    # the Thought drops the action and causes loops on no-progress screens.
     history_blocks: List[str] = []
     for i, turn in enumerate((actor_history or [])[-4:]):
         resp = (turn.get("response", "") or "").strip()
         if not resp:
             continue
-        # Hard-cap each turn at ~2000 chars to keep the prompt bounded when
-        # multi-step responses are long; this still retains all action lines
-        # for typical 2-4 action sequences.
+        # Cap each turn at ~2000 chars to bound the prompt; still keeps all
+        # action lines for typical 2-4 action sequences.
         if len(resp) > 2000:
             resp = resp[:2000] + "  …[truncated]"
         history_blocks.append(f"Turn -{len(actor_history[-4:]) - i} ago:\n{resp}")
@@ -395,12 +344,10 @@ def _call_decomposer(
         + "\n\n".join(history_blocks)
         if history_blocks else ""
     )
-    # Live workbook structure (SP block) goes RIGHT NEXT TO the subgoal so
-    # the model picks up real column letters / end-rows when composing
-    # calc_* action ranges. Putting this in the system prompt didn't work —
-    # the system prompt is 40K chars and the model anchors on the
-    # placeholder examples (e.g. `Sheet1.A2:A20`) instead of reading the
-    # actual layout.
+    # Live workbook structure goes right next to the subgoal so the model
+    # picks up real column letters / end-rows for calc_* ranges. In the 40K-
+    # char system prompt it doesn't work — the model anchors on the
+    # placeholder examples (e.g. `Sheet1.A2:A20`) instead of the real layout.
     doc_block_section = (
         f"\n\nLive document structure (use these EXACT column letters / "
         f"end-row N from `used=A1:<col><N>` when building calc_* action "
@@ -409,20 +356,16 @@ def _call_decomposer(
         if doc_inspect_block else ""
     )
 
-    # When the previous cli_run turn FAILED (returncode != 0),
-    # the planner already saw the truncated stderr — but its <actor_hint>
-    # paraphrase tends to lose the specific error (e.g. it becomes "check
-    # brackets" instead of "closing parenthesis ')' does not match opening
-    # parenthesis '['"). So the actor needs the raw stderr too, head+tail
-    # truncated to keep the actual ExceptionClass + message visible.
+    # When the previous cli_run FAILED, the planner's <actor_hint> paraphrase
+    # tends to lose the specific error (e.g. "check brackets" instead of the
+    # exact "closing parenthesis ')' does not match ..."). Give the actor the
+    # raw stderr too, head+tail truncated to keep the ExceptionClass + message.
     last_run_section = ""
     if last_cli_run_output and last_cli_run_output.get("returncode") not in (None, 0):
         _err = (last_cli_run_output.get("stderr") or "").strip()
         _out = (last_cli_run_output.get("stdout") or "").strip()
-        # Head+tail truncate (mirrors qwen25vl_agent_planner's helper). For the
-        # bracket-mismatch failure mode we MUST keep the tail (where Python
-        # prints the actual error message); naive head-only truncation
-        # silently drops it.
+        # Head+tail truncate. MUST keep the tail — Python prints the actual
+        # error message there; head-only truncation would drop it.
         def _ht(s, budget=600, head_frac=0.25):
             if not s or len(s) <= budget: return s
             h = max(80, int(budget * head_frac))
@@ -442,11 +385,9 @@ def _call_decomposer(
             f"  stderr:     {_err_t or '(empty)'}"
         )
 
-    # [Trusted file paths inventory] — absolute paths the env-perceiver
-    # observed on disk at task start. Used by extract_info Pattern 14b
-    # as the authoritative source for `paths` when the subgoal text is
-    # vague. The decomposer must pick from this list verbatim, not
-    # invent filenames from a pattern.
+    # Trusted file paths the env-perceiver observed on disk at task start.
+    # Authoritative source for extract_info's `paths` (Pattern 14b) when the
+    # subgoal is vague — pick verbatim, don't invent filenames.
     inventory_section = ""
     if useful_paths:
         _lines = "\n".join(f"  {p}" for p in useful_paths)
@@ -458,14 +399,11 @@ def _call_decomposer(
             f"{_lines}"
         )
 
-    # [Notebook] — the agent's persistent KV memory (free-form
-    # note_write entries + auto-mirrored extract_info per-file results).
-    # The planner often gives a vague subgoal like "use calc_set_range
-    # to write the extracted data into Sheet1 starting at A9" without
-    # listing the actual values; the decomposer must source the literal
-    # values from this block, NOT re-issue extract_info, NOT make up
-    # numbers. Same block format as the planner sees, so both sides
-    # have a single shared view of captured state.
+    # Notebook — the agent's persistent KV memory (note_write entries +
+    # mirrored extract_info results). The planner often gives a vague subgoal
+    # ("write the extracted data into Sheet1 starting at A9") without the
+    # actual values; the decomposer must source literals from here, not
+    # re-issue extract_info or invent numbers. Same format the planner sees.
     notebook_section = ""
     if working_memory_text:
         notebook_section = (
@@ -495,24 +433,20 @@ def _call_decomposer(
              "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
         ]},
     ]
-    # Qwen3.5-VL thinking toggle. Default OFF (decomposer's 1024-token
-    # budget isn't wasted on chain-of-thought). Flip on via env
-    # QWEN35_THINKING=1; max_tokens auto-bumps to QWEN35_THINKING_MAX_TOKENS
-    # (default 15000) so the <think> block has headroom. Detect any
-    # alias containing "qwen3.5"/"qwen35" case-insensitively.
+    # Qwen3.5-VL thinking toggle. Default OFF so the 1024-token budget isn't
+    # spent on chain-of-thought; flip on via QWEN35_THINKING=1 (max_tokens
+    # auto-bumps to QWEN35_THINKING_MAX_TOKENS, default 15000).
     #
-    # NB: thinking-off wire format DIFFERS between OpenRouter and local
-    # vLLM — OpenRouter expects `reasoning.enabled`, vLLM expects
-    # `chat_template_kwargs.enable_thinking`. Branch on the client's
-    # base_url. Setting the wrong key on OpenRouter silently fails
-    # (no error, but thinking stays on, blowing past max_tokens).
+    # NB: the wire format DIFFERS between OpenRouter (`reasoning.enabled`) and
+    # local vLLM (`chat_template_kwargs.enable_thinking`); branch on base_url.
+    # Wrong key on OpenRouter fails silently — thinking stays on, blows past
+    # max_tokens.
     extra_kwargs: Dict[str, Any] = {}
     _model_lc = (model or "").lower()
     if "qwen3.7" in _model_lc:
-        # qwen3.7-plus (OpenRouter): thinking ON by default (best quality).
-        # Its reasoning trace is ~2600 tokens; the decomposer's default 1024
-        # budget would truncate the answer, so bump max_tokens to a high floor.
-        # Turn off via QWEN37_THINKING=0.
+        # qwen3.7-plus (OpenRouter): thinking ON by default. Its ~2600-token
+        # trace would truncate the answer under the 1024 budget, so bump
+        # max_tokens to a high floor. Off via QWEN37_THINKING=0.
         thinking_on = os.environ.get(
             "QWEN37_THINKING", "1").strip().lower() in ("1", "true", "yes", "on")
         _base_url = str(getattr(client, "base_url", "") or "")
@@ -547,11 +481,10 @@ def _call_decomposer(
                 floor = 15000
             if max_tokens < floor:
                 max_tokens = floor
-    # Vision-provider lock: kimi-k2.6 / qwen3.5-397b serve VISION on ONE OpenRouter
-    # provider only; default routing drops the image (text-only/empty completion).
-    # Keep this id->provider map in sync with llm_client._VISION_PROVIDER (which is
-    # keyed by alias; here we key by the resolved OpenRouter model id). Merges into
-    # any extra_body already set by the thinking branches above.
+    # Vision-provider lock: kimi-k2.6 / qwen3.5-397b serve vision on ONE
+    # OpenRouter provider; default routing drops the image. Keep this
+    # id->provider map in sync with llm_client._VISION_PROVIDER (keyed by alias
+    # there, by resolved model id here). Merges into any extra_body above.
     _base_url = str(getattr(client, "base_url", "") or "")
     if "openrouter.ai" in _base_url:
         _vp = {"moonshotai/kimi-k2.6": "SiliconFlow",
@@ -564,8 +497,7 @@ def _call_decomposer(
         **extra_kwargs,
     )
     raw = (resp.choices[0].message.content or "").strip()
-    # Strip Qwen3.5 thinking trailer (free-form reasoning + </think>
-    # before the actual answer). No-op when no </think> present.
+    # Strip the Qwen3.5 thinking trailer up to </think>. No-op when absent.
     _thk = raw.rfind("</think>")
     if _thk >= 0:
         raw = raw[_thk + len("</think>"):].lstrip()
@@ -573,7 +505,7 @@ def _call_decomposer(
 
 
 # ---------------------------------------------------------------------------
-# Composition — build the UI-TARS-compatible output string from steps
+# Composition — build the UI-TARS output string from steps
 # ---------------------------------------------------------------------------
 
 def _compose_action_line(
@@ -584,9 +516,9 @@ def _compose_action_line(
 ) -> Optional[str]:
     """Translate one decomposer step into a UI-TARS action line.
 
-    Coordinates come from the decomposer's own per-action ``point`` (inline
-    grounding). ``_resolve`` returns None to skip the action when the point is
-    missing/bad, so the caller never blind-clicks a fallback.
+    Coordinates come from the step's own ``point`` (inline grounding).
+    ``_resolve`` returns None to skip the action on a missing/bad point, so the
+    caller never blind-clicks a fallback.
     """
     action = step.get("action")
 
@@ -653,19 +585,14 @@ def _compose_action_line(
 
     if action == "type":
         text = step.get("text", "")
-        # Explicit destructive/submit modifiers (default False = safe
-        # additive typing at cursor; no Ctrl+A, no Enter). The actor
-        # opts in for single-line replace (wipe_then_type=True, e.g.
-        # address bar) or command commit (submit=True, e.g. terminal
-        # line or search box). See ACTOR_ACTION_SPACE doc in
-        # qwen25vl_agent_planner.py for usage. Old steps without these
-        # keys remain backward-compatible: both default False — never
-        # destructive (which is the SAFE default we want by design).
+        # Destructive/submit modifiers, both default False = safe additive
+        # typing at cursor (no Ctrl+A, no Enter). Opt in for single-line
+        # replace (wipe_then_type, e.g. address bar) or commit (submit, e.g.
+        # terminal/search). Old steps without these keys stay back-compatible.
         params = [f"content='{_escape_single_quotes(text)}'"]
         if bool(step.get("wipe_then_type", False)):
-            # Audit guard: wipe_then_type does a Ctrl+A then overwrite —
-            # potentially destructive if the focused field is not the one
-            # intended. Log so post-hoc review can spot bad wipes.
+            # wipe_then_type does Ctrl+A then overwrite — destructive if the
+            # wrong field is focused. Log so review can spot bad wipes.
             logger.warning("wipe_then_type=True (destructive replace) for text %r",
                            text[:80])
             params.append("wipe_then_type=True")
@@ -688,9 +615,8 @@ def _compose_action_line(
         if coords is not None:
             px, py = coords
         else:
-            # No anchor (or anchor grounding failed) → scroll at screen
-            # center. Scrolling at the center is harmless, so unlike
-            # click/drag we fall back instead of skipping the action.
+            # No/failed anchor → scroll at center. Harmless, so unlike
+            # click/drag we fall back instead of skipping.
             px, py = screen_w // 2, screen_h // 2
         return f"scroll(start_box='({px},{py})', direction='{direction}')"
 
@@ -703,17 +629,15 @@ def _compose_action_line(
             logger.warning("navigate missing 'url': %r", step)
             return None
         new_tab = bool(step.get("new_tab", False))
-        # Same wire format as cli_run/edit_json: function-call string
-        # the upstream AST parser decodes; the in-VM runtime script
-        # comes from navigate_helpers.build_navigate_script.
+        # Wire format like cli_run/edit_json: a function-call string the AST
+        # parser decodes; runtime script from navigate_helpers.
         return f"navigate(url={url!r}, new_tab={new_tab})"
 
     if action == "finished":
-        # Text-answer terminal sentinel. Emit as ``finished(answer='...')``
-        # text; agent.py's text-answer detection block in _pa_predict
-        # catches this verbatim, stashes ``self._text_answer``, and
-        # terminates the episode (no pyautogui code generated — the
-        # detection short-circuits before _to_pyautogui).
+        # Text-answer terminal sentinel. agent.py's text-answer block in
+        # _pa_predict catches finished(answer='...') verbatim, stashes
+        # _text_answer, and ends the episode (short-circuits before
+        # _to_pyautogui, so no pyautogui code is generated).
         answer = (step.get("answer") or "").strip()
         if not answer:
             logger.warning("finished emitted with empty answer: %r", step)
@@ -731,18 +655,16 @@ def _compose_action_line(
         if not cmd:
             logger.warning("cli_run missing 'command' field: %r", step)
             return None
-        # Wire format mirrors edit_json: function-call string the upstream
-        # AST parser can decode. ``command`` is a Python string literal
-        # (repr-style) — _pa_to_pyautogui will pass it through to the
-        # runtime script which json.dumps it again before embedding.
+        # Wire format like edit_json. ``command`` is a repr'd Python string
+        # literal; _pa_to_pyautogui passes it to the runtime script, which
+        # json.dumps it again before embedding.
         return f"cli_run(command={cmd!r}, background={bg}, wait_seconds={wait_s})"
 
     if action == "extract_info":
-        # Host-side action — agent (not VM) reads files via
-        # controller.get_file, dispatches by extension to the planner
-        # LLM (with vision for images / PDFs), aggregates structured
-        # results. NO pyautogui code is generated; result is stored on
-        # the agent and rendered in the next planner prompt.
+        # Host-side action: the agent reads files via controller.get_file,
+        # dispatches by extension to the planner LLM (vision for images/PDFs),
+        # aggregates structured results. No pyautogui code — result is stored
+        # on the agent and rendered in the next planner prompt.
         paths = step.get("paths") or []
         if isinstance(paths, str):
             paths = [paths]
@@ -752,8 +674,8 @@ def _compose_action_line(
         if not paths or not query:
             logger.warning("extract_info missing paths or query: %r", step)
             return None
-        # JSON-encode payloads so they survive the round-trip through
-        # repr() + ast.literal_eval (no shell escape risk — runs in-process).
+        # JSON-encode payloads so they survive the repr() + ast.literal_eval
+        # round-trip (no shell-escape risk — runs in-process).
         import json as _json
         return (
             f"extract_info(paths={_json.dumps(paths)!r}, "
@@ -762,10 +684,9 @@ def _compose_action_line(
         )
 
     if action == "note_write":
-        # Host-side action — write a (key, value) into the agent's
-        # Notebook. The notebook is rendered into both planner and
-        # decomposer prompts every turn so neither side ever has to
-        # re-observe what was already captured.
+        # Host-side action: write (key, value) into the agent Notebook, which
+        # is rendered into both prompts every turn so neither side re-observes
+        # what was already captured.
         key = (step.get("key") or "").strip()
         value = step.get("value")
         if value is None:
@@ -773,9 +694,8 @@ def _compose_action_line(
         if not key:
             logger.warning("note_write missing 'key': %r", step)
             return None
-        # JSON-encode dict/list values so the wire form survives the
-        # repr→literal_eval round-trip; plain strings/numbers pass
-        # through as-is. handle_note_write decodes on the other side.
+        # JSON-encode dict/list values to survive the repr→literal_eval
+        # round-trip; scalars pass through. handle_note_write decodes.
         if isinstance(value, (dict, list)):
             import json as _json
             value = _json.dumps(value, ensure_ascii=False)
@@ -784,9 +704,8 @@ def _compose_action_line(
         return f"note_write(key={key!r}, value={value!r})"
 
     if action == "open_app":
-        # No grounding needed — deterministic window activation / launch
-        # on the VM. Wire format mirrors cli_run: a function-call string
-        # the AST parser at _pa_parse_action_ast can decode.
+        # No grounding — deterministic window activate/launch. Wire format
+        # like cli_run, decoded by _pa_parse_action_ast.
         app = (step.get("app") or "").strip()
         if not app:
             logger.warning("open_app missing 'app' field: %r", step)
@@ -796,10 +715,9 @@ def _compose_action_line(
             return f"open_app(app={app!r}, file_path={file_path!r})"
         return f"open_app(app={app!r})"
 
-    # Structured Calc actions (calc_fill_column, … — full list in
-    # calc_actions.CALC_ACTION_NAMES). Actor emits FLAT JSON kwargs;
-    # framework owns the Python-source generation. Keeps all calc_*
-    # dispatch in one module instead of growing the elif chain here.
+    # Structured Calc actions (full list in CALC_ACTION_NAMES). Actor emits
+    # flat JSON kwargs; the framework owns Python-source generation, keeping
+    # calc_* dispatch in one module instead of growing the elif chain.
     from mm_agents.structagent.actions.calc.actions import CALC_ACTION_NAMES, step_to_wire
     if action in CALC_ACTION_NAMES:
         wire = step_to_wire(step)
@@ -807,10 +725,8 @@ def _compose_action_line(
             logger.warning("%s validation failed: %r", action, step)
         return wire
 
-    # Structured Impress actions (impress_set_font, impress_set_text_color,
-    # … — full list in impress_actions.IMPRESS_ACTION_NAMES). Same
-    # contract as calc_*: flat JSON in, ``impress_xxx(k=v, …)`` wire
-    # string out; runtime script generation lives in impress_actions.
+    # Structured Impress actions (full list in IMPRESS_ACTION_NAMES). Same
+    # contract as calc_*: flat JSON in, impress_xxx(k=v, …) wire string out.
     from mm_agents.structagent.actions.impress.actions import (
         IMPRESS_ACTION_NAMES as _IMPRESS_ACTION_NAMES_LOCAL,
         step_to_wire as _impress_step_to_wire,
@@ -821,9 +737,8 @@ def _compose_action_line(
             logger.warning("%s validation failed: %r", action, step)
         return wire
 
-    # Structured Writer actions (writer_paste_at, … — full list in
-    # writer_actions.WRITER_ACTION_NAMES). Same contract as calc_* /
-    # impress_*: flat JSON in, ``writer_xxx(k=v, …)`` wire string out.
+    # Structured Writer actions (full list in WRITER_ACTION_NAMES). Same
+    # contract as calc_* / impress_*: flat JSON in, writer_xxx(k=v, …) out.
     from mm_agents.structagent.actions.writer.actions import (
         WRITER_ACTION_NAMES as _WRITER_ACTION_NAMES_LOCAL,
         step_to_wire as _writer_step_to_wire,
@@ -835,7 +750,7 @@ def _compose_action_line(
         return wire
 
     if action == "edit_json":
-        # No grounding needed — file IO action.
+        # No grounding — file IO action.
         path = (step.get("path") or "").strip()
         op = (step.get("op") or "").strip()
         data = step.get("data")
@@ -848,13 +763,11 @@ def _compose_action_line(
         if data is None:
             logger.warning("edit_json missing 'data' field: %r", step)
             return None
-        # Wire format: ``edit_json(path='...', op='...', data='<json_str>')``.
-        # The upstream AST parser (_pa_parse_action_ast) extracts each
-        # kwarg as a Python string. Downstream _pa_to_pyautogui will
-        # ``json.loads(data)`` to recover the dict/list before generating
-        # the runtime script. This double-encoding (Python string holding
-        # JSON string) is necessary because ast.Constant only handles
-        # primitive literals, not nested dict/list literals.
+        # Wire: edit_json(path='...', op='...', data='<json_str>'). The AST
+        # parser extracts each kwarg as a string; _pa_to_pyautogui json.loads
+        # data back to a dict/list. The double-encoding (Python string holding
+        # JSON) is needed because ast.Constant only handles primitive literals,
+        # not nested dict/list.
         import json as _json
         data_json = _json.dumps(data)
         return f"edit_json(path={path!r}, op={op!r}, data={data_json!r})"
@@ -879,29 +792,14 @@ def call_decomposer_actor(
     working_memory_text: Optional[str] = None,
     task_domain: Optional[str] = None,
 ) -> str:
-    """Decompose-then-ground actor. Return string in UI-TARS's output shape.
+    """Decompose-then-ground actor. Returns a UI-TARS-shaped string.
 
-    Parameters
-    ----------
-    instruction : str
-        The full original task instruction.
-    subgoal : str
-        The current subgoal to execute NOW.
-    screenshot_bytes : bytes
-        Current screen PNG bytes (the physical screen, not resized).
-    screen_size : (int, int)
-        Physical screen (width, height) in pixels. Used to de-normalize the
-        decomposer's own 0-1000 inline coords into pyautogui pixel coords.
-    decomposer_client, decomposer_model
-        OpenAI client + model name for the decomposer LLM (typically the
-        Qwen3.5-VL planner server at :8010).
-    decomposer_system_template : str
-        The A2 system prompt, already rendered with any substitutions the
-        caller wants (subgoal / completed / remaining). Typically produced
-        by ``PromptSet.render("A2_actor_decomposer_points", ...)``.
-    actor_history : list, optional
-        Recent actor turns for decomposer context. Same shape as the
-        UI-TARS path (``[{"screenshot_b64": ..., "response": ...}]``).
+    screen_size is the physical screen (w, h) in pixels, used to de-normalize
+    the decomposer's 0-1000 inline coords. decomposer_client/model point at the
+    decomposer LLM (typically the Qwen3.5-VL planner server at :8010).
+    decomposer_system_template is the already-rendered A2 prompt. actor_history
+    is recent turns, same shape as the UI-TARS path
+    (``[{"screenshot_b64": ..., "response": ...}]``).
     """
     screen_w, screen_h = int(screen_size[0]), int(screen_size[1])
     screenshot_b64 = base64.b64encode(screenshot_bytes).decode("ascii")
@@ -925,10 +823,8 @@ def call_decomposer_actor(
         logger.exception("decomposer call failed: %s", e)
         return "<Impossible>"
 
-    # Diagnostic: log a head of the raw decomposer text so post-hoc
-    # debugging can see WHY <Impossible> fires (empty? markdown? bare
-    # 'impossible' step? non-array prose?). Truncate to keep the log
-    # readable but long enough to show the action shape.
+    # Log a head of the raw response so debugging can see WHY <Impossible>
+    # fires (empty? markdown? bare 'impossible'? non-array prose?).
     logger.info("[decomposer] raw response head (%d chars): %s",
                 len(decomposer_text), decomposer_text[:600].replace("\n", " ⏎ "))
 
@@ -955,9 +851,8 @@ def call_decomposer_actor(
             steps, retry_rejected = (
                 _parse_decomposer_response_with_diagnostics(
                     decomposer_text, task_domain=task_domain))
-            # Surface unknowns from either attempt — caller wants to
-            # know what the model actually emitted, not just that we
-            # failed.
+            # Surface unknowns from either attempt — the caller wants what the
+            # model actually emitted, not just that we failed.
             rejected_unknown = retry_rejected or rejected_unknown
         except Exception as e:  # noqa: BLE001
             logger.exception("decomposer retry failed: %s", e)
@@ -975,14 +870,11 @@ def call_decomposer_actor(
 
     # 2b) Guard against multi-click batches.
     #
-    # POINTS-G grounds every click in this response against the SAME
-    # pre-action screenshot. A second click whose target only becomes
-    # visible after the first click (dropdown items after opening,
-    # calendar days after month nav, checkbox states after toggle,
-    # CAPTCHA cells after the first selection) is grounded against
-    # thin air. We keep the 1st click and drop everything from the
-    # 2nd click onwards — next actor invocation will re-ground the
-    # follow-up against the updated screenshot.
+    # Every click in this response is grounded against the SAME pre-action
+    # screenshot. A second click whose target only appears after the first
+    # (dropdown items, post-nav calendar days, toggled checkboxes, CAPTCHA
+    # cells) grounds against thin air. Keep the 1st click, drop from the 2nd
+    # on; the next invocation re-grounds against the updated screenshot.
     _click_kinds = {"click", "left_double", "right_single"}
     _second_click_idx = None
     _first_seen = False
@@ -1008,17 +900,13 @@ def call_decomposer_actor(
 
     # 2c) Guard against multiple structured actions per response.
     #
-    # Structured actions (impress_* / calc_* / writer_* / cli_run /
-    # edit_json) are the granularity at which the planner already
-    # decomposes — multiple of them in a single decomposer batch is
-    # the model carpet-bombing rather than reasoning about which op
-    # to run (the observed failure mode is 25× impress_set_font, one
-    # per shape on the slide). Keep the FIRST structured action and
-    # drop every step AFTER it. Subsequent structured ops belong in
-    # their own turn so the planner can verify each diff; subsequent
-    # clicks would also ground against a stale screenshot because
-    # the structured op may have mutated doc state visible in the
-    # next screen capture.
+    # Structured actions (impress_* / calc_* / writer_* / cli_run / edit_json)
+    # are the granularity the planner already decomposes at; several in one
+    # batch is carpet-bombing, not reasoning (observed: 25x impress_set_font,
+    # one per shape). Keep the FIRST and drop the rest — each structured op
+    # belongs in its own turn so the planner can verify its diff, and a
+    # following click would ground against a stale screenshot after the op
+    # mutates doc state.
     _structured_kinds = (set(_CALC_ACTION_NAMES)
                           | set(_IMPRESS_ACTION_NAMES)
                           | set(_WRITER_ACTION_NAMES)
@@ -1053,9 +941,8 @@ def call_decomposer_actor(
         if line:
             action_lines.append(line)
         else:
-            # Diagnostic: emit the step that failed to compose so the
-            # runtime.log shows whether the decomposer produced an
-            # unknown action, an empty/missing required field, etc.
+            # Log the step that failed to compose (unknown action, missing
+            # required field, etc).
             logger.warning("step produced no action line: %r", step)
 
     if not action_lines:
@@ -1065,7 +952,7 @@ def call_decomposer_actor(
 
     # 4) Assemble UI-TARS-compatible output
     thought_bits: List[str] = []
-    for step in steps[:3]:  # brief summary of first few steps
+    for step in steps[:3]:
         a = step.get("action", "?")
         if a in ("click", "left_double", "right_single"):
             thought_bits.append(f"{a} {step.get('target', '')[:200]}")

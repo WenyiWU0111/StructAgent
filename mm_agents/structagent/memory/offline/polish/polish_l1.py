@@ -1,35 +1,21 @@
-"""Phase 3 L1 — Step 3: polish each subgoal cluster into 1+ L1 typical actions.
+"""Phase 3 L1 — Step 3: polish each subgoal cluster into 1+ L1 actions.
 
-A subgoal cluster groups segments with the same SUBGOAL intent (e.g.
-275 segments all saying "Open the terminal application"). But the
-underlying ACTION may vary — some open terminal via right-click menu,
-others via Ctrl+Alt+T, others via launcher icon. We let the polisher
-emit 1 OR MORE L1 actions per cluster, one per distinct APPROACH it
-sees in the samples.
+A cluster groups segments with the same SUBGOAL, but the underlying
+ACTION may vary (terminal via menu vs Ctrl+Alt+T vs launcher icon). The
+polisher emits one L1 action per distinct approach it sees.
 
-Output per cluster (under ``_l1_actions_v3/<domain>/cluster_NNNN.json``):
-  - cluster_subgoal_pattern         (canonical subgoal text)
-  - cluster_coherence               ("single_approach" / "multiple_approaches")
-  - n_actions
-  - actions: [ {action_id, approach, typical_actions, …}, … ]
-  - unassigned_sample_task_hashes   (outlier samples)
+Output per cluster (``_l1_actions_v3/<domain>/cluster_NNNN.json``):
+cluster_subgoal_pattern, cluster_coherence, n_actions, actions[],
+unassigned_sample_task_hashes.
 
-For large clusters (n>15) we SAMPLE 15 stratified by source; the LLM
-sees a diverse subsample but the full cluster's task_hash list is
-preserved at top level so retrieval still attributes correctly.
+Large clusters (n>15) are sampled to 15 stratified by source; the LLM
+sees a subsample but the full task_hash list is kept at top level so
+retrieval still attributes correctly.
 
-Workflow (preview-then-batch):
-  1. ``--render-only --domain X --cluster cluster_NNNN``
-  2. ``--clusters X:cluster_A,X:cluster_B``           polish 2-3
-  3. ``--full --workers 6``                           polish all n>=5
-
-Run:
-  PYTHONPATH=. python -m mm_agents.structagent.memory.offline.polish.polish_l1 \\
-      --render-only --domain libreoffice_calc --cluster cluster_0000
-  PYTHONPATH=. python -m mm_agents.structagent.memory.offline.polish.polish_l1 \\
-      --clusters libreoffice_calc:cluster_0000,libreoffice_calc:cluster_0001
-  PYTHONPATH=. python -m mm_agents.structagent.memory.offline.polish.polish_l1 \\
-      --full --workers 6
+Workflow (preview then batch):
+  --render-only --domain X --cluster cluster_NNNN     # preview one
+  --clusters X:cluster_A,X:cluster_B                  # polish a few
+  --full --workers 6                                  # polish all n>=5
 """
 from __future__ import annotations
 

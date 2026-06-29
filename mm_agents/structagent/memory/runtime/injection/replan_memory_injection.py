@@ -1,37 +1,19 @@
-"""Render L2 (task-level) + L1 (subgoal-level) alternatives blocks for
-the planner's force_replan prompt.
+"""L2 (task-level) + L1 (subgoal-level) ALTERNATIVES blocks for the
+planner's force_replan prompt.
 
-DIFFERENCE FROM ``planner_prompt_injection.py``:
+Unlike ``planner_prompt_injection`` (task start, ONE best-match skill to
+seed the initial strategy), these run at force_replan and surface TOP-K
+ALTERNATIVE skills/actions to switch to. Same FAISS indexes, different
+rendering + caller intent; rendered compactly to fit alongside the
+diagnosis + verifier traces.
 
-  ``planner_prompt_injection.render_for_planner_initial`` runs at TASK
-  START and surfaces ONE best-match skill ("here's the canonical plan
-  for this task class"). It informs the agent's INITIAL strategy.
+L1 queries ``current_subgoal`` (stable) rather than the diagnosis hint,
+which may be off without corpus context. L2 queries ``task_text`` (same
+key as the initial plan). No filter on tried variants yet — the planner
+sees diagnosis + L1 + L2 as distinct blocks and decides.
 
-  ``replan_memory_injection.render_l2_alternatives_for_replan`` runs at
-  FORCE_REPLAN and surfaces TOP-K ALTERNATIVE skills ("here are other
-  skills the corpus has for this task class — different strategies
-  you could switch to"). It informs the agent's STRATEGY SWITCH.
-
-  Similarly for L1: the initial-plan L1 hook is per-subgoal at the
-  actor (one best-match action). The replan L1 hook is at force_replan
-  and surfaces ALTERNATIVE actions for the currently-failing subgoal.
-
-Both retrieve from the SAME FAISS indexes — only the rendering style
-+ caller intent differ. We render the alternatives compactly so they
-fit in the force_replan prompt alongside diagnose + verifier traces
-without blowing the context window.
-
-Sibling-block design (not category-gated, not filter-dependent):
-- L1 query uses ``current_subgoal`` (stable, not diagnose's hint —
-  diagnose may be off without corpus context, so we don't drive
-  retrieval through its hint).
-- L2 query uses ``task_text`` (same as initial-plan key).
-- No filter on currently-active strategy / tried variants in this
-  first cut; planner LLM sees diagnose + L1 + L2 in distinct blocks
-  and decides.
-
-Failure-safe: any internal exception → returns ("", meta_with_ERROR_mode)
-so memory injection NEVER breaks the force_replan path.
+Failure-safe: any exception → ("", meta with ERROR mode); never breaks
+force_replan.
 """
 
 from __future__ import annotations

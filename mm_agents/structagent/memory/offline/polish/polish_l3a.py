@@ -1,42 +1,20 @@
 """Phase 3 — L3a cluster-rule polish over the merged loose-tier clusters.
 
-L3a is the *cluster-rule* tier: high-level, often-cross-domain "common
-wisdom" extracted from a sizeable cluster. Unlike L2 (which produces
-step-by-step plan templates the planner replays), L3a produces
-ACTIONABLE INSIGHT — invariants, gotchas, design patterns that span the
-cluster's trajectories.
+L3a extracts ACTIONABLE INSIGHT from a sizeable cluster — invariants,
+gotchas, design patterns spanning its trajectories. Unlike L2 (step-by-step
+plan templates), it's high-level cross-trajectory wisdom.
 
-Input directory defaults to ``_clusters_v3_loose_merged/`` — the
-2nd-tier merged cluster set produced by ``merge_small_loose_clusters``.
-That set is "big_kept + merged_super + small_kept" combined; we polish
-every cluster with n >= MIN_CLUSTER_SIZE in one pass.
+Input defaults to ``_clusters_v3_loose_merged/`` (big_kept + merged_super
++ small_kept, from ``merge_small_loose_clusters``); polishes every cluster
+with n >= MIN_CLUSTER_SIZE.
 
-Example: a 47-member merged super-cluster combining 19 small "align
-textbox / shape" niches on impress slides yields rules like:
-
-  - "Impress textbox alignment lives in Properties > Position and
-     Size; the toolbar Align dropdown applies to slide-level grouping,
-     NOT in-textbox content"
-  - "Triple-click selects all text in a textbox; single-click only
-     positions cursor — alignment commands need the all-selected state"
-  - "Shape vs text alignment use different menu paths — Format > Object
-     > Position for shape, Format > Paragraph for text"
-
-vs L2 which would produce a single concrete plan for ONE specific kind
-of alignment.
-
-Workflow (preview-then-batch):
-  1. ``--render-only --cluster cluster_0000``  dump prompt, no LLM
-  2. ``--max 3``                              polish 3 clusters, eyeball
-  3. ``--full``                               polish every n>=MIN
-
-Run:
+Run (preview-then-batch):
   PYTHONPATH=. python -m mm_agents.structagent.memory.offline.polish.polish_l3a \\
-      --render-only --cluster cluster_0000
+      --render-only --cluster cluster_0000   # dump prompt, no LLM
   PYTHONPATH=. python -m mm_agents.structagent.memory.offline.polish.polish_l3a \\
-      --max 3
+      --max 3                                # polish 3, eyeball
   PYTHONPATH=. python -m mm_agents.structagent.memory.offline.polish.polish_l3a \\
-      --full --workers 6
+      --full --workers 6                     # polish all n>=MIN
 """
 from __future__ import annotations
 

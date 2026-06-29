@@ -3,35 +3,31 @@ from typing import Dict, Optional, List, Tuple
 import json
 
 def parse_action_json(message: str) -> Optional[Dict]:
-    """
-    Parses the action JSON from a ChatCompletionMessage content string.
+    """Parse action JSON from message content.
 
-    Expected format: <tool_call>{"name": <function-name>, "arguments": <args-json-object>}</tool_call>
-    
-    Returns a dict with key "function_call" on success; otherwise returns the original message.
+    Expected: <tool_call>{"name": ..., "arguments": {...}}</tool_call>
+    Returns {"function_call": ...} on success, else the original message.
     """
     
     def _strip_think_blocks(text: str) -> str:
         return re.sub(r'<\s*think\s*>.*?<\s*/\s*think\s*>', '', text or '', flags=re.IGNORECASE | re.DOTALL)
 
     def _clean_json_string(json_str: str) -> str:
-        """Clean common JSON formatting issues"""
+        """Fix common JSON formatting issues."""
         if not json_str:
             return json_str
-            
-        # Replace curly quotes with straight quotes
+
+        # Curly quotes -> straight
         json_str = json_str.replace('"', '"').replace('"', '"')
         json_str = json_str.replace(''', "'").replace(''', "'")
-        
-        # Remove trailing newlines and whitespace
+
         json_str = json_str.strip()
-        
-        # Remove problematic newlines at end of values
+
+        # Strip stray newlines at end of values
         json_str = re.sub(r'\\n["\'}]', '"', json_str)
         json_str = re.sub(r'\n["\'}]', '"', json_str)
-        
-        # Fix common malformed patterns
-        # Fix: {"action": "left_click": [x, y]} -> {"action": "left_click", "coordinate": [x, y]}
+
+        # {"action": "left_click": [x, y]} -> {"action": "left_click", "coordinate": [x, y]}
         json_str = re.sub(r'"action":\s*"([^"]+)":\s*(\[[^\]]+\])', r'"action": "\1", "coordinate": \2', json_str)
         
         return json_str
@@ -52,17 +48,14 @@ def parse_action_json(message: str) -> Optional[Dict]:
         return None
 
     def _normalize_function_call_object(obj: Dict) -> Optional[Dict]:
-        """Normalize various JSON formats to standard function_call format"""
+        """Normalize various JSON shapes to standard function_call format."""
         if not isinstance(obj, dict):
             return None
-            
-        # Handle direct {"name": ..., "arguments": ...} format
+
         if "name" in obj and "arguments" in obj:
             fc = {"name": obj.get("name"), "arguments": obj.get("arguments", {})}
-        # Handle {"action": {...}} format  
         elif "action" in obj and isinstance(obj["action"], dict):
             fc = obj["action"]
-        # Handle existing {"function_call": {...}} format
         elif "function_call" in obj and isinstance(obj["function_call"], dict):
             fc = obj["function_call"]
         else:
@@ -71,7 +64,6 @@ def parse_action_json(message: str) -> Optional[Dict]:
         if not isinstance(fc, dict) or not fc.get("name"):
             return None
 
-        # Ensure arguments is a dict
         args = fc.get("arguments", {})
         if not isinstance(args, dict):
             args = {}
@@ -84,7 +76,6 @@ def parse_action_json(message: str) -> Optional[Dict]:
                     try:
                         x = int(coord_val[0])
                         y = int(coord_val[1])
-                        # Keep as list for your existing code
                         args[coord_key] = [x, y]
                     except Exception:
                         pass
@@ -96,7 +87,7 @@ def parse_action_json(message: str) -> Optional[Dict]:
         return {"function_call": {"name": fc["name"], "arguments": args}}
 
     def _try_parse_json(json_str: str) -> Optional[Dict]:
-        """Attempt to parse JSON string with cleaning"""
+        """Parse JSON string, applying cleaning first."""
         if not json_str:
             return None
             
@@ -114,7 +105,7 @@ def parse_action_json(message: str) -> Optional[Dict]:
 
     text = _strip_think_blocks(message or "")
 
-    # Primary: Extract from <tool_call> ... </tool_call> blocks
+    # Primary: <tool_call> ... </tool_call>
     tool_call_match = re.search(r'<tool_call>\s*(.*?)\s*</tool_call>', text, flags=re.DOTALL)
     if tool_call_match:
         json_content = tool_call_match.group(1).strip()
@@ -122,40 +113,39 @@ def parse_action_json(message: str) -> Optional[Dict]:
         if result:
             return result
 
-    # Fallback: Try explicit 'Action: {...}'
+    # Fallback: explicit 'Action: {...}'
     action_match = re.search(r'Action:\s*(\{.*\})', text, flags=re.DOTALL)
     if action_match:
         result = _try_parse_json(action_match.group(1))
         if result:
             return result
 
-    # Fallback: Try code-fenced JSON
+    # Fallback: code-fenced JSON
     fenced_matches = re.findall(r"```json\s*([\s\S]*?)\s*```", text)
     for fenced_content in fenced_matches:
         result = _try_parse_json(fenced_content.strip())
         if result:
             return result
-        
-        # Try extracting first JSON object from fenced content
+
         json_candidate = _extract_first_json_object(fenced_content)
         if json_candidate:
             result = _try_parse_json(json_candidate)
             if result:
                 return result
 
-    # Fallback: Try first balanced JSON object within the text
+    # Fallback: first balanced JSON object in the text
     json_candidate = _extract_first_json_object(text)
     if json_candidate:
         result = _try_parse_json(json_candidate)
         if result:
             return result
 
-    # Last resort: Try whole text as JSON
+    # Last resort: whole text as JSON
     result = _try_parse_json(text)
     if result:
         return result
 
-    # Return original message to trigger NL-based fallback
+    # Original message triggers NL-based fallback downstream
     return message
 
 
@@ -165,28 +155,20 @@ import datetime
 
 
 def _next_weekday(from_date: datetime.date, target_weekday: int, next_week: bool = False) -> datetime.date:
-    """Get the next occurrence of a weekday (0=Monday, 6=Sunday).
+    """Next occurrence of a weekday (0=Monday, 6=Sunday).
 
-    next_week=False: closest FUTURE occurrence of `target_weekday`.
-        Today=Sat, target=Sat → +7 (since "today" doesn't count).
-
-    next_week=True: same weekday but in NEXT calendar week (week starting
-        Monday). Equivalent to: jump forward to next Monday, then offset
-        by target_weekday days. Aligns with OSWorld evaluator's
-        `next week Saturday/Sunday/Friday` math.
-        Today=Tue, target=Sat → +11 (= 6 to next Mon + 5).
-        Today=Sat, target=Sat → +7  (= 2 to next Mon + 5).
-        Today=Sun, target=Sat → +6  (= 1 to next Mon + 5).
-        Today=Mon, target=Mon → +7  (= 7 to next Mon + 0).
+    next_week=False: closest future occurrence (today excluded; Sat->Sat = +7).
+    next_week=True: same weekday in the NEXT calendar week (week starts Monday).
+        Jump to next Monday, then offset by target_weekday. Matches OSWorld's
+        `next week Saturday/Sunday/Friday` math (e.g. Tue->Sat = +11).
     """
     if next_week:
-        # Days until next Monday: if today is Mon, that's 7 days; else
-        # 7 - weekday (e.g. Tue=6, Sat=2, Sun=1).
+        # Days to next Monday (7 if today is Monday)
         days_to_next_monday = 7 - from_date.weekday() if from_date.weekday() > 0 else 7
         next_monday = from_date + datetime.timedelta(days=days_to_next_monday)
         return next_monday + datetime.timedelta(days=int(target_weekday))
 
-    # Default: closest future occurrence of target_weekday (today excluded).
+    # Closest future occurrence (today excluded)
     days_ahead = target_weekday - from_date.weekday()
     if days_ahead <= 0:
         days_ahead += 7
@@ -203,10 +185,9 @@ def _first_weekday_of_offset_month(from_date: datetime.date, weekday: int, month
 
 
 def _build_date_toolkit() -> Tuple[Dict[str, dict], str]:
-    """Build a toolkit of date calculation formulas with descriptions.
+    """Build date-formula toolkit.
 
-    Returns: (toolkit_dict, formatted_description_for_llm)
-        toolkit_dict maps formula_id → {description, function(args) → date}
+    Returns (toolkit, llm_description). toolkit maps formula_id -> {description, fn}.
     """
     today = datetime.date.today()
 
@@ -278,24 +259,23 @@ def _build_date_toolkit() -> Tuple[Dict[str, dict], str]:
 
 
 def resolve_relative_dates(instruction: str, call_llm_fn=None) -> str:
-    """
-    Resolve relative date references in the instruction to concrete dates.
+    """Resolve relative date references in the instruction to concrete dates.
 
-    If call_llm_fn is provided, uses LLM to select date formulas from a toolkit.
-    Otherwise falls back to regex-based pattern matching.
+    With call_llm_fn, the LLM selects formulas from a toolkit; otherwise falls
+    back to regex pattern matching.
     """
     today = datetime.date.today()
     weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     today_name = weekday_names[today.weekday()]
 
-    # Check if instruction contains any date-like references
+    # Bail early if no date-like references
     date_keywords = re.search(
         r'\b(next|tomorrow|yesterday|this month|next month|weekend|monday|tuesday|wednesday'
         r'|thursday|friday|saturday|sunday|\d{1,2}(?:st|nd|rd|th))\b', instruction, re.IGNORECASE)
     if not date_keywords:
         return instruction
 
-    # If LLM available, use toolkit-based approach
+    # LLM toolkit path
     if call_llm_fn:
         toolkit, toolkit_desc = _build_date_toolkit()
 
@@ -358,19 +338,11 @@ Output ONLY valid JSON:"""
         except Exception:
             pass
 
-    # Fallback: regex-based pattern matching.
-    #
-    # NOTE on weekday vs. weekend semantics — verified against OSWorld's
-    # `desktop_env/evaluators/getters/misc.py:get_rule_relativeTime`:
-    #   • OSWorld's keys "next Monday" / "next Saturday" / "next Sunday"
-    #     mean the COMING weekday — same as our `_next_weekday(today, N)`.
-    #     Keep these as-is.
-    #   • OSWorld has NO "next weekend" key. Task authors who write
-    #     "next weekend" in instructions match it against eval keys
-    #     "next week Saturday" / "next week Sunday" (formal: next-week's
-    #     weekend, ~10-11 days out, not this Saturday). So
-    #     `\bnext\s+weekend\b` here MUST use next_week=True to align —
-    #     this matches the LLM-toolkit `next_weekend` formula above.
+    # Regex fallback. Weekday/weekend semantics verified against OSWorld
+    # desktop_env/evaluators/getters/misc.py:get_rule_relativeTime:
+    #   - "next Monday/Saturday/Sunday" = the coming weekday -> _next_weekday(today, N).
+    #   - No "next weekend" key; authors match it to "next week Saturday/Sunday"
+    #     (~10-11 days out), so \bnext\s+weekend\b must use next_week=True.
     patterns = {
         r'\bnext\s+monday\b': lambda: _next_weekday(today, 0),
         r'\bnext\s+tuesday\b': lambda: _next_weekday(today, 1),
@@ -465,13 +437,10 @@ TASK_TEMPLATES = {
 }
 
 
-# Common city/airport → IATA code mapping.
-#
-# IMPORTANT — entry ORDER matters for substring fallback in
-# `_resolve_iata`: specific airport keywords (Kennedy, O'Hare, Heathrow,
-# ...) must appear BEFORE their parent city aggregator so that strings
-# like "New York–Kennedy Airport" resolve to JFK rather than the
-# city's NYC. Single-airport cities (Mumbai, Dubai, ...) sit anywhere.
+# City/airport -> IATA code.
+# ORDER matters for _resolve_iata's substring fallback: airport keywords
+# (Kennedy, O'Hare, ...) must precede their parent city so e.g.
+# "New York-Kennedy Airport" -> JFK, not NYC. Single-airport cities anywhere.
 IATA_CODES = {
     # Multi-airport US — airport names first, then city
     "jfk": "JFK", "kennedy": "JFK", "laguardia": "LGA", "newark": "EWR",
@@ -524,13 +493,9 @@ IATA_CODES = {
     "zurich": "ZRH",
     "vienna": "VIE",
     "dublin": "DUB",
-    # Stockholm: OSWorld chrome eval (e.g. 82bc8d6a) compares the URL
-    # toStation against "STO" (city aggregator code), not "ARN" (Arlanda
-    # airport). Most airline sites still resolve typed "Stockholm" to ARN
-    # in their URL — the agent's chosen site is the variable here, not
-    # this hardcode. We emit STO so planner targets the eval's expected
-    # code; if the airline site forces ARN, the task is unsavable
-    # regardless.
+    # Stockholm: OSWorld chrome eval (82bc8d6a) checks the URL toStation
+    # against "STO" (city code), not "ARN" (Arlanda). Emit STO so the planner
+    # targets the eval's expected code; if the site forces ARN it's unsavable.
     "stockholm": "STO",
     "oslo": "OSL",
     "copenhagen": "CPH",
@@ -552,43 +517,30 @@ IATA_CODES = {
 }
 
 
-# Defensive override: if the LLM ignores the prompt and outputs an IATA
-# code directly, normalize the codes that don't match what OSWorld
-# evaluators expect. Keys are 3-letter codes; values are eval-aligned
-# replacements. Add entries only when chrome eval evidence supports it.
+# If the LLM emits an IATA code directly, normalize ones OSWorld evals don't
+# expect. code -> eval-aligned code. Add only with chrome eval evidence.
 IATA_NORMALIZE = {
-    # Stockholm: LLMs prefer "ARN" (Arlanda) but OSWorld eval (e.g.
-    # 82bc8d6a) expects the city aggregator code "STO".
+    # LLMs prefer ARN (Arlanda); OSWorld eval 82bc8d6a expects city code STO.
     "ARN": "STO",
 }
 
 
 def _resolve_iata(value: str) -> str:
-    """Replace city/airport name with IATA code if found in mapping.
+    """Map a city/airport name to its IATA code.
 
-    Returns a single code per entry; eval-aligned values for multi-airport
-    cities are encoded into ``IATA_CODES`` directly (e.g. Stockholm → STO
-    based on chrome eval evidence). When a specific airport is named
-    (e.g. "Kennedy", "O'Hare"), substring match picks the airport-specific
-    code — the airport-name entries are placed first in the table so
-    they win over the city aggregator.
-
-    If the input is already a 3-letter IATA code, it passes through
-    unchanged unless ``IATA_NORMALIZE`` overrides it (e.g. ARN → STO),
-    which catches the case where an upstream LLM outputs the wrong
-    specific-airport code despite the prompt asking for the city name.
+    Already-3-letter codes pass through, except IATA_NORMALIZE overrides
+    (e.g. ARN -> STO). Substring match picks airport-specific codes since
+    airport entries precede their city in IATA_CODES.
     """
-    # Already an IATA code (3 uppercase letters)
     stripped = value.strip()
     if re.match(r'^[A-Z]{3}$', stripped):
         return IATA_NORMALIZE.get(stripped, stripped)
 
     lower = stripped.lower()
-    # Try exact match first
     if lower in IATA_CODES:
         return IATA_CODES[lower]
 
-    # Substring match (e.g., "New York–Kennedy Airport" → "JFK")
+    # Substring, e.g. "New York-Kennedy Airport" -> JFK
     for city, code in IATA_CODES.items():
         if city in lower:
             return code
@@ -606,21 +558,16 @@ def detect_task_template(instruction: str) -> Optional[Dict]:
 
 
 def extract_task_fields(instruction: str, call_llm_fn) -> Optional[str]:
-    """
-    Detect task template, call LLM to extract structured fields from instruction.
+    """Detect a task template and extract its fields via LLM.
 
-    Args:
-        instruction: the raw task instruction
-        call_llm_fn: callable(messages, max_tokens) -> str
-
-    Returns:
-        Augmented instruction with extracted fields appended, or None if no template matches.
+    Returns the instruction with extracted fields appended, or None if no
+    template matches. call_llm_fn: callable(messages, max_tokens) -> str.
     """
     template = detect_task_template(instruction)
     if template is None:
         return None
 
-    # Resolve dates first so the LLM has concrete dates to work with
+    # Resolve dates first so the LLM sees concrete dates
     instruction_with_dates = resolve_relative_dates(instruction)
 
     fields_desc = "\n".join(f"- {name}: {desc}" for name, desc in template["fields"].items())
@@ -644,12 +591,11 @@ field_name: value"""
         if not response or not response.strip():
             return None
 
-        # Filter out N/A fields and resolve IATA codes for flight searches
+        # Drop N/A fields; resolve IATA codes for flight searches
         lines = []
         for line in response.strip().split("\n"):
             line = line.strip()
             if line and "N/A" not in line and "n/a" not in line and "not mentioned" not in line.lower():
-                # Resolve IATA codes for departure/destination fields
                 if template["name"] == "flight_search":
                     for field_key in ("departure", "destination"):
                         if line.lower().startswith(field_key):
@@ -677,20 +623,11 @@ def correct_plan(instruction: str, plan: str, screenshots_b64: List[str],
                  call_llm_fn, completed_subgoals: List[str] = None,
                  system_prompt_suffix: str = "",
                  ledger_block: Optional[str] = None) -> Optional[str]:
-    """
-    Review and correct a generated plan for common issues.
+    """Review and correct a generated plan; returns corrected text or None.
 
-    Args:
-        instruction: the task instruction
-        plan: the generated plan text
-        screenshots_b64: recent screenshots (up to 3) as base64 strings
-        call_llm_fn: callable(messages, max_tokens) -> str
-        completed_subgoals: list of already-completed subgoal descriptions
-        ledger_block: optional rendered Progress Ledger block; when provided,
-            its ``DEAD-END PATHS ALREADY TRIED`` entries constrain the corrector
-            to pick structurally different routes.
-
-    Returns: corrected plan text, or None if no corrections needed
+    screenshots_b64: recent screenshots (last 3 used). ledger_block: optional
+    Progress Ledger; its DEAD-END PATHS ALREADY TRIED entries force the
+    corrector onto a structurally different route.
     """
     completed_context = ""
     if completed_subgoals:
@@ -770,7 +707,7 @@ Corrected numbered step-by-step plan.
 _EMBED_MODEL = None
 
 def _get_embed_model():
-    """Lazy-load sentence-transformers model (cached singleton)."""
+    """Lazy-load the sentence-transformers model (cached singleton)."""
     global _EMBED_MODEL
     if _EMBED_MODEL is None:
         from sentence_transformers import SentenceTransformer
@@ -780,19 +717,13 @@ def _get_embed_model():
 
 def a11y_filter_by_embedding(subgoal: str, elements: List[Dict],
                               top_k: int = 20) -> List[Dict]:
-    """Filter a11y elements by semantic similarity to the subgoal using embeddings.
+    """Return the top_k a11y elements most similar to the subgoal by embedding.
 
-    Args:
-        subgoal: current subgoal text
-        elements: list of element dicts from A11yElementHelper
-        top_k: number of top elements to return
-
-    Returns: top_k elements sorted by relevance
+    elements: dicts from A11yElementHelper.
     """
     import numpy as np
     model = _get_embed_model()
 
-    # Build element text representations
     elem_texts = []
     for e in elements:
         text = f'{e["role"]} "{e["name"]}"'
@@ -807,7 +738,6 @@ def a11y_filter_by_embedding(subgoal: str, elements: List[Dict],
     e_embs = model.encode(elem_texts)
     sims = np.dot(e_embs, q_emb.T).squeeze()
 
-    # Rank by similarity and take top_k
     ranked_indices = np.argsort(-sims)[:top_k]
     filtered = [elements[i] for i in ranked_indices]
 
@@ -817,7 +747,7 @@ def a11y_filter_by_embedding(subgoal: str, elements: List[Dict],
 # ── Two-stage a11y element selection ───────────────────────────────────────────
 
 def _parse_llm_json(response: str):
-    """Parse JSON from LLM response, handling markdown code blocks."""
+    """Parse JSON from an LLM response, stripping markdown fences."""
     response = (response or "").strip()
     if "```" in response:
         response = response.split("```")[1].strip()
@@ -827,14 +757,10 @@ def _parse_llm_json(response: str):
 
 
 def a11y_filter_elements(subgoal: str, elements_text: str, call_llm_fn) -> List[int]:
-    """Stage 1: Ask LLM to filter relevant element indices from full a11y list.
+    """Stage 1: LLM picks relevant element indices from the full a11y list.
 
-    Args:
-        subgoal: current subgoal text
-        elements_text: formatted element list from A11yElementHelper.format_elements_for_llm()
-        call_llm_fn: callable(messages, max_tokens) -> str
-
-    Returns: list of relevant element indices, or empty list on failure
+    elements_text: from A11yElementHelper.format_elements_for_llm().
+    Returns indices, or [] on failure.
     """
     prompt = f"""From the list of interactive elements below, select the indices that are relevant to this subgoal. Make sure to select the correct indices for the subgoal, because the indices are used for action execution in the next stage.
 
@@ -862,16 +788,9 @@ Make sure to include all indices that are relevant to the subgoal!"""
 
 def a11y_select_actions(instruction: str, subgoal: str, filtered_text: str,
                         call_llm_fn, screenshot_b64: str = None) -> List[Dict]:
-    """Stage 2: Ask LLM to select actions on filtered elements.
+    """Stage 2: LLM selects actions on the filtered elements.
 
-    Args:
-        instruction: full task instruction
-        subgoal: current subgoal text
-        filtered_text: formatted filtered element list
-        call_llm_fn: callable(messages, max_tokens) -> str
-        screenshot_b64: optional screenshot for visual context
-
-    Returns: list of action dicts [{index, action, value?}], or empty list on failure
+    Returns [{index, action, value?}], or [] on failure.
     """
     prompt = f"""You are interacting with a web page. Given the current subgoal and the FILTERED list of relevant interactive elements, choose which element(s) to interact with.
 
@@ -915,17 +834,10 @@ Output ONLY valid JSON, no explanation:
 
 def is_web_form_subgoal(subgoal: str, screenshot_b64: str,
                         call_llm_fn) -> bool:
-    """Use LLM + screenshot to determine if a subgoal involves web form interaction.
+    """LLM + screenshot: does the subgoal involve web form interaction?
 
-    Detects: filling text fields, applying filters, selecting dates, choosing
-    from dropdowns, clicking checkboxes, setting passenger counts, etc.
-
-    Args:
-        subgoal: the subgoal text
-        screenshot_b64: base64-encoded screenshot of the current page
-        call_llm_fn: callable(messages, max_tokens) -> str
-
-    Returns: True if the subgoal involves web form interaction
+    Covers text fields, filters, date pickers, dropdowns, checkboxes,
+    passenger counts, etc.
     """
     prompt = f"""Look at this screenshot and subgoal. Does this subgoal involve interacting with a web form element on the page?
 
@@ -983,15 +895,9 @@ def locate_via_ctrl_f(search_term: str) -> List[str]:
 
 
 def locate_target(subgoal: str, screenshot_b64: str, call_llm_fn) -> List[str]:
-    """Pre-action locate: use LLM to check if subgoal target is off-screen, then Ctrl+F to it.
+    """If the LLM judges the subgoal target off-screen, Ctrl+F to it.
 
-    Args:
-        subgoal: the current subgoal text
-        screenshot_b64: base64-encoded screenshot of the current page
-        call_llm_fn: callable(messages, max_tokens) -> str
-
-    Returns:
-        List of pyautogui code strings to execute, or [] if target is visible / no locate needed.
+    Returns pyautogui code strings, or [] if the target is visible / no locate needed.
     """
     prompt = (
         f"Subgoal: {subgoal}\n\n"
@@ -1078,7 +984,7 @@ _terminal_commands_cache: Optional[dict] = None
 
 
 def _load_terminal_commands() -> dict:
-    """Load domain-specific terminal command config from terminal_commands.json."""
+    """Load domain terminal-command config from terminal_commands.json (cached)."""
     global _terminal_commands_cache
     if _terminal_commands_cache is not None:
         return _terminal_commands_cache
@@ -1097,7 +1003,7 @@ def _build_domain_section(domain: Optional[str]) -> str:
     """Build the domain-specific config files and examples section for the prompt."""
     commands = _load_terminal_commands()
     if not domain or domain not in commands:
-        # No domain match — include all domains as general reference
+        # No domain match: fall back to all domains' examples
         all_examples = []
         for d, data in commands.items():
             if d.startswith("_"):
@@ -1118,12 +1024,10 @@ def _build_domain_section(domain: Optional[str]) -> str:
     data = commands[domain]
     lines = []
 
-    # Notes section (domain-specific guidance)
     notes = data.get("notes", "")
     if notes:
         lines.append(f"\n=== DOMAIN NOTES ===\n{notes}\n")
 
-    # Config files section
     config_files = data.get("config_files", [])
     if config_files:
         lines.append("\n=== CONFIG FILE LOCATIONS ===")
@@ -1133,7 +1037,6 @@ def _build_domain_section(domain: Optional[str]) -> str:
             lines.append(f"  How to edit: {cf['how_to_edit']}")
         lines.append("")
 
-    # Examples section
     examples = data.get("examples", [])
     if examples:
         lines.append("=== EXAMPLES ===\n")
@@ -1148,17 +1051,10 @@ def _build_domain_section(domain: Optional[str]) -> str:
 
 def classify_terminal_subgoal(subgoal: str, instruction: str, screenshot_b64: str,
                               call_llm_fn, domain: Optional[str] = None) -> Optional[str]:
-    """Use LLM to determine if a subgoal can be done with a terminal command.
+    """LLM decides if a subgoal can be done via a terminal command.
 
-    Args:
-        subgoal: the current subgoal text
-        instruction: the overall task instruction
-        screenshot_b64: base64-encoded screenshot
-        call_llm_fn: callable(messages, max_tokens) -> str
-        domain: the app domain (e.g. "vlc", "os", "vs_code") for domain-specific examples
-
-    Returns:
-        The bash command string if applicable, or None.
+    domain (e.g. "vlc", "os", "vs_code") selects domain-specific examples.
+    Returns the bash command string, or None.
     """
     domain_section = _build_domain_section(domain)
     prompt = _TERMINAL_SUBGOAL_PROMPT_TEMPLATE.format(
@@ -1179,7 +1075,7 @@ def classify_terminal_subgoal(subgoal: str, instruction: str, screenshot_b64: st
         response = call_llm_fn(messages, max_tokens=500)
         if not response:
             return None
-        # Strip thinking content if present (Qwen3.5-VL <think> blocks)
+        # Strip Qwen3.5-VL <think> blocks
         clean = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
         m = re.match(r'COMMAND:\s*(.+)', clean, re.IGNORECASE)
         if not m:
@@ -1193,14 +1089,11 @@ def classify_terminal_subgoal(subgoal: str, instruction: str, screenshot_b64: st
 
 
 def execute_bash_on_vm(env, command: str, timeout: int = 30) -> Tuple[bool, str]:
-    """Execute a bash command on the VM.
+    """Run a bash command on the VM. Returns (success, output_or_error).
 
-    Tries env.controller.run_bash_script first. If the controller doesn't support it
-    (e.g. APIDesktopEnv's _RemoteController), falls back to env.step() with a
-    subprocess.run() wrapped in Python code.
-
-    Returns:
-        (success, output_or_error) where success = returncode == 0.
+    Prefers env.controller.run_bash_script; if unsupported (e.g.
+    APIDesktopEnv's _RemoteController), falls back to env.step() with a
+    subprocess.run() wrapped in Python.
     """
     # Method 1: direct run_bash_script (PythonController)
     if hasattr(env.controller, 'run_bash_script'):
@@ -1218,7 +1111,7 @@ def execute_bash_on_vm(env, command: str, timeout: int = 30) -> Tuple[bool, str]
         except Exception as e:
             return False, str(e)
 
-    # Method 2: wrap bash command in Python subprocess and execute via env.step()
+    # Method 2: wrap in a Python subprocess and run via env.step()
     safe_cmd = command.replace("\\", "\\\\").replace("'", "\\'")
     python_code = (
         "import subprocess\n"
@@ -1229,7 +1122,7 @@ def execute_bash_on_vm(env, command: str, timeout: int = 30) -> Tuple[bool, str]
     )
     try:
         obs, _, done, _ = env.step(python_code)
-        # The command executed via env.step; check if env is still alive
+        # done => env died after running the command
         if done:
             return False, "env reported done after bash execution"
         return True, "executed via env.step"
@@ -1238,26 +1131,17 @@ def execute_bash_on_vm(env, command: str, timeout: int = 30) -> Tuple[bool, str]
 
 
 def generate_vscode_settings_edit_actions(settings_to_merge: dict, env) -> List[str]:
-    """Generate actions to edit VS Code settings.json safely.
+    """Edit VS Code settings.json by pasting the merged JSON whole.
 
-    Flow:
-    1. env.step: Read current settings.json, merge new settings, copy result to clipboard
-    2. env.step: Open settings.json in VS Code via Command Palette
-    3. Return pyautogui code: Ctrl+A → Ctrl+V (paste merged JSON) → Ctrl+S
-
-    This avoids auto-closing bracket issues by pasting the complete JSON.
-
-    Args:
-        settings_to_merge: dict of key-value pairs to add/update in settings.json
-        env: the environment object
-
-    Returns:
-        List of pyautogui code strings to execute, or []
+    Reads + merges current settings to clipboard (env.step), opens
+    settings.json via Command Palette (env.step), then returns pyautogui code
+    for Ctrl+A -> Ctrl+V -> Ctrl+S. Pasting the full JSON sidesteps the
+    editor's auto-closing brackets. Returns pyautogui code strings, or [].
     """
     import json as _json
     merge_json = _json.dumps(settings_to_merge)
 
-    # Step 1: Read current settings, merge, copy to clipboard on the VM
+    # Step 1: read + merge settings, copy to clipboard on the VM
     merge_and_copy_code = (
         "import json, os, subprocess\n"
         f"new_settings = {merge_json}\n"
@@ -1278,7 +1162,7 @@ def generate_vscode_settings_edit_actions(settings_to_merge: dict, env) -> List[
     except Exception:
         return []
 
-    # Step 2: Open settings.json in VS Code editor
+    # Step 2: open settings.json in the editor
     open_settings_code = (
         "import pyautogui, time\n"
         "pyautogui.hotkey('ctrl', 'shift', 'p')\n"
@@ -1293,7 +1177,7 @@ def generate_vscode_settings_edit_actions(settings_to_merge: dict, env) -> List[
     except Exception:
         return []
 
-    # Step 3: Select all → paste → save
+    # Step 3: select all -> paste -> save
     paste_code = (
         "import pyautogui, time\n"
         "pyautogui.hotkey('ctrl', 'a')\n"

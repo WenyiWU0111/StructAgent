@@ -1,53 +1,26 @@
-"""boundary_verify.py — context-aware milestone verification at boundaries.
+"""Context-aware milestone verification at planner-declared boundaries.
 
-Phase 1 of the boundary-verify architecture (the planned replacement for the
-per-step KeyNode poll in ``key_node_detector.py``). PURE module — nothing here
-touches the loop yet.
+Verifies a milestone ONCE, at the boundary where the planner declares the
+subgoal done — the moment the most context is available — instead of the
+legacy per-step KeyNode poll (key_node_detector.py), which froze a VerifySpec
+at t=0 (least info) and re-checked every milestone on every step. Pure module:
+nothing here touches the loop yet.
 
-WHY THIS EXISTS
-  The legacy design freezes a ``VerifySpec`` for every milestone at t=0 (when
-  the agent has only the first screenshot) and then re-checks every milestone
-  on EVERY step (often a multimodal LLM call per step). Two problems: t=0
-  specs are authored with the least information available, and per-step
-  checking is expensive and mostly fires mid-subgoal when nothing is expected
-  to be done yet.
+Judge-or-probe (v1): one LLM call per boundary covering all the subgoal's
+target outcomes. Per outcome the verifier either judges from the current
+observation (screenshot + a11y + perceiver prior + doc-structure block) or
+requests ONE deterministic PROBE for latent facts a screenshot can't show
+(file content, saved state, document model, active URL). Probes reuse the
+verifiers.py executors via verify_with_trace; all are read-only (shell_command
+behind _shell_probe_is_readonly). The authored probe rides on the verdict
+(authored_check) so a later DONE-gate re-check reuses it for free.
 
-  This module instead verifies a milestone ONCE, at the boundary where the
-  planner itself declares the targeting subgoal done — the moment the most
-  context is available. It authors the check ON THE SPOT.
-
-THE "JUDGE-OR-PROBE" CALL (v1)
-  One LLM call per boundary, covering all of that subgoal's target outcomes.
-  For each outcome the verifier either:
-    * judges directly from the current observation (screenshot + a11y +
-      perceiver prior + office document-structure block), or
-    * requests ONE deterministic PROBE to settle a LATENT fact a screenshot
-      cannot show (file content, saved state, document model, active tab URL).
-      Probes reuse the proven executors in ``verifiers.py`` via
-      ``verify_with_trace``.
-
-  Probe kinds: file_grep, url_match, a11y_match, calc_verify, impress_verify,
-  writer_verify (all structurally read-only — the LLM supplies only structured
-  args, the framework builds the read), plus ``shell_command`` behind a
-  READ-ONLY guard (see ``_shell_probe_is_readonly``). A verifier must never
-  change the state it is checking.
-
-  The authored probe is returned on the verdict (``authored_check``) so a
-  later DONE-gate re-check can reuse it without spending another LLM call.
-
-CONTRACT
-  ``verify_milestone(outcomes, ctx, call_llm, model, env=None, logger=None)
-      -> List[MilestoneVerdict]``
-
-  Conservative by design: anything the verifier cannot positively confirm is
-  reported ``verified=False`` (keep working) — never rubber-stamp the
-  planner's claim. A verifier-infrastructure failure is flagged
-  (``error=True``) so the caller can distinguish "not done" from "could not
-  check" and pick a fallback policy.
-
-  Duck-typed ``outcomes``: each only needs ``.id``, ``.description``,
-  ``.evidence_hint``, ``.app`` (read via ``getattr``) — so tests can pass
-  lightweight stubs without constructing a full ``Outcome``.
+Contract: verify_milestone(outcomes, ctx, call_llm, model, env, logger)
+-> List[MilestoneVerdict]. Conservative — anything not positively confirmed is
+verified=False (keep working), never rubber-stamp the planner. Infra failure
+sets error=True so the caller can tell "not done" from "could not check".
+outcomes is duck-typed: only needs .id/.description/.evidence_hint/.app (via
+getattr), so tests can pass stubs.
 """
 from __future__ import annotations
 
@@ -57,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from mm_agents.structagent.ledger.core.ledger import VerifySpec
-# Module-global so tests can monkeypatch the executor to isolate the fold logic.
+# Module-global so tests can monkeypatch the executor.
 from mm_agents.structagent.core.verifier.verifiers import verify_with_trace
 
 
@@ -69,13 +42,11 @@ PROBE_KINDS: frozenset = frozenset({
 })
 
 # ── Per-domain trust map ──────────────────────────────────────────────────────
-# Single source for (a) which probe kinds the verifier may author at a boundary in
-# this domain and (b) the "trust X / don't trust Y" guidance shown to the LLM.
-# Reflects REAL probe capability: shell_command is read-only env/existence only
-# (which / pgrep / test / gsettings get / dpkg -l / snap list — NO cat/grep/ls/
-# sqlite/unzip/pipes); office docs are ZIP so file_grep can't read them → use
-# *_verify (UNO). Excluded kinds are NEVER shown to the model (silent restriction,
-# mirroring the actor-side coding gate). Unknown domain → all probes, no guidance.
+# Single source for (a) the probe kinds the verifier may author in this domain and
+# (b) the "trust X / don't trust Y" guidance shown to the LLM. Reflects real probe
+# capability: shell_command is read-only env/existence only; office docs are ZIP so
+# file_grep can't read them → use *_verify (UNO). Excluded kinds are never shown to
+# the model. Unknown domain → all probes, no guidance.
 DOMAIN_TRUST_MAP: Dict[str, Dict[str, Any]] = {
     "chrome": {
         "probes": ("a11y_match", "url_match", "file_grep"),
@@ -131,8 +102,7 @@ DOMAIN_TRUST_MAP: Dict[str, Dict[str, Any]] = {
 
 
 def allowed_probes_for_domain(domain: str) -> frozenset:
-    """Probe kinds the verifier may author in this domain (per DOMAIN_TRUST_MAP).
-    Unknown domain → all probes. Excluded kinds are never shown to the model."""
+    """Probe kinds allowed in this domain (per DOMAIN_TRUST_MAP); unknown → all."""
     entry = DOMAIN_TRUST_MAP.get((domain or "").strip())
     return frozenset(entry["probes"]) if entry else PROBE_KINDS
 
@@ -146,9 +116,8 @@ def domain_trust_guidance(domain: str) -> str:
             f"- TRUST: {entry['trust']}.\n"
             f"- DO NOT TRUST (misleading): {entry['avoid']}.")
 
-# Per-kind schema doc rendered into the prompt's probe catalog. build_messages
-# emits only the lines for the kinds ALLOWED at this boundary (domain-dependent),
-# so an excluded kind never appears as an option to the model.
+# Per-kind schema doc for the prompt's probe catalog. build_messages emits only
+# the lines for kinds allowed at this boundary, so excluded kinds never appear.
 _PROBE_DOC = {
     "url_match": 'url_match      {"kind":"url_match","url_pattern":"regex against the active tab URL"}',
     "a11y_match": 'a11y_match     {"kind":"a11y_match","text_contains":["..."],"state_contains":["..."],"tag":"..."}',
@@ -163,15 +132,14 @@ _PROBE_DOC = {
 _PROBE_ORDER = ["url_match", "a11y_match", "file_grep", "calc_verify",
                 "impress_verify", "writer_verify", "shell_command"]
 
-# Cap the a11y text sent to the verifier. Content-heavy pages (esp. chrome)
-# produce a11y trees of ~1M chars / 260k+ tokens that blow the model's context
-# window (observed: BadRequestError 400, 260645 > 262144). KeyNode caps at
-# 6000; the boundary verifier is the SOLE verifier so we keep more (30k chars
-# ≈ 7.5k tokens) — generous but safely under the limit alongside the image.
+# Cap a11y text sent to the verifier. Content-heavy pages (esp. chrome) yield
+# ~1M-char trees that blow the context window (observed 400: 260645 > 262144).
+# 30k chars ≈ 7.5k tokens — generous (KeyNode caps at 6000) but safe alongside
+# the image, since the boundary verifier is the sole verifier.
 _A11Y_MAX_CHARS = 30000
 
-# Whitelist of VerifySpec fields read from an LLM probe request, per kind.
-# Anything else the model emits is dropped — it cannot invent spec fields.
+# VerifySpec fields read from an LLM probe request, per kind. Anything else the
+# model emits is dropped — it can't invent spec fields.
 _PROBE_FIELDS: Dict[str, tuple] = {
     "file_grep": ("file_path", "patterns", "all_must_match", "proximity_lines"),
     "url_match": ("url_pattern",),
@@ -184,13 +152,11 @@ _PROBE_FIELDS: Dict[str, tuple] = {
 }
 
 # ── shell_command read-only guard ──
-# ``VerifySpec.is_valid()`` already hard-whitelists argv[0] to
-# {which, dpkg, snap, pgrep, test, gsettings, python3}. Because that set is
-# tiny, we guard with an ALLOWLIST refinement (tighter than a denylist — no
-# leak): the inherently-read commands pass; the dual-use tools must use a read
-# subcommand; the free-form interpreter (python3) is rejected outright (a
-# verify probe must not run arbitrary code — document checks belong in
-# calc/impress/writer_verify).
+# is_valid() already whitelists argv[0] to {which, dpkg, snap, pgrep, test,
+# gsettings, python3}. Refine with an allowlist (tighter than a denylist):
+# inherently-read commands pass, dual-use tools need a read subcommand, and
+# python3 is rejected — a verify probe must not run arbitrary code (document
+# checks belong in calc/impress/writer_verify).
 _SHELL_ALWAYS_READ: frozenset = frozenset({"which", "pgrep", "test"})
 _SHELL_DUAL_READ: Dict[str, frozenset] = {
     "gsettings": frozenset({
@@ -205,12 +171,10 @@ _SHELL_DUAL_READ: Dict[str, frozenset] = {
 
 
 def _shell_probe_is_readonly(command: Any) -> bool:
-    """Best-effort read-only guard for a ``shell_command`` PROBE.
+    """True only when a shell_command probe provably reads state.
 
-    Returns True only when the command provably reads state. ``is_valid``
-    already bounds argv[0] to a 7-command whitelist; here ``which``/``pgrep``/
-    ``test`` always pass, the dual-use tools (gsettings/dpkg/snap) must invoke
-    a read subcommand, and everything else (notably ``python3``) is rejected.
+    which/pgrep/test always pass; gsettings/dpkg/snap need a read subcommand;
+    everything else (notably python3) is rejected.
     """
     if not isinstance(command, list) or not command:
         return False
@@ -230,10 +194,9 @@ def _shell_probe_is_readonly(command: Any) -> bool:
 class VerifyContext:
     """Everything the boundary verifier needs about the current situation.
 
-    A single current screenshot is NOT enough on its own: milestone
-    verification is a transition question (did THIS subgoal achieve the
-    change?) and often depends on latent state. So we carry the delta and the
-    full a11y, and lean on the probe for what no screenshot can show.
+    Verification is a transition question (did THIS subgoal make the change?)
+    and often hinges on latent state, so we carry the delta and full a11y and
+    lean on probes for what no screenshot can show.
     """
     instruction: str = ""                    # the task instruction
     domain: str = ""                         # OSWorld domain (context; GUI-only gating is via gui_only)
@@ -339,10 +302,9 @@ def _b64_to_url(b64: str) -> str:
 
 
 def _render_snapshot_prior(snap: Any) -> str:
-    """Compact perceiver prior (opportunistic — only when PERCEIVER is on).
+    """Compact perceiver prior from a SubgoalSnapshot (only when PERCEIVER is on).
 
-    Reads a couple of high-signal fields off a SubgoalSnapshot via getattr so
-    this module stays decoupled from the perceiver dataclass.
+    Reads a few fields via getattr to stay decoupled from the perceiver dataclass.
     """
     if snap is None:
         return ""
@@ -365,12 +327,11 @@ def _render_snapshot_prior(snap: Any) -> str:
 
 def spec_from_probe(probe: Any,
                     allowed_kinds: frozenset = PROBE_KINDS) -> Optional[VerifySpec]:
-    """Build a validated ``VerifySpec`` from an LLM probe-request dict.
+    """Build a validated VerifySpec from an LLM probe-request dict, or None.
 
-    Returns ``None`` when the kind is disallowed, required fields are missing,
-    the model invented unknown fields, the spec fails ``VerifySpec.is_valid()``,
-    or (for shell_command) the command is not provably read-only. Defensive by
-    construction: only whitelisted fields for the kind are read.
+    None when the kind is disallowed, the spec fails is_valid(), or (for
+    shell_command) the command isn't provably read-only. Only whitelisted
+    fields for the kind are read.
     """
     if not isinstance(probe, dict):
         return None
@@ -395,15 +356,12 @@ def spec_from_probe(probe: Any,
 
 
 def _extract_json_array(raw: str) -> Any:
-    """Tolerant extraction of the verifier's JSON from an LLM response: strips
-    code fences, tries a direct parse, then scans for the first ``[`` (array)
-    or ``{`` (single object) and ``raw_decode``s from there (handles prose
-    wrappers).
+    """Tolerant JSON extraction: strip fences, direct parse, else raw_decode from
+    the first ``[`` or ``{`` (handles prose wrappers).
 
-    A bare object is wrapped into a one-element list: when there is a SINGLE
-    milestone the model frequently emits ``{...}`` instead of ``[{...}]``,
-    which would otherwise be dropped by the ``isinstance(data, list)`` check in
-    ``parse_verifier_response`` and silently yield an empty verdict.
+    A bare object is wrapped into a one-element list — for a single milestone the
+    model often emits ``{...}`` instead of ``[{...}]``, which the list check in
+    parse_verifier_response would otherwise drop into an empty verdict.
     """
     s = (raw or "").strip()
     s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
@@ -426,8 +384,8 @@ def _extract_json_array(raw: str) -> Any:
 
 
 def parse_verifier_response(raw: str, outcomes: List[Any]) -> Dict[str, dict]:
-    """Parse the verifier's JSON array into ``{outcome_id: item}``. Items for
-    ids not in ``outcomes`` are dropped; malformed input yields ``{}``."""
+    """Parse the verifier JSON array into {outcome_id: item}. Unknown ids dropped;
+    malformed input → {}."""
     out: Dict[str, dict] = {}
     data = _extract_json_array(raw)
     if not isinstance(data, list):
@@ -470,9 +428,8 @@ def build_messages(outcomes: List[Any], ctx: VerifyContext
     lines.append("[MILESTONES to verify]\n" + "\n".join(ol))
 
     blocks: List[Dict[str, Any]] = [{"type": "text", "text": "\n\n".join(lines)}]
-    # Recent screenshots oldest→newest (workflow context, like the KeyNode
-    # judge): earlier frames first, then the current. Each is decoded as an
-    # IMAGE (~2k tokens), so up to ~5 frames ≈ 10k tokens — safe.
+    # Recent screenshots oldest→newest (workflow context), then the current.
+    # Each is ~2k tokens, so ~5 frames ≈ 10k tokens — safe.
     for _i, _b in enumerate(ctx.prior_screenshots_b64 or []):
         if not _b:
             continue
@@ -485,11 +442,9 @@ def build_messages(outcomes: List[Any], ctx: VerifyContext
         blocks.append({"type": "image_url",
                        "image_url": {"url": _b64_to_url(ctx.screenshot_b64)}})
     if ctx.a11y_text:
-        # Defensive crash-guard ONLY. The caller is expected to pass a
-        # subgoal-relevant, intent-prefiltered a11y (see the loop gate); this
-        # cap is the last-resort net because the prefilter bounds row COUNT but
-        # not per-row text size, and returns input unchanged when rows<=top_n —
-        # so a few huge rows could still blow the context window (observed 400).
+        # Last-resort crash guard: the caller passes intent-prefiltered a11y, but
+        # the prefilter bounds row COUNT not per-row size, so a few huge rows could
+        # still blow the context window (observed 400).
         a11y = ctx.a11y_text
         if len(a11y) > _A11Y_MAX_CHARS:
             a11y = (a11y[:_A11Y_MAX_CHARS]
@@ -505,8 +460,7 @@ def build_messages(outcomes: List[Any], ctx: VerifyContext
             "properties]\n" + ctx.doc_inspect_block)})
     if ctx.check_recipe_block:
         blocks.append({"type": "text", "text": ctx.check_recipe_block})
-    # Per-domain ground-truth guidance (trust X / don't trust Y) + the low-level
-    # probe catalog. Excluded kinds (per DOMAIN_TRUST_MAP) are never shown.
+    # Per-domain ground-truth guidance + probe catalog. Excluded kinds never shown.
     guidance = domain_trust_guidance(ctx.domain)
     if guidance:
         blocks.append({"type": "text", "text": guidance})
@@ -526,15 +480,15 @@ def build_messages(outcomes: List[Any], ctx: VerifyContext
 def _run_probe(spec: VerifySpec, ctx: VerifyContext, env: Any,
                obs_verdict: str, obs_reason: str, obs_evidence: str,
                logger: Any = None) -> tuple:
-    """Run one probe; fold the (True/False/None) verdict.
+    """Run one probe and fold its True/False/None verdict.
 
-    Returns ``(verified_bool, method, reason, evidence)``. ``None``
-    (inconclusive) falls back to the LLM's observation judgment.
+    Returns (verified, method, reason, evidence). None (inconclusive) falls
+    back to the LLM's observation judgment.
     """
     try:
         verdict, trace = verify_with_trace(
             spec, env, a11y_text=ctx.a11y_text, instruction=ctx.instruction)
-    except Exception as e:                                    # probe must never crash the verify
+    except Exception as e:                                    # a probe must never crash the verify
         if logger:
             logger.warning("[BoundaryVerify] probe %s raised: %s", spec.kind, e)
         verdict, trace = None, {"verdict_reason": f"probe raised: {e}"}
@@ -558,13 +512,12 @@ def _run_probe(spec: VerifySpec, ctx: VerifyContext, env: Any,
 def verify_milestone(outcomes: List[Any], ctx: VerifyContext,
                      call_llm: Any, model: str,
                      env: Any = None, logger: Any = None) -> List[MilestoneVerdict]:
-    """Verify the given target outcomes at a planner-declared boundary.
+    """Verify target outcomes at a planner-declared boundary (see module docstring).
 
-    One LLM call (judge-or-probe) covering all ``outcomes``; per outcome, an
-    optional deterministic probe overrides the observation judgment. See the
-    module docstring for the full contract. Always returns one verdict per
-    outcome (never raises); on verifier-infra failure every verdict is
-    ``verified=False, error=True``.
+    One judge-or-probe LLM call covering all outcomes; an optional deterministic
+    probe overrides the observation judgment. Always returns one verdict per
+    outcome (never raises); on infra failure every verdict is verified=False,
+    error=True.
     """
     outcomes = list(outcomes or [])
     if not outcomes:
@@ -606,8 +559,8 @@ def verify_milestone(outcomes: List[Any], ctx: VerifyContext,
             verdicts.append(MilestoneVerdict(
                 oid, verified, reason2, evidence2, method, authored_check=spec))
         else:
-            # No (valid) probe → trust the observation judgment, conservatively:
-            # only an explicit "verified" counts; "uncertain"/anything else → not done.
+            # No valid probe → trust the observation, conservatively: only an
+            # explicit "verified" counts; anything else → not done.
             verdicts.append(MilestoneVerdict(
                 oid, verified=(obs == "verified"),
                 reason=reason, evidence=evidence, method="obs"))

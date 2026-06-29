@@ -1,26 +1,18 @@
-"""Structured Impress action handlers — flat JSON kwargs, no nested
-Python.
+"""Structured Impress action handlers — flat JSON kwargs, no nested Python.
 
 Mirrors :mod:`mm_agents.actions.calc.actions`. The actor emits a JSON dict like
-``{"action":"impress_set_text", "slide":1, "placeholder":"title",
-"text":"..."}``; this module deterministically builds the equivalent
-``op_impress_*`` call. The Python source is generated server-side —
-guaranteed syntactically correct.
+``{"action":"impress_set_text", "slide":1, "placeholder":"title", "text":...}``
+and this module deterministically builds the equivalent ``op_impress_*`` call,
+so the generated Python is always syntactically correct.
 
 Three slices:
+  * :data:`IMPRESS_ACTION_NAMES` — dispatch membership gate.
+  * ``_wire_impress_*`` — validate JSON → AST-parseable wire string.
+  * ``_build_impress_*`` — wire kwargs → full runtime script to exec on the VM.
 
-  * :data:`IMPRESS_ACTION_NAMES` — membership gate for dispatch.
-  * ``_wire_impress_*`` validators — convert a decomposer's JSON
-    action dict to an AST-parseable wire string.
-  * ``_build_impress_*`` codegen — given parsed kwargs, build the
-    wrapped runtime script (boilerplate + ops library + actor body)
-    ready to ``exec`` on the VM.
-
-Adding a new ``impress_*`` action: add the name to
-:data:`IMPRESS_ACTION_NAMES`, add a ``_wire_impress_*`` validator
-returning a wire string, add a ``_build_impress_*`` Python-code
-generator. The dispatch tables at the bottom of the file pick up the
-new handlers automatically.
+To add an ``impress_*`` action: add the name to :data:`IMPRESS_ACTION_NAMES`,
+a ``_wire_impress_*`` validator, and a ``_build_impress_*`` generator. The
+dispatch tables at the bottom pick them up automatically.
 """
 from __future__ import annotations
 
@@ -59,8 +51,7 @@ IMPRESS_ACTION_NAMES: frozenset = frozenset({
 })
 
 
-# Companion verify-op registry — feeds the init_ledger's calc_verify-
-# style structured spec for the impress domain.
+# Verify-op registry — feeds init_ledger's structured verify spec for impress.
 
 IMPRESS_VERIFY_OPS: Dict[str, str] = {
     "slide_count":              "verify_impress_slide_count",
@@ -113,9 +104,8 @@ def validate_impress_verify_check(chk: Dict[str, Any]) -> bool:
 
 
 def build_impress_verify_python_body(checks: List[Dict[str, Any]]) -> str:
-    """Return the python3 -c body string for a list of impress_verify
-    checks. ``all`` semantics — prints PASS iff every check is truthy;
-    otherwise prints ``FAIL: check[<i>] '<op>'`` naming the first
+    """python3 -c body for a list of impress_verify checks. Prints PASS iff
+    every check is truthy, else ``FAIL: check[<i>] '<op>'`` for the first
     failing check."""
     if not checks:
         return "print('FAIL: no checks')"
@@ -137,9 +127,7 @@ def build_impress_verify_python_body(checks: List[Dict[str, Any]]) -> str:
 
 
 def impress_verify_schema_block() -> str:
-    """Prompt block describing the structured ``impress_verify`` spec
-    for init_ledger. Mirrors calc_verify_schema_block.
-    """
+    """Prompt block for the structured ``impress_verify`` spec (init_ledger)."""
     return _IMPRESS_VERIFY_SCHEMA_BLOCK
 
 
@@ -282,10 +270,8 @@ the impress_verify kind covers every Impress evaluator shape.
 # ====================================================================
 
 def action_schema_block() -> str:
-    """Action catalogue describing every impress_* action's flat JSON
-    shape. Injected into the decomposer system prompt when domain is
-    libreoffice_impress. Mirrors calc's action_schema_block.
-    """
+    """Action catalogue (flat JSON shapes) for the decomposer prompt on
+    libreoffice_impress."""
     return _ACTION_SCHEMA_BLOCK
 
 
@@ -574,16 +560,13 @@ is no raw-UNO escape hatch.
 # ====================================================================
 
 def data_layout_init_block() -> str:
-    """Prompt block describing the data_layout JSON shape init_ledger
-    must emit for libreoffice_impress tasks. Mirrors calc's init block.
-    """
+    """Prompt block: data_layout JSON shape init_ledger emits for impress."""
     return _DATA_LAYOUT_INIT_BLOCK
 
 
 def data_layout_planner_block() -> str:
-    """Prompt block describing the <data_layout>+<step> XML shape the
-    planner must emit for libreoffice_impress tasks.
-    """
+    """Prompt block: <data_layout>+<step> XML shape the planner emits for
+    impress."""
     return _DATA_LAYOUT_PLANNER_BLOCK
 
 
@@ -874,12 +857,11 @@ def _emit_script(call_lines: List[str], domain: Optional[str],
     from ..uno.cli_run_uno_helpers import build_runtime_script
     code = "\n".join(list(call_lines) + ["print('PASS')"])
     try:
-        # The UNO ops library + setup MUST match the ACTION's domain (impress),
-        # NOT the active-window/__current_domain — cli_run_uno re-binds ``doc``
-        # by document service type, so window focus is irrelevant. Routing by
-        # __current_domain loaded the wrong ops lib when another app was focused
-        # (6f4073b8/eb303e01: impress_set_notes under a Writer window → the
-        # Writer ops lib has no op_impress_set_notes → every call failed).
+        # Ops lib MUST match the action's domain (impress), NOT
+        # __current_domain — cli_run_uno re-binds ``doc`` by service type, so
+        # window focus is irrelevant. Routing by __current_domain loaded the
+        # wrong ops lib when another app was focused (6f4073b8/eb303e01:
+        # impress_set_notes under a Writer window → no op_impress_set_notes).
         return build_runtime_script(code, domain="libreoffice_impress")
     except ValueError as e:
         if logger:
@@ -908,9 +890,7 @@ def _wire_set_text(step):
 
 
 def _wire_set_font(step):
-    # ``scope`` defaults to "shape" → ``slide`` is then required.
-    # For scope="slide" only ``slide`` is required; for scope="all"
-    # nothing geometric is required.
+    # scope="shape"/"slide" require ``slide``; scope="all" requires nothing.
     scope = (step.get("scope") or "shape").lower()
     slide = step.get("slide")
     if scope == "shape" and slide is None:
@@ -1158,7 +1138,7 @@ def _wire_insert_chart(step):
     values = step.get("values")
     if not values:
         return None
-    # Form-2-style emission protocol borrowed from calc: count check.
+    # Reject if any value series length mismatches the category count.
     cat_len = (len(categories) if isinstance(categories, list)
                else (len(categories.split("|"))
                      if isinstance(categories, str) else 0))
@@ -1190,9 +1170,8 @@ def _wire_insert_table(step):
     rows = step.get("rows"); cols = step.get("cols")
     if slide is None or rows is None or cols is None:
         return None
-    # Pass position/size through as-is (no hard-coded defaults). When all
-    # four are omitted, the op falls into "replace empty content
-    # placeholder" mode — see op_impress_insert_table.
+    # No default x/y/w/h: when all four are omitted, the op uses
+    # "replace empty content placeholder" mode (see op_impress_insert_table).
     return _kw_wire("impress_insert_table", {
         "slide": slide,
         "rows": int(rows), "cols": int(cols),
@@ -1261,9 +1240,8 @@ _WIRE_HANDLERS = {
 
 
 def step_to_wire(step: Dict[str, Any]) -> Optional[str]:
-    """Convert a decomposer JSON action dict to an AST-parseable
-    ``impress_xxx(arg=val, ...)`` wire string. Returns None if the
-    JSON is malformed."""
+    """JSON action dict → ``impress_xxx(arg=val, ...)`` wire string, or None
+    if malformed."""
     handler = _WIRE_HANDLERS.get(step.get("action") or "")
     if not handler:
         return None
@@ -1275,16 +1253,12 @@ def step_to_wire(step: Dict[str, Any]) -> Optional[str]:
 # ====================================================================
 
 def _build_generic(op_name: str, inputs: Dict[str, Any], logger) -> Optional[str]:
-    """Default builder — takes inputs minus ``__current_domain`` /
-    ``action`` and forwards them to op_impress_<name>.
+    """Default builder for actions whose kwargs map 1:1 to op_impress_<name>;
+    forwards inputs minus ``__current_domain`` / ``action``.
 
-    Used for actions whose kwargs map 1:1 to the op signature.
-
-    Also captures the action's target slide (when present) into a module
-    global ``_pa_target_slide`` BEFORE the op call. The cli_run_uno
-    post-block reads this and switches the view to that slide so the
-    next screenshot reflects the edit instead of whichever slide
-    happened to be visible. Mirrors the calc_* sheet-tracking design.
+    Stashes the target slide into module global ``_pa_target_slide`` before the
+    op call so the cli_run_uno post-block can switch the view there — otherwise
+    the next screenshot shows whatever slide happened to be visible.
     """
     domain = inputs.get("__current_domain")
     kw = {k: v for k, v in inputs.items()
@@ -1292,8 +1266,7 @@ def _build_generic(op_name: str, inputs: Dict[str, Any], logger) -> Optional[str
     pre_lines: list = []
     slide_val = kw.get("slide")
     if slide_val is not None:
-        # Stash the slide selector verbatim — the post-block re-resolves
-        # via _impress_get_slide so it handles either int or name.
+        # Stash verbatim; post-block re-resolves via _impress_get_slide (int or name).
         pre_lines.append(f"_pa_target_slide = {slide_val!r}")
     return _emit_script(pre_lines + [_kw_call(op_name, kw)], domain, logger)
 
@@ -1425,11 +1398,10 @@ _BUILD_HANDLERS = {
 def action_to_runtime_script(action_type: str,
                               inputs: Dict[str, Any],
                               logger=None) -> Optional[str]:
-    """Given an ``impress_*`` action_type + parsed kwargs, build the
-    full runtime script ready for cli_run_uno on the VM.
+    """Build the full cli_run_uno runtime script for an ``impress_*`` action.
 
-    Returns None when the kwargs are malformed; the planner's next
-    turn will see [Last cli_run output] empty and re-plan.
+    Returns None on malformed kwargs; the planner then sees an empty
+    [Last cli_run output] next turn and re-plans.
     """
     builder = _BUILD_HANDLERS.get(action_type)
     if builder is None:

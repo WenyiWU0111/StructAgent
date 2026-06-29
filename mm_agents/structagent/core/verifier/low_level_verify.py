@@ -1,9 +1,8 @@
 """VLM verifier for one actor turn inside a subgoal.
 
-This verifier is intentionally narrower than the boundary verifier. It checks
-whether the last actor action helped the current subgoal, using current
-before/after screenshots plus a short recent-turn history for context. It does
-not update the ledger and it does not certify task-level completion.
+Narrower than the boundary verifier: checks whether the last action helped
+the current subgoal, from before/after screenshots plus a short turn history.
+Does not touch the ledger or certify task-level completion.
 """
 from __future__ import annotations
 

@@ -1,16 +1,13 @@
-"""Retrieve boundary CHECK RECIPES (verifier-side memory for the boundary verifier).
+"""Retrieve boundary CHECK RECIPES — verifier-side memory.
 
-The bank is built by ``mm_agents.structagent.memory.offline.build_check_recipes`` from the
-Verifier intent recipes: per milestone class, the ground-truth probe + strict criterion
-+ traps, keyed by ``when_to_use``. The boundary verifier retrieves the top-k for the
-current milestone and folds them into its judge-or-probe prompt as guidance —
-"how this class of milestone has been verified before".
+The bank (built by ``memory.offline.build_check_recipes`` from Verifier
+intent recipes) holds, per milestone class, the ground-truth probe +
+strict criterion + traps, keyed by ``when_to_use``. The boundary
+verifier retrieves the top-k for the current milestone and folds them
+into its judge-or-probe prompt as guidance.
 
-  retrieve_check_recipes(query_text, domain="", k=3) -> List[dict]
-  render_check_recipe_block(recipes) -> str   (prompt block, or "")
-
-Lazy process-wide singleton (SentenceTransformer + FAISS load paid once). Missing
-bank → returns [] / "" silently (feature is opt-in; must never break verification).
+Lazy process-wide singleton (model + FAISS loaded once). Missing bank →
+[] / "" silently; the feature is opt-in and must never break verification.
 """
 from __future__ import annotations
 

@@ -1,25 +1,18 @@
 """Reconstruct bBoN RolloutArtifacts from EXISTING run dumps — no re-run, no VM.
 
-We already have ~8k rollouts on disk (tasks repeat 20-30x across configs/dates).
-Each task dir carries enough to rebuild a narrative offline:
+Builds the OFFLINE judge frozen set cheaply from the ~8k rollouts already on
+disk (tasks repeat 20-30x across configs/dates). Per task dir we read:
 
   result.txt                                   -> real eval score (0/1)
-  keynode_debug/step_NNN_keynode_input.json    -> per-step outcomes (id/description/
-                                                  evidence_hint/current_state) + action
+  keynode_debug/step_NNN_keynode_input.json    -> per-step outcomes + action
   keynode_debug/step_NNN_keynode_verdicts.json -> per-outcome deterministic_trace
-                                                  (objective probe output) per step
-  planner_debug/step_NNNN_*.html               -> the screenshots the planner saw
-                                                  (embedded data:image/png; take max)
+  planner_debug/step_NNNN_*.html               -> screenshots (embedded png; take max)
   traj.jsonl                                   -> per-step response (for <decision>)
 
-Synthetic KeyNodes are derived from outcome STATE TRANSITIONS across the per-step
-``current_state`` sequence (pending->verified = satisfied; verified->reverted =
-invalidated), with the step's ``deterministic_trace`` as the objective evidence.
-This keeps the facts-not-verdicts rule (see narrative.py): we render the probe
-trace, never "satisfied".
-
-For production bBoN you still run N live rollouts; this is for building the OFFLINE
-judge frozen set cheaply from data we already paid for.
+Synthetic KeyNodes come from outcome state transitions (pending->verified =
+satisfied; verified->reverted = invalidated), with the step's deterministic_trace
+as evidence. Keeps the facts-not-verdicts rule (narrative.py): render the probe
+trace, never "satisfied". Production bBoN still runs N live rollouts.
 """
 from __future__ import annotations
 
@@ -60,7 +53,7 @@ def load_score(task_dir: str) -> Optional[float]:
 
 
 def _trace_summary(trace: Any) -> str:
-    """Objective one-liner for a deterministic_trace (probe + raw result). No verdict."""
+    """Objective one-liner for a deterministic_trace (probe + raw result), no verdict."""
     if not isinstance(trace, dict):
         return str(trace)[:200]
     kind = trace.get("kind", "probe")
@@ -75,8 +68,8 @@ def _trace_summary(trace: Any) -> str:
 
 
 def _load_steps(task_dir: str) -> List[dict]:
-    """Parse keynode_debug into per-step dicts (step_idx, action, states{id:state},
-    traces{id:summary}) ordered by step_idx."""
+    """keynode_debug -> per-step dicts {step_idx, action, states{id:state},
+    traces{id:summary}}, ordered by step_idx."""
     kd = os.path.join(task_dir, "keynode_debug")
     inputs: Dict[int, dict] = {}
     for p in glob.glob(os.path.join(kd, "*_keynode_input.json")):
@@ -106,16 +99,15 @@ def _load_steps(task_dir: str) -> List[dict]:
                       "states": states, "traces": traces})
     if steps:
         return steps
-    # Fallback: boundary-mode / keynode-less runs emit no per-step
-    # *_keynode_input.json (the per-step poll is bypassed). Rebuild a step
-    # skeleton from traj.jsonl so BBoN works regardless of verify mode — no
-    # per-step outcome states (judge leans on screenshots + actions + final).
+    # Boundary-mode / keynode-less runs emit no per-step *_keynode_input.json,
+    # so rebuild a skeleton from traj.jsonl (no per-step outcome states; judge
+    # leans on screenshots + actions + final).
     return _load_steps_from_traj(task_dir)
 
 
 def _load_steps_from_traj(task_dir: str) -> List[dict]:
-    """Mode-agnostic step skeleton from traj.jsonl: {step_idx, action, states{},
-    traces{}}. Used when keynode_debug has no per-step input dumps."""
+    """Step skeleton from traj.jsonl ({step_idx, action, states{}, traces{}}),
+    for when keynode_debug has no per-step input dumps."""
     p = os.path.join(task_dir, "traj.jsonl")
     if not os.path.exists(p):
         return []
@@ -142,7 +134,7 @@ def _load_steps_from_traj(task_dir: str) -> List[dict]:
 
 
 def _planner_html_index(task_dir: str) -> Dict[int, str]:
-    """{step_idx: planner_debug html path} from filenames (cheap; no read)."""
+    """{step_idx: planner_debug html path} from filenames (no read)."""
     idx: Dict[int, str] = {}
     for p in glob.glob(os.path.join(task_dir, "planner_debug", "step_*.html")):
         m = _PLANNER_STEP_RE.search(os.path.basename(p))
@@ -152,10 +144,9 @@ def _planner_html_index(task_dir: str) -> Dict[int, str]:
 
 
 def _load_screenshots(task_dir: str, needed: Optional[set] = None) -> Dict[int, str]:
-    """planner_debug html -> {step_idx: largest embedded png b64}. Reads ONLY the
-    htmls for ``needed`` steps (turning points + anchors) — each html is multi-MB, so
-    targeted loading avoids reading the whole 100-step trajectory. ``needed=None``
-    reads all (slow; avoid)."""
+    """planner_debug html -> {step_idx: largest embedded png b64}. Reads only the
+    htmls for ``needed`` steps — each is multi-MB, so targeted loading avoids the
+    whole 100-step trajectory. ``needed=None`` reads all (slow; avoid)."""
     idx = _planner_html_index(task_dir)
     items = idx.items() if needed is None else ((s, idx[s]) for s in needed if s in idx)
     out: Dict[int, str] = {}
@@ -165,12 +156,12 @@ def _load_screenshots(task_dir: str, needed: Optional[set] = None) -> Dict[int, 
         except Exception:
             continue
         if imgs:
-            out[s] = max(imgs, key=len)   # the full current screenshot
+            out[s] = max(imgs, key=len)   # largest = full screenshot
     return out
 
 
 def _load_decisions(task_dir: str) -> Dict[int, str]:
-    """traj.jsonl -> {step_idx: planner decision} (best-effort; step_num is 1-based)."""
+    """traj.jsonl -> {step_idx: planner decision}. step_num is 1-based."""
     out: Dict[int, str] = {}
     p = os.path.join(task_dir, "traj.jsonl")
     if not os.path.exists(p):
@@ -187,9 +178,9 @@ def _load_decisions(task_dir: str) -> Dict[int, str]:
 
 
 def _load_final_state_facts(task_dir: str) -> str:
-    """Objective final-state facts from the LAST perceiver snapshot: visible
-    controls (label/role/state/value) + transition summary. Excludes the
-    perceiver's own subgoal verdict — facts, not another model's judgment."""
+    """Final-state facts from the LAST perceiver snapshot: visible controls
+    (label/role/state/value) + transition summary. Excludes the perceiver's own
+    subgoal verdict — facts, not another model's judgment."""
     snaps = sorted(glob.glob(os.path.join(task_dir, "perceiver_debug",
                                           "*_perceiver_snapshot.json")))
     if not snaps:
@@ -223,9 +214,9 @@ def _load_final_state_facts(task_dir: str) -> str:
 
 
 def _load_step_a11y(task_dir: str) -> Dict[int, str]:
-    """{step_num: a11y_filtered_text} from perceiver_debug — the per-step a11y the
-    perceiver saw (URL + element text + state). Paired with each frame for the judge
-    so it reads page/filter state instead of guessing from pixels."""
+    """{step_num: a11y_filtered_text} from perceiver_debug (URL + element text +
+    state). Paired with each frame so the judge reads page/filter state instead
+    of guessing from pixels."""
     out: Dict[int, str] = {}
     for p in glob.glob(os.path.join(task_dir, "perceiver_debug",
                                     "*_perceiver_input.json")):
@@ -242,9 +233,9 @@ def _load_step_a11y(task_dir: str) -> Dict[int, str]:
 
 
 def from_existing_run(task_dir: str, *, with_screenshots: bool = True) -> Optional[RolloutArtifacts]:
-    """Rebuild RolloutArtifacts from one task dir's dumps. Returns None if the dir
-    lacks keynode_debug (can't reconstruct a narrative). Synthetic KeyNodes come from
-    outcome state transitions; evidence = the deterministic_trace (objective)."""
+    """Rebuild RolloutArtifacts from one task dir, or None if it has no steps to
+    reconstruct from. Synthetic KeyNodes come from outcome state transitions;
+    evidence = the deterministic_trace."""
     steps = _load_steps(task_dir)
     if not steps:
         return None
@@ -277,15 +268,14 @@ def from_existing_run(task_dir: str, *, with_screenshots: bool = True) -> Option
             actor_action_summary=st["action"],
             planner_decision=decisions.get(si), key_nodes=kns))
 
-    # Targeted screenshot load: only the turning-point candidates + first/last
-    # anchors (each planner_debug html is multi-MB; reading all 100 is the slow path).
+    # Targeted screenshot load: turning-point candidates + first/last anchors
+    # (each html is multi-MB; reading all 100 is the slow path).
     final_shot = ""
     shots: Dict[int, str] = {}
     if with_screenshots and timeline:
         first_s, last_s = timeline[0].step_idx, timeline[-1].step_idx
-        # Always load the LAST few steps' screenshots (mode-agnostic tail) so
-        # boundary-mode runs — no per-step keynodes — still get decisive tail
-        # frames, not just first/last.
+        # Always include the last few steps' frames so boundary-mode runs (no
+        # per-step keynodes) still get decisive tail frames, not just first/last.
         from mm_agents.structagent.bbon.narrative import DEFAULT_MAX_FRAMES as _MF
         needed = {first_s, last_s} | {s.step_idx for s in timeline[-_MF:]} | {
             s.step_idx for s in timeline
@@ -296,7 +286,7 @@ def from_existing_run(task_dir: str, *, with_screenshots: bool = True) -> Option
                 s.screenshot_b64 = shots[s.step_idx]
         final_shot = shots.get(last_s, "")
 
-    # rubric / outcomes from the LAST step's snapshot (final states)
+    # Outcomes with final states from the last step's snapshot.
     final_states = steps[-1]["states"]
     outcomes = [Outcome(id=o["id"], description=o.get("description", ""),
                         evidence_hint=o.get("evidence_hint", ""),
@@ -304,9 +294,9 @@ def from_existing_run(task_dir: str, *, with_screenshots: bool = True) -> Option
                 for o in _last_outcome_defs(task_dir)]
     ledger = SimpleNamespace(required_outcomes=outcomes)
 
-    # final a11y: the last step's perceiver a11y (closest to terminal state)
+    # Last step's perceiver a11y (closest to terminal state).
     final_a11y = step_a11y[max(step_a11y)] if step_a11y else ""
-    # infeasible signal: agent terminated with FAIL / impossible
+    # Infeasible signal: agent terminated with FAIL / impossible.
     emitted_fail = any(
         kw in (s.actor_action_summary or "")
         for s in timeline for kw in ("FAIL", "impossible", "Impossible", "IMPOSSIBLE"))
@@ -321,12 +311,11 @@ def from_existing_run(task_dir: str, *, with_screenshots: bool = True) -> Option
 
 
 def _load_final_doc_structure(task_dir: str) -> str:
-    """Parse the rollout's FINAL output file(s) under ``eval_files/`` — the SAME
-    file the OSWorld checker reads — into a compact text view (cell values +
-    formulas + number formats). This is the checker-level spreadsheet state that
-    screenshots and AT-SPI a11y lack. We use the real exported file (not the
-    SheetPerceiver probe, which may be stale if the last steps didn't re-inspect).
-    No-op when there's no parseable output (judge falls back to screenshots)."""
+    """Parse the FINAL output file(s) under ``eval_files/`` — the SAME files the
+    OSWorld checker reads — into compact text (cell values + formulas + number
+    formats). This checker-level state is what screenshots and AT-SPI a11y lack.
+    Uses the real exported file, not the SheetPerceiver probe (which may be stale).
+    Empty when nothing parseable (judge falls back to screenshots)."""
     ed = os.path.join(task_dir, "eval_files")
     if not os.path.isdir(ed):
         return ""
@@ -346,7 +335,7 @@ def _load_final_doc_structure(task_dir: str) -> str:
                            ".md", ".xml", ".yaml", ".yml", ".js", ".ts",
                            ".html", ".css", ".sh", ".cfg", ".ini")):
             blocks.append(f"FILE {f}:\n" + _render_textfile(p))
-        # pdf / images / other: non-tabular — skip (judge keeps screenshots)
+        # pdf / images / other non-tabular: skip (judge keeps screenshots).
         if sum(len(b) for b in blocks) > 3500:
             break
     return "\n\n".join(blocks)[:3500]
@@ -354,11 +343,11 @@ def _load_final_doc_structure(task_dir: str) -> str:
 
 def _render_xlsx(path: str, *, max_rows: int = 40, max_cols: int = 20) -> str:
     """openpyxl → text: per sheet, used range with formulas + cached values
-    (``=SUM(...)->4852``) and non-default number formats. Reads formulas like the
-    checker (load_workbook default) PLUS data_only for the computed result."""
+    (``=SUM(...)->4852``) and non-default number formats. Loads both the checker's
+    formula view (default) and data_only for the computed result."""
     try:
         import openpyxl
-        wf = openpyxl.load_workbook(path, data_only=False)   # formulas (checker)
+        wf = openpyxl.load_workbook(path, data_only=False)   # formulas
         wv = openpyxl.load_workbook(path, data_only=True)    # cached values
     except Exception as e:
         return f"  [xlsx parse failed: {str(e)[:80]}]"
@@ -392,8 +381,8 @@ def _render_xlsx(path: str, *, max_rows: int = 40, max_cols: int = 20) -> str:
             out.append(f"  ... ({sf.max_row - max_rows} more rows)")
         if fmts:
             out.append("  number-formats: " + "; ".join(fmts[:20]))
-        # Charts / sparklines: many calc tasks ARE "make a chart" — invisible in
-        # cell values, so the judge needs them explicitly (type + data range).
+        # Charts/sparklines: many calc tasks ARE "make a chart", invisible in cell
+        # values, so surface them explicitly (type + data range).
         charts = getattr(sf, "_charts", []) or []
         if charts:
             crows = []
@@ -431,10 +420,9 @@ def _render_csv(path: str, *, max_rows: int = 40) -> str:
 
 
 def _render_docx(path: str, *, max_paras: int = 80) -> str:
-    """Extract paragraph text + per-run formatting (font/bold/italic/underline/
-    size) from a .docx — the checker-level document state. Writer tasks are mostly
-    about FORMATTING (font name, italic, case), invisible in screenshots, so we
-    surface the format flags next to the text."""
+    """.docx paragraph text + per-run formatting (font/bold/italic/underline/size)
+    — the checker-level document state. Writer tasks are mostly about formatting,
+    invisible in screenshots, so the flags ride next to the text."""
     try:
         from docx import Document
     except Exception as e:
@@ -471,8 +459,7 @@ def _render_docx(path: str, *, max_paras: int = 80) -> str:
                     fmts.add(f"color=#{col.rgb}")
             except Exception:
                 pass
-        # paragraph-level alignment (left/center/right/justify) — a very common
-        # writer checker target, invisible in screenshots.
+        # Paragraph alignment — common writer checker target, invisible in screenshots.
         al = getattr(para, "alignment", None)
         if al is not None:
             _almap = {0: "left", 1: "center", 2: "right", 3: "justify",
@@ -505,8 +492,8 @@ def _render_docx(path: str, *, max_paras: int = 80) -> str:
 
 
 def _render_textfile(path: str, *, max_chars: int = 1800) -> str:
-    """Read a plain-text output file (json/py/txt/code-workspace/...) verbatim —
-    the checker-level file content for vs_code and other text-output tasks."""
+    """Plain-text output file (json/py/txt/code-workspace/...) verbatim — the
+    checker-level content for vs_code and other text-output tasks."""
     try:
         txt = open(path, encoding="utf-8", errors="replace").read()
     except Exception as e:
@@ -518,10 +505,9 @@ def _render_textfile(path: str, *, max_chars: int = 1800) -> str:
 
 
 def _render_odt(path: str, *, max_paras: int = 80) -> str:
-    """Extract paragraph text + style name from a .odt (LibreOffice native) via
-    odfpy — same role as _render_docx for the odt writer rollouts. ODF stores
-    formatting by style reference, so we surface text + the paragraph style name
-    (which carries alignment/heading info for most checker tasks)."""
+    """.odt paragraph text + style name via odfpy — the odt counterpart of
+    _render_docx. ODF stores formatting by style reference, so we surface text +
+    the paragraph style name (carries alignment/heading for most checker tasks)."""
     try:
         from odf.opendocument import load
         from odf import text as _odftext, teletype
@@ -546,7 +532,7 @@ def _render_odt(path: str, *, max_paras: int = 80) -> str:
 
 
 def _last_outcome_defs(task_dir: str) -> List[dict]:
-    """The outcome id/description/evidence_hint defs (stable across steps)."""
+    """Outcome id/description/evidence_hint defs (stable across steps)."""
     ins = sorted(glob.glob(os.path.join(task_dir, "keynode_debug", "*_keynode_input.json")))
     if not ins:
         return []
@@ -557,11 +543,10 @@ def _last_outcome_defs(task_dir: str) -> List[dict]:
 
 
 def _load_task_instruction(task_dir: str) -> str:
-    """AUTHORITATIVE task instruction from the task config json. Do NOT regex
+    """Authoritative task instruction from the task config json. Do NOT regex
     'Task:'/'Instruction:' out of init_ledger_prompt — that prompt embeds a few-shot
-    EXAMPLE ('Task: configure a product search to in-stock, free-ship, 4-star') which
-    the regex hit FIRST, mislabeling EVERY task with the example and feeding the judge
-    the wrong goal (tanked calc judge_acc; polluted chrome/gimp too)."""
+    EXAMPLE the regex hit first, mislabeling every task with the example and feeding
+    the judge the wrong goal (tanked calc judge_acc; polluted chrome/gimp too)."""
     tid = task_id_of(task_dir) or os.path.basename(task_dir)
     for c in glob.glob(os.path.join("evaluation_examples", "examples", "*",
                                     f"{tid}.json")):
@@ -576,10 +561,10 @@ def _load_task_instruction(task_dir: str) -> str:
 
 def scan_scores(run_roots: List[str], *, domains: Optional[List[str]] = None,
                 min_rollouts: int = 2) -> Dict[str, List[Tuple[str, int]]]:
-    """CHEAP first pass: group task dirs by id and read result.txt scores only (no
-    artifact parsing / no screenshots). Returns {task_id: [(dir, score01), ...]} for
-    tasks with >= min_rollouts. Use it to compute recoverable%/oracle/single for free
-    and to pick which (decidable) dirs are worth the expensive screenshot parse."""
+    """Cheap first pass: group task dirs by id, read result.txt scores only (no
+    artifact parsing / screenshots). Returns {task_id: [(dir, score01), ...]} for
+    tasks with >= min_rollouts. Used to compute recoverable%/oracle/single for free
+    and pick which dirs are worth the expensive screenshot parse."""
     by_task: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
     for root in run_roots:
         for rt in glob.glob(os.path.join(root, "**", "result.txt"), recursive=True):
@@ -598,9 +583,9 @@ def scan_scores(run_roots: List[str], *, domains: Optional[List[str]] = None,
 def build_frozen_set(run_roots: List[str], *, domains: Optional[List[str]] = None,
                      min_rollouts: int = 2, max_per_task: Optional[int] = None,
                      with_screenshots: bool = True) -> List[List[Tuple[RolloutArtifacts, int]]]:
-    """Group task dirs (under run_roots) by task id, parse each rollout, keep tasks
-    with >= min_rollouts. Returns frozen_set for eval_judge. Score uses success>=0.999
-    -> 1 else 0. ``with_screenshots=False`` is fast (recoverable%-only / text narratives)."""
+    """Group task dirs by id, parse each rollout, keep tasks with >= min_rollouts.
+    Returns the frozen_set for eval_judge (score = 1 if success>=0.999 else 0).
+    ``with_screenshots=False`` is fast (recoverable%-only / text narratives)."""
     by_task: Dict[str, List[str]] = defaultdict(list)
     for root in run_roots:
         for rt in glob.glob(os.path.join(root, "**", "result.txt"), recursive=True):

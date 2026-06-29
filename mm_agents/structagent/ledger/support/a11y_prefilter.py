@@ -1,34 +1,23 @@
-"""Subgoal-conditioned coarse filter for linearized a11y trees.
+"""Subgoal-conditioned coarse filter for linearized a11y trees (no LLM).
 
-Two passes, both mechanical (no LLM):
-  1. Embedding similarity — for each row, SUM cosine sim over the query
-     set ``[subgoal_text] + outcome_evidence_hints``. Keep top-N.
-     (Sum aggregation, not max — a row that's medium-relevant to many
-      queries should outrank one that's strongly relevant to a single
-      query, since the queries together describe the agent's task.)
-  2. Anomaly carve-out — force-include rows whose tag is in
-     ``ANOMALY_ROLES`` (popup / menu / alert), so just-appeared
-     blockers always reach the perceiver and surface as
-     ``unexpected_blockers`` — even when their labels don't lexically
-     match the subgoal.
+Two passes:
+  1. Embedding similarity — per row, SUM cosine sim over the query set
+     ``[subgoal_text] + outcome_evidence_hints``, keep top-N. Sum, not max,
+     so a row relevant to many queries beats one strongly relevant to one
+     (queries jointly describe the task).
+  2. Anomaly carve-out — force-include rows tagged in ``ANOMALY_ROLES``
+     (popup/menu/alert) so just-appeared blockers always reach the
+     perceiver, even when their labels don't lexically match the subgoal.
 
-The filtered output is the same ``tag\\ttext\\tstate`` format as the
-input — drop-in replacement for ``trim_accessibility_tree`` in the
-existing pipeline. Header line ``tag\\ttext\\tstate`` and trailing
-``...`` truncation marker are preserved.
+Output is the same ``tag\\ttext\\tstate`` format as the input (header +
+trailing ``...`` marker preserved) — drop-in for ``trim_accessibility_tree``.
 
-NOTE — input is the OUTPUT of ``linearize_accessibility_tree``
-(autoglm/prompt/accessibility_tree_handle.py), which already filters by
-role whitelist + visible+showing + has-content + size>0 + active app
-only + dedup. Empirically the funnel kills ~96% of nodes BEFORE this
-prefilter sees them. Our job is just the final intent-based ranking.
+Input is the OUTPUT of ``linearize_accessibility_tree``, which already kills
+~96% of nodes (role whitelist, visible/showing, size>0, active app, dedup).
+We only do the final intent-based ranking. The crop bbox is NOT computed
+here — the perceiver VLM picks that from the full screenshot.
 
-The visual_focus bbox (which screen region to crop) is NOT computed
-here — the perceiver VLM looks at the full screenshot and outputs the
-crop bbox itself. This module only ranks text rows for the perceiver's
-``relevant_controls`` pool.
-
-See docs/PROGRESS_LEDGER_V2_CHANGELOG.md §17 for design context.
+See docs/PROGRESS_LEDGER_V2_CHANGELOG.md §17.
 """
 from __future__ import annotations
 
@@ -37,12 +26,10 @@ from typing import Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-# Popup-ish roles that must reach the perceiver regardless of subgoal
-# embedding similarity. Empirically determined from real chrome a11y
-# dumps (see tools/probe_a11y_filter_variants.py): only ``alert`` and
-# ``menu`` actually survive linearize_accessibility_tree's funnel and
-# appear in real Chrome runtime logs. ``dialog`` / ``alertdialog`` are
-# typically dropped earlier (size=0 or empty name).
+# Popup-ish roles that must reach the perceiver regardless of similarity.
+# Only ``alert`` and ``menu`` survive linearize_accessibility_tree's funnel
+# in real Chrome runtime logs (see tools/probe_a11y_filter_variants.py);
+# ``dialog`` / ``alertdialog`` get dropped earlier (size=0 or empty name).
 ANOMALY_ROLES = frozenset({
     "alert",
     "menu",
@@ -58,8 +45,7 @@ _DEFAULT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
 def _get_model():
-    """Lazy-load the embedding model. ~80MB download on first use; ~50ms
-    per encoding call afterward (CPU)."""
+    """Lazy-load the embedding model (~80MB on first use; ~50ms/encode on CPU)."""
     global _MODEL
     if _MODEL is None:
         try:
@@ -80,8 +66,7 @@ def _get_model():
 # --------------------------------------------------------------------------- #
 
 def _row_tag(row: str) -> str:
-    """Extract the leading tag (role) from a 'tag\\ttext\\tstate' row.
-    Returns empty string for malformed rows (we keep them as-is)."""
+    """Leading tag (role) from a 'tag\\ttext\\tstate' row; '' if malformed."""
     tab = row.find("\t")
     return row[:tab] if tab > 0 else ""
 
@@ -117,21 +102,15 @@ def _prefilter_a11y_core(
     """Filter a linearized a11y text down to subgoal-relevant rows.
 
     Args:
-        linearized_text: output of ``linearize_accessibility_tree``. First
-            line is expected to be the header ``tag\\ttext\\tstate``.
-        subgoal_text: the agent's current subgoal (drives embedding query).
-        outcome_evidence_hints: list of currently-active outcome
-            evidence_hint strings (also embedded as queries).
-        top_n: target row count for embedding-ranked rows. Anomaly carve-out
-            adds on top of this; final size = top_n + |anomaly rows|.
+        linearized_text: ``linearize_accessibility_tree`` output; first line
+            is the ``tag\\ttext\\tstate`` header.
+        subgoal_text: current subgoal (embedding query).
+        outcome_evidence_hints: active evidence_hint strings (also queries).
+        top_n: target row count; anomaly carve-out adds on top
+            (final size = top_n + |anomaly rows|).
 
-    Returns:
-        Filtered linearized a11y text (header + filtered rows + optional
-        truncation marker), preserving the original row order.
-        Returns the input unchanged when:
-          - input is empty / header-only
-          - row count ≤ top_n (no benefit from filtering)
-          - both subgoal_text and outcome_evidence_hints are empty (no query)
+    Returns the filtered text in original row order. Returns input unchanged
+    when it's empty/header-only, row count <= top_n, or there's no query.
     """
     if not linearized_text:
         return linearized_text
@@ -143,38 +122,34 @@ def _prefilter_a11y_core(
     header = lines[0]
     body = lines[1:]
 
-    # Strip a trailing "..." truncation marker if present so we don't try to
-    # embed it. We won't re-add it (filtering shrinks the set anyway).
+    # Strip a trailing "..." marker so we don't embed it (filtering shrinks
+    # the set anyway, so we don't re-add it).
     if body and body[-1].strip() == "...":
         body = body[:-1]
 
     if len(body) <= top_n:
-        # Nothing to gain; return as-is so we don't pay embedding cost.
-        return linearized_text
+        return linearized_text  # nothing to gain; skip embedding cost
 
     queries = [q.strip() for q in
                ([subgoal_text] + list(outcome_evidence_hints or []))
                if q and q.strip()]
     if not queries:
-        # No query → no semantic signal → don't filter.
-        return linearized_text
+        return linearized_text  # no query → no signal → don't filter
 
-    # ── Pass 2 (computed first; cheap): anomaly carve-out ──
-    # Always-keep set, computed by tag. Cheap; skip embedding for these.
+    # Pass 2 (cheap, done first): always-keep anomaly rows, by tag.
     anomaly_idx = {
         i for i, row in enumerate(body)
         if _row_tag(row).lower() in ANOMALY_ROLES
     }
 
-    # ── Pass 1: embedding rank top-N (SUM aggregation) ──
-    # Only embed rows that aren't already in the must-keep set, so we use
-    # the budget for genuine ranking work.
+    # Pass 1: embedding rank top-N. Skip the must-keep set so the budget
+    # goes to genuine ranking.
     rest_idx = [i for i in range(len(body)) if i not in anomaly_idx]
     rest_rows = [body[i] for i in rest_idx]
 
     try:
         model = _get_model()
-        # Normalize so we can use dot-product as cosine similarity.
+        # Normalize → dot product is cosine sim.
         query_emb = model.encode(
             queries, normalize_embeddings=True, show_progress_bar=False
         )
@@ -191,13 +166,9 @@ def _prefilter_a11y_core(
         )
         return linearized_text
 
-    # Per-row score = SUM of cosine similarities across all queries.
-    # Sum (not max) means rows aligned with MULTIPLE aspects of the task
-    # outrank rows aligned with just one — the queries together describe
-    # the agent's full intent so we want joint relevance.
+    # Per-row score = SUM of cosine sims over queries (see module docstring).
     sims = (row_emb @ query_emb.T).sum(axis=1)
 
-    # Take top_n indices into rest_rows by similarity (descending).
     n_keep = min(top_n, len(rest_rows))
     if n_keep == 0:
         ranked_idx = set()
@@ -207,13 +178,12 @@ def _prefilter_a11y_core(
         top_local = np.argpartition(-sims, n_keep - 1)[:n_keep]
         ranked_idx = {rest_idx[i] for i in top_local}
 
-    # ── Combine + restore original a11y tree order ──
+    # Combine and restore original tree order.
     keep_idx = sorted(anomaly_idx | ranked_idx)
     kept_rows = [body[i] for i in keep_idx]
 
     if not kept_rows:
-        # Defensive: shouldn't happen, but don't return naked header.
-        return linearized_text
+        return linearized_text  # defensive: never return a naked header
 
     out_lines = [header] + kept_rows
     n_dropped = len(body) - len(kept_rows)
@@ -232,8 +202,7 @@ def explain_prefilter(
     outcome_evidence_hints: Optional[Sequence[str]] = None,
     top_n: int = 100,
 ) -> dict:
-    """Return diagnostics about what the filter would do — useful for
-    tests and replay tools."""
+    """Diagnostics on what the filter would do (for tests / replay tools)."""
     if not linearized_text:
         return {"input_rows": 0, "kept_rows": 0, "anomaly_in_input": 0,
                 "filtered_text": linearized_text}

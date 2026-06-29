@@ -1,31 +1,25 @@
 """LLM-driven dead-end curator.
 
-Replaces the mechanical "every strategy switch → write a FailedPath"
-behavior with an LLM that sees the FULL strategy-switch history +
-current outcome state + currently-recorded failed_paths and decides:
+Replaces the mechanical "every strategy switch → write a FailedPath" behavior
+with an LLM that sees the full strategy-switch history + current outcome state +
+recorded failed_paths, then decides:
 
   - which strategy spans were truly dead-ends (record as level=strategy)
-  - which were actor-execution failures masquerading as strategy
-    failures (DO NOT record as strategy-level — strategy was sound)
-  - which already-recorded entries are fuzzy duplicates of others
-    (collapse into one)
-  - which already-recorded entries were misclassified in retrospect
-    and should be dropped
+  - which were actor-execution failures masquerading as strategy failures (do
+    NOT record at strategy level — the strategy was sound)
+  - which recorded entries are fuzzy duplicates (collapse into one)
+  - which recorded entries were misclassified in retrospect (drop)
 
-The mechanical pair-wise ``strategy_similar`` judge can't see across
-multiple switches and can't retrospect on its own past writes; the
-curator owns both responsibilities by re-deriving the entire
-``failed_paths`` list from history each time it runs.
+The pair-wise ``strategy_similar`` judge can't see across multiple switches or
+retrospect on its own past writes; the curator owns both by re-deriving the
+whole failed_paths list from history each run.
 
 Touch points:
-  - ``StrategyEvent`` records each strategy commit (install / switch /
-    re-iteration). The agent's ``_commit_strategy_change`` appends one
-    of these to ``self._strategy_history`` instead of writing a
-    FailedPath directly.
-  - ``ActionStuckEvent`` records a rule #6 cadence trigger fire.
-  - ``curate_failed_paths`` is called after each REPLAN; it returns
-    the new authoritative ``failed_paths`` list which the agent
-    assigns onto ``ledger.failed_paths``.
+  - StrategyEvent: each strategy commit (install / switch / re-iteration);
+    _commit_strategy_change appends one instead of writing a FailedPath directly.
+  - ActionStuckEvent: a rule-#6 cadence trigger fire.
+  - curate_failed_paths: called after each REPLAN; returns the new authoritative
+    failed_paths list assigned onto ledger.failed_paths.
 """
 from __future__ import annotations
 
@@ -40,26 +34,21 @@ if TYPE_CHECKING:
 
 @dataclass
 class _EvidenceFields:
-    """Shared per-event evidence used by the curator's tactical-vs-strategic
-    judgment. These come from the perceiver / actor state at the moment
-    the event was created — they let the curator distinguish "target
-    UI element was on screen but the actor missed the click" (tactical,
-    do NOT dead-end) from "target was never observed across all attempts"
-    (strategic, OK to dead-end).
+    """Per-event perceiver/actor evidence for the tactical-vs-strategic judgment.
+    Lets the curator distinguish "target was on screen but the actor missed the
+    click" (tactical, don't dead-end) from "target never observed across all
+    attempts" (strategic, OK to dead-end).
     """
-    # Base64 PNG of the screenshot at the failing turn. Curator
-    # attaches the most recent K screenshots as image_url parts.
+    # Screenshot at the failing turn; curator attaches the most recent K as
+    # image_url parts.
     last_screenshot_b64: Optional[str] = None
-    # Top-K a11y elements (text-form) the perceiver pre-filtered for
-    # the failing turn — e.g. ``"button 'Save'  enabled\\nmenu-item ..."``.
+    # Top-K a11y elements (text) the perceiver pre-filtered for the failing turn.
     last_a11y_top_k: Optional[str] = None
     # Perceiver's overall subgoal-done verdict: "yes" / "no" / "partial".
     last_perceiver_overall: Optional[str] = None
-    # Count of unexpected blocker controls (modals, error toasts, ...)
-    # the perceiver flagged.
+    # Unexpected blocker controls (modals, error toasts) the perceiver flagged.
     last_perceiver_blockers: int = 0
-    # How many "relevant controls" the perceiver matched against the
-    # subgoal — 0 means the target element did NOT appear on screen.
+    # Relevant controls matched against the subgoal; 0 = target not on screen.
     last_perceiver_controls_count: int = 0
 
 
@@ -68,12 +57,10 @@ class StrategyEvent(_EvidenceFields):
     """One strategy-level event in the agent's history.
 
     Kinds:
-      - "install"   : first plan committed at step 0
-      - "same"      : REPLAN with strategy_similar(prior, new) == True
-                       (planner kept the same approach; we still log
-                       this so the curator sees the full chain)
-      - "switch"    : REPLAN with strategy_similar == False
-                       (planner abandoned prior for new)
+      - "install" : first plan committed at step 0
+      - "same"    : REPLAN with strategy_similar == True (planner kept the
+                     approach; logged anyway so the curator sees the full chain)
+      - "switch"  : REPLAN with strategy_similar == False (planner abandoned prior)
     """
     kind: str = ""
     step_idx: int = 0
@@ -84,11 +71,9 @@ class StrategyEvent(_EvidenceFields):
     actions_under_prior: List[str] = field(default_factory=list)
     progress_signal: str = "unknown"
     current_subgoal: Optional[str] = None
-    # A4: which Outcome the planner was driving toward when this
-    # strategy event occurred (ledger.next_focus_outcome() at event
-    # creation time). Lets the curator emit ``target_outcome_id`` on
-    # the resulting FailedPath entries so the planner prompt can
-    # filter per-focus-outcome.
+    # A4: Outcome the planner was driving toward at event creation. Lets the
+    # curator stamp target_outcome_id on resulting FailedPaths so the planner
+    # prompt can filter per-focus-outcome.
     focus_outcome_id: Optional[str] = None
 
 
@@ -127,9 +112,8 @@ def _strategy_history_block(events: List[StrategyEvent]) -> str:
         actions_str = "; ".join(
             (a or "")[:80] for a in ev.actions_under_prior[-5:]
         ) or "(none)"
-        # A4: show which Outcome the planner was driving toward at this
-        # event so the curator can attribute the resulting FailedPath
-        # via target_outcome_id.
+        # A4: show the Outcome the planner was driving toward so the curator can
+        # attribute the resulting FailedPath via target_outcome_id.
         focus_tag = (f"  [focus_outcome={ev.focus_outcome_id}]"
                      if getattr(ev, "focus_outcome_id", None) else "")
         if ev.kind == "install":
@@ -164,12 +148,11 @@ def _strategy_history_block(events: List[StrategyEvent]) -> str:
 
 
 def _format_evidence_line(ev) -> List[str]:
-    """One-liner block summarizing the perceiver / a11y evidence
-    captured at event creation. Curator uses these to decide
-    TACTICAL vs STRATEGIC failure (see DECISION RULES below)."""
+    """Summarize the perceiver / a11y evidence captured at event creation, for
+    the curator's TACTICAL-vs-STRATEGIC decision."""
     overall = getattr(ev, "last_perceiver_overall", None)
     if overall is None and not getattr(ev, "last_a11y_top_k", None):
-        return []  # event has no evidence (older event or perceiver off)
+        return []  # no evidence (older event or perceiver off)
     n_ctrls = getattr(ev, "last_perceiver_controls_count", 0) or 0
     n_block = getattr(ev, "last_perceiver_blockers", 0) or 0
     lines = [
@@ -472,10 +455,8 @@ def _build_curator_prompt(
 
 
 def _parse_curator_response(response: str) -> Optional[List[Dict[str, Any]]]:
-    """Extract the failed_paths list from the curator's JSON output.
-    Tolerates leading/trailing prose, code fences, and minor whitespace.
-    Discards per_event_analysis here — see ``_parse_curator_full`` if
-    you also want the per-event verdicts (e.g. for logging)."""
+    """failed_paths list from the curator's JSON. Tolerates surrounding prose /
+    code fences. Use _parse_curator_full if you also want the per-event verdicts."""
     full = _parse_curator_full(response)
     return full[1] if full is not None else None
 
@@ -483,13 +464,11 @@ def _parse_curator_response(response: str) -> Optional[List[Dict[str, Any]]]:
 def _parse_curator_full(
     response: str,
 ) -> Optional[tuple]:
-    """Parse strategy_analysis + problematic_actions + failed_paths from
-    the curator's JSON output. Returns (analysis_list, failed_paths_list)
-    or None on failure. analysis_list is a flat list of dicts (one per
-    strategy_analysis item + one per problematic_actions item), each
-    tagged with ``kind``. failed_paths must be present + a list.
-
-    Also accepts the legacy ``per_event_analysis`` schema for back-compat.
+    """Parse strategy_analysis + problematic_actions + failed_paths from the
+    curator's JSON. Returns (analysis, failed_paths) or None. analysis is a flat
+    list of dicts (one per strategy_analysis / problematic_actions item) tagged
+    with ``kind``; failed_paths must be present and a list. Accepts the legacy
+    per_event_analysis schema for back-compat.
     """
     if not response:
         return None
@@ -522,7 +501,7 @@ def _parse_curator_full(
                 a = dict(a)
                 a["kind"] = "action"
                 analysis.append(a)
-    # Back-compat with prior per_event_analysis key
+    # Back-compat: prior per_event_analysis key.
     legacy = obj.get("per_event_analysis") or []
     if isinstance(legacy, list):
         for a in legacy:
@@ -537,8 +516,7 @@ def _coerce_failed_path_dict(
     raw: Dict[str, Any],
     fallback_step: int,
 ) -> Optional[Dict[str, Any]]:
-    """Validate + normalize one curator-emitted entry into a dict
-    compatible with ``FailedPath(**d)``."""
+    """Validate + normalize one curator entry into a FailedPath(**d) dict."""
     path = (raw.get("path") or "").strip()
     if not path:
         return None
@@ -570,9 +548,8 @@ def _coerce_failed_path_dict(
             s = a.replace("\n", " ").strip()
             if s:
                 actions_clean.append(s[:200])
-    # A4: per-outcome routing. null / missing → uncategorized
-    # (rendered in the legacy global block); a string id is preserved
-    # and used by render_outcome_view to filter per focus outcome.
+    # A4: per-outcome routing. null/missing → uncategorized (legacy global
+    # block); a string id is kept for render_outcome_view's per-focus filter.
     target = raw.get("target_outcome_id")
     if not isinstance(target, str) or not target.strip():
         target = None
@@ -596,15 +573,12 @@ def _collect_recent_event_screenshots(
     *,
     cap: int = 5,
 ) -> List[Dict[str, str]]:
-    """Return up to ``cap`` (label, b64) pairs for the most recent
-    events that carry screenshot evidence. Newest first.
-
-    Curator attaches these as image_url parts at the end of the user
-    message; the prompt's tactical-vs-strategic rule references them
-    by order.
+    """Up to ``cap`` (label, b64) pairs for the most recent events with
+    screenshot evidence, newest first. Curator attaches these as image_url
+    parts; the prompt's tactical-vs-strategic rule references them by order.
     """
     bundle: List[Dict[str, str]] = []
-    # Walk newest-first through both event lists, interleaved by step_idx
+    # Interleave both event lists, newest-first by step_idx.
     combined = []
     for ev in strategy_events:
         if getattr(ev, "last_screenshot_b64", None):
@@ -635,25 +609,19 @@ def curate_failed_paths(
 ) -> Optional[List["FailedPath"]]:
     """Run the LLM curator and return the new failed_paths list.
 
-    ``llm_call`` signature has been generalized to accept a multimodal
-    messages list — either ``llm_call(prompt: str) -> str`` (legacy
-    text-only) or ``llm_call(messages: List[dict]) -> str`` (preferred,
-    used when events carry screenshot evidence). The function probes
-    its single positional argument: if it's a string, the call is
-    treated as legacy text-only; if it's a list, treated as messages.
+    ``llm_call`` takes one positional arg: a str prompt (legacy text-only) or a
+    messages list (preferred, used when events carry screenshots). We try the
+    messages form first and fall back to the str form on TypeError.
 
-    Returns None if the LLM call or JSON parse failed — caller should
-    keep the existing failed_paths in that case (don't blow them away
-    on a transient error).
+    Returns None if the LLM call or JSON parse failed — caller keeps the
+    existing failed_paths (don't wipe them on a transient error).
 
-    ``analysis_sink``: optional list — if provided, the per-event
-    verdicts the LLM produced (rationale, merge target, etc.) are
-    appended into it so the caller can log them.
+    ``analysis_sink``: optional list; if given, the LLM's per-event verdicts
+    (rationale, merge target, ...) are appended for the caller to log.
     """
-    from mm_agents.structagent.ledger.core.ledger import FailedPath  # local import: avoids circular
+    from mm_agents.structagent.ledger.core.ledger import FailedPath  # avoid circular import
 
     if not strategy_events and not action_stuck_events:
-        # Nothing to curate yet
         return list(current_failed_paths)
 
     prompt = _build_curator_prompt(
@@ -665,8 +633,7 @@ def curate_failed_paths(
         current_failed_paths=current_failed_paths,
     )
 
-    # Build multimodal user content: prompt text + up to 5 attached
-    # screenshots from the most recent stuck/strategy events.
+    # Multimodal user content: prompt + up to 5 recent-event screenshots.
     user_content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
     shot_bundle = _collect_recent_event_screenshots(
         strategy_events, action_stuck_events, cap=5,
@@ -700,8 +667,7 @@ def curate_failed_paths(
     messages = [{"role": "user", "content": user_content}]
 
     try:
-        # Try multimodal first; fall back to legacy text-only signature
-        # if the caller's llm_call doesn't accept a list.
+        # Multimodal first; fall back to text-only if llm_call rejects a list.
         try:
             response = llm_call(messages) or ""
         except TypeError:
@@ -727,9 +693,8 @@ def curate_failed_paths(
         try:
             new_failed_paths.append(FailedPath(**coerced))
         except TypeError:
-            # Drop unknown fields and retry. A4: include target_outcome_id
-            # in the allow-list so per-outcome routing survives the
-            # legacy-fallback path.
+            # Drop unknown fields and retry. A4: keep target_outcome_id in the
+            # allow-list so per-outcome routing survives this fallback.
             fields = {
                 "path", "why", "first_observed_at_step",
                 "first_observed_at_subgoal", "level",
@@ -743,9 +708,8 @@ def curate_failed_paths(
             except Exception:
                 continue
 
-    # Preserve strong-model-authored dead-ends. The curator's LLM may omit
-    # them (it's the weak model and doesn't know the rescue agent's
-    # intent); re-attach any that aren't already present in the new list.
+    # Preserve strong-model-authored dead-ends: the weak curator LLM may omit
+    # them (doesn't know the rescue agent's intent). Re-attach any missing.
     existing_strong = [fp for fp in current_failed_paths
                        if getattr(fp, "strong_model_origin", False)]
     if existing_strong:

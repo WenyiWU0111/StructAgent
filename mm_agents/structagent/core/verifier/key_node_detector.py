@@ -1,19 +1,14 @@
 """KeyNode detector — one multimodal LLM call per planner turn.
 
-Looks at (prev observation, current observation, actor action, outcomes
-table) and emits a list of `KeyNode` recording meaningful state
-transitions:
-  - outcome_satisfied / outcome_invalidated   (drives the OutcomeStateCache)
-  - value_committed / navigation / dialog_opened / dialog_closed
-    (auxiliary signals that enrich the event stream — not gated by
-    outcome state)
+Diffs (prev obs, current obs, actor action, outcomes table) into a list of
+`KeyNode` state transitions:
+  - outcome_satisfied / outcome_invalidated drive the OutcomeStateCache
+  - value_committed / navigation / dialog_opened / dialog_closed are
+    auxiliary timeline signals, not gated by outcome state
 
-Conservative output discipline:
-  * every KeyNode MUST cite an `evidence` string (a11y row or visual phrase);
-    no evidence → drop the KeyNode at parse time
-  * confidence is an ordinal label `low|medium|high` (LLM self-rated floats
-    are unreliable; ordinals stay calibratable)
-  * empty list is the correct answer when nothing meaningful happened
+Output discipline: every KeyNode needs an `evidence` string (dropped at parse
+time otherwise); confidence is an ordinal low|medium|high (self-rated floats
+are unreliable); empty list is the right answer when nothing changed.
 """
 from __future__ import annotations
 
@@ -32,9 +27,8 @@ from mm_agents.structagent.ledger.core.timeline import (
     KN_DIALOG_CLOSED, OUTCOME_PENDING,
     OUTCOME_VERIFIED,
 )
-# A2: silent-observer assembler. Builds an Evidence per verify_with_trace
-# run and appends to outcome.evidence; nothing reads outcome.evidence
-# yet — A3 wires the planner's Verifier-Feedback block to it.
+# Silent-observer assembler: builds an Evidence per verify_with_trace run and
+# appends to outcome.evidence (consumed later by the planner's Verifier-Feedback).
 from mm_agents.structagent.ledger.core.records import (
     build as _build_evidence,
 )
@@ -291,52 +285,37 @@ def detect_key_nodes(
     *,
     prev_step: Optional[StepRecord],
     current_step: StepRecord,
-    required_outcomes: List[Any],            # List[Outcome]; duck-typed (.id, .description, .evidence_hint, .verify)
+    required_outcomes: List[Any],            # duck-typed Outcome (.id, .description, .evidence_hint, .verify)
     current_outcome_states: Dict[str, str],  # {oid: pending|verified|reverted}
     actor_action_summary: str,
-    a11y_delta_block: Optional[str],         # already-rendered WindowDelta.to_prompt_block()
+    a11y_delta_block: Optional[str],         # pre-rendered WindowDelta.to_prompt_block()
     call_llm: Callable,
     model: Optional[str] = None,
     max_tokens: int = 2000,
     snapshot: Optional[Any] = None,           # SubgoalSnapshot — perceiver's pre-distilled view (auxiliary)
-    doc_inspect_block: Optional[str] = None,  # office-domain SP/DP/SP block (authoritative for font / color / size / cell values; supersedes the screenshot for structural properties)
-    env: Optional[Any] = None,                # used for deterministic file_grep verify
-    instruction: str = "",                    # used by verifier for app detection / fallback path
-    results_dir: Optional[str] = None,        # debug dump target dir (e.g. <results>/<task>/)
+    doc_inspect_block: Optional[str] = None,  # office SP/DP block, authoritative for structural props (font/color/size/cell values)
+    env: Optional[Any] = None,                # deterministic file_grep verify
+    instruction: str = "",                    # app detection / fallback path
+    results_dir: Optional[str] = None,        # debug dump dir, e.g. <results>/<task>/
     debug_step_idx: Optional[int] = None,     # explicit step idx for debug filenames
     agent_state: Optional[Dict[str, Any]] = None,  # per-task state (_ledger, _ledger_slots, _physical_domain, ...)
-    earlier_steps: Optional[List[StepRecord]] = None,  # extra frames OLDER than prev (oldest→newest) for the visual judge
+    earlier_steps: Optional[List[StepRecord]] = None,  # frames OLDER than prev (oldest→newest), for the visual judge
 ) -> List[KeyNode]:
-    """KeyNode detection with hybrid deterministic + LLM dispatch.
+    """Detect KeyNodes via hybrid deterministic + LLM dispatch.
 
-    Per-outcome flow:
-      1. If outcome carries a ``verify`` spec AND state is pending/reverted,
-         run the deterministic verifier (file_grep / a11y_match / url_match):
-           - True  → emit outcome_satisfied with conf=high; SKIP the LLM
-                     for this outcome.
-           - False → emit nothing (outcome stays pending). Trust the
-                     deterministic verdict — file content / DOM / URL
-                     is the ground truth, not LLM inference.
-           - None  → uncertain (path unresolvable, file unreadable,
-                     a11y row not visible). Fall back to the LLM path
-                     for this outcome.
+    Per outcome: if it has a ``verify`` spec and state is pending/reverted,
+    run the deterministic verifier — True emits outcome_satisfied (conf=high),
+    False stays pending (file/DOM/URL is ground truth), None falls back to the
+    LLM. Already-verified / no-spec / None-verdict outcomes go to the LLM. The
+    LLM call is skipped entirely when every outcome got a deterministic verdict.
 
-      2. If outcome already verified, OR has no verify spec, OR verifier
-         returned None, hand it to the LLM (legacy path) — same prompt
-         as before, just with a smaller required_outcomes list.
-
-    The LLM call is skipped entirely if every outcome got a deterministic
-    verdict (saves ~1 LLM call per step on the common case).
-
-    When ``snapshot`` is provided, the perceiver's pre-verified clauses,
-    relevant_controls and transition summary are injected into the LLM
-    prompt as a strong prior — KeyNode treats the perceiver as having
-    already done part of the verification work.
+    A ``snapshot`` (perceiver's pre-verified clauses, controls, transition
+    summary) is injected into the LLM prompt as a strong prior.
     """
     if not required_outcomes:
         return []
 
-    # ─── Debug input dump (zero-cost when results_dir is None) ───
+    # Debug input dump (no-op when results_dir is None)
     from mm_agents.structagent.core.verifier import key_node_debug
     a11y_text = current_step.a11y or ""
     dbg_step = debug_step_idx if debug_step_idx is not None else current_step.step_idx
@@ -355,13 +334,10 @@ def detect_key_nodes(
     needs_llm: List[Any] = []
     per_outcome_trace: List[Dict[str, Any]] = []  # for debug dump
 
-    # Step-0 baseline-skip. At step 0 the actor has not had a turn yet,
-    # so every outcome that requires actor work would verify=False —
-    # and any timing-sensitive verify (e.g. a UNO verify → LO not fully
-    # ready right after snapshot reset) risks blocking the entire 110s
-    # HTTP read budget per outcome before the first action even runs.
-    # Treat all outcomes as pending without inspecting state; the next
-    # round (after the actor's first turn) does the real check.
+    # Step-0 baseline skip. No actor turn yet, so anything needing actor work
+    # would verify=False; worse, a timing-sensitive verify (UNO right after
+    # snapshot reset) can burn the whole 110s HTTP read budget per outcome
+    # before the first action. Treat all as pending; check for real next round.
     _step_idx = getattr(current_step, "step_idx", 0)
     if _step_idx == 0:
         logger.info(
@@ -390,15 +366,11 @@ def detect_key_nodes(
         )
         return []
 
-    # R2 — physical-app scope gate. For outcomes whose verify needs the
-    # focused window's UI (a11y_match / url_match) and whose outcome.app
-    # differs from the currently-focused app, skip BOTH deterministic
-    # and LLM paths this step. The outcome stays at its previous state.
-    # Rationale: ``_extract_active_url`` reads whatever URL is in the
-    # current a11y dump; ``a11y_match`` looks for controls in that dump
-    # — if the wrong app is focused, both produce noise. Best to
-    # explicitly defer the verification to a turn where the right
-    # window is forward.
+    # Physical-app scope gate. If a UI-dependent verify (a11y_match / url_match)
+    # targets an app other than the focused one, skip both paths this step and
+    # leave the outcome unchanged: ``_extract_active_url`` and ``a11y_match`` both
+    # read the current a11y dump, so a wrong-focus turn only produces noise. Defer
+    # to a turn where the right window is forward.
     _physical = (agent_state or {}).get("_physical_domain")
     _UI_DEPENDENT_KINDS = ("a11y_match", "url_match")
 
@@ -425,8 +397,7 @@ def detect_key_nodes(
             "took_llm_path": False,
             "emitted_keynode": None,
         }
-        # R2 — app scope short-circuit (before any deterministic /
-        # LLM dispatch). Logged for offline replay.
+        # App-scope short-circuit (before any dispatch). Logged for replay.
         if _app_mismatch(o):
             rec["deterministic_trace"] = {
                 "reason": (
@@ -444,35 +415,19 @@ def detect_key_nodes(
             )
             per_outcome_trace.append(rec)
             continue
-        # Already-verified outcomes still go to the LLM so it can detect
-        # invalidation. Pending/reverted with verify spec try deterministic
-        # — except a11y_match, which by design routes to the LLM (the
-        # original v1 KeyNode flow that compares before/after a11y +
-        # screenshot). Substring-matching a11y rows on a single frame
-        # would catch transient cues and miss state transitions; only
-        # file_grep / url_match are reliably deterministic.
-        # A1: outcome's own DONE-rejection counter drives the fallback
-        # to LLM judge. Was previously read off a separate
-        # OutcomeStateCache; now lives on the Outcome itself.
+        # DONE-rejection counter drives the LLM fallback (lives on the Outcome).
         _fall_back_after_rejections = o.should_fall_back_to_llm()
-        # Route to the LLM only when deterministic verification cannot
-        # apply: no verify spec, a11y_match (transient UI requires the
-        # before/after a11y+screenshot comparison the v1 LLM flow does),
-        # or the K-fallback (the deterministic verifier persistently
-        # disagrees with DONE rejections).
+        # Route to LLM only when deterministic verify can't apply: no spec,
+        # a11y_match (needs the v1 before/after a11y+screenshot compare —
+        # substring-matching one frame catches transient cues and misses
+        # transitions), or persistent disagreement with DONE rejections.
         #
-        # NOTE on already-verified outcomes: previously they ALWAYS went
-        # to LLM "to detect invalidation". But deterministic kinds
-        # (file_grep / url_match / shell_command / calc_verify /
-        # impress_verify) re-read live VM state every turn — if the
-        # user un-did the action (file deleted, dconf flipped, URL
-        # navigated, document mutated), verdict drops to False and we
-        # can emit outcome_invalidated directly. The LLM-based
-        # invalidation check on top of a deterministic-verifiable
-        # outcome is actively harmful: terminal scroll history / popup
-        # leftovers can show stale error rows that fool the LLM into
-        # invalidating an outcome the live deterministic verify still
-        # confirms.
+        # Already-verified outcomes are NOT forced to the LLM: deterministic
+        # kinds (file_grep / url_match / shell_command / calc_verify /
+        # impress_verify) re-read live VM state each turn, so an undo drops the
+        # verdict to False and we emit outcome_invalidated directly. Running an
+        # LLM invalidation check on top is harmful — stale terminal/popup rows
+        # can fool it into invalidating an outcome the live verify still confirms.
         _must_use_llm = (
             verify is None
             or verify.kind == "a11y_match"
@@ -512,25 +467,19 @@ def detect_key_nodes(
             logger.warning("[KeyNodeDetector] verifier crashed for %s: %s",
                            o.id, e)
             verdict, trace = None, {"verdict_reason": f"crash: {e}"}
-        # A1: persist the verifier trace directly onto the Outcome so
-        # the planner's force_replan prompt can render concrete
-        # "[Verifier Feedback]" diagnostics (patterns checked,
-        # per-pattern hits, file size, file changed since baseline).
-        # Must happen on EVERY verify run — not just satisfied — because
-        # the planner needs to see the failed run details, not only
-        # success.
+        # Persist the trace onto the Outcome so force_replan can render concrete
+        # "[Verifier Feedback]" diagnostics. On EVERY run, not just satisfied —
+        # the planner needs failed-run details too.
         try:
             if isinstance(trace, dict):
                 o.record_verifier_trace(trace)
         except Exception as e:
             logger.info("[KeyNodeDetector] record_verifier_trace failed: %s", e)
 
-        # In-step self-healing loop: when a PENDING outcome's verifier
-        # returns False AND the diagnoser classifies the failure as
-        # ``verifier_mismatch``, re-author the spec and re-run the
-        # verifier within the SAME step — actor never sees the broken
-        # spec. Up to ``INSTEP_REAUTHOR_MAX_ROUNDS`` cycles; shares
-        # A1: budget tracked on outcome.patch_applied.
+        # In-step self-healing: on a PENDING False verdict diagnosed as
+        # ``verifier_mismatch``, reauthor the spec and re-verify within the same
+        # step so the actor never sees a broken spec. Up to
+        # ``INSTEP_REAUTHOR_MAX_ROUNDS``; budget tracked on outcome.patch_applied.
         if (
             cur_state != OUTCOME_VERIFIED
             and verdict is False
@@ -548,8 +497,7 @@ def detect_key_nodes(
                 agent_state=agent_state,
                 current_step=current_step,
             )
-            # Persist per-round details into the step's debug dump so
-            # each spec rewrite + re-verify is replayable offline.
+            # Persist per-round details so each rewrite + re-verify is replayable.
             if rounds_log:
                 rec["instep_reauthor_rounds"] = rounds_log
                 rec["instep_reauthor_patches_after"] = o.patch_applied
@@ -557,12 +505,9 @@ def detect_key_nodes(
         rec["deterministic_verdict"] = verdict
         rec["deterministic_trace"] = trace
 
-        # ─── A2 (silent observer): build Evidence for this verify run ───
-        # We append once per concrete (True/False) verdict. None verdicts
-        # route to the LLM path; the LLM path's KeyNode is recorded in
-        # the timeline but we don't synthesize a fake "verifier ran"
-        # Evidence for it (no trace to capture). triggering_keynode is
-        # left None at A2; A3+ may patch it from the emitted KeyNode.
+        # Silent observer: append one Evidence per concrete (True/False) verdict.
+        # None verdicts go to the LLM path and get no Evidence (no trace to
+        # capture). triggering_keynode left None; may be patched later.
         if verdict in (True, False):
             try:
                 ev = _build_evidence(
@@ -580,10 +525,8 @@ def detect_key_nodes(
 
         if cur_state == OUTCOME_VERIFIED:
             # Already verified — looking for invalidation only.
-            # - verdict=True  → state still holds; no transition, emit nothing
-            # - verdict=False → state was un-done; emit outcome_invalidated
-            # - verdict=None  → ambiguous (resolved_path gone, crash); fall
-            #                   back to LLM judge for invalidation reasoning
+            # True → still holds, emit nothing. False → undone, invalidate.
+            # None → ambiguous (path gone, crash); LLM judges invalidation.
             if verdict is False:
                 kn = KeyNode(
                     kind=KN_OUTCOME_INVALIDATED,
@@ -685,17 +628,11 @@ def detect_key_nodes(
         llm_kns = _parse_response(raw, current_step.step_idx, needs_llm,
                                    sub_states)
 
-        # ─── Hard gate: unresolved-slot block on LLM judge satisfactions ───
-        # The LLM judge looks at a11y/screenshot and can hallucinate
-        # satisfaction for an outcome whose verify spec embeds a slot
-        # reference that's still UNBOUND — e.g. an outcome
-        # "the extracted URL is loaded" with verify ``${target_url}``,
-        # judged satisfied because there happens to be *some* URL
-        # visible on screen. Block that here: KN_OUTCOME_SATISFIED is
-        # only credible when every slot the verify spec mentions has
-        # been bound by the perceiver. Otherwise demote to "uncertain"
-        # and leave the outcome pending — the planner will keep pushing
-        # the actor to expose the value.
+        # Hard gate: block LLM-judged satisfaction when the verify spec
+        # references an UNBOUND slot. The judge can hallucinate satisfaction
+        # for e.g. "the extracted URL is loaded" (verify ``${target_url}``)
+        # just because some URL is on screen. Only credible once every
+        # referenced slot is bound; else leave the outcome pending.
         from mm_agents.structagent.ledger.core.ledger import find_slot_refs
         slots = (agent_state or {}).get("_ledger_slots") or {}
         outcomes_by_id = {o.id: o for o in needs_llm}
@@ -708,7 +645,7 @@ def detect_key_nodes(
             spec = getattr(o, "verify", None) if o else None
             unresolved: List[str] = []
             if spec is not None:
-                # Scan every string-valued spec field for ${name} refs.
+                # Scan all spec fields for ${name} refs.
                 from dataclasses import asdict
                 try:
                     spec_blob = asdict(spec)
@@ -725,7 +662,7 @@ def detect_key_nodes(
                     "pending until perceiver binds them",
                     current_step.step_idx, kn.target, unresolved,
                 )
-                # Mark in trace for offline debug
+                # Mark in trace for debug
                 for rec in per_outcome_trace:
                     if rec["outcome_id"] == kn.target:
                         rec["llm_satisfied_rejected_unbound"] = unresolved
@@ -774,22 +711,16 @@ def _instep_reauthor_loop(
     agent_state,
     current_step,
 ):
-    """One pending outcome's deterministic verifier returned False on
-    this step. Try to heal the spec WITHIN this step rather than
-    surfacing a possibly-broken verdict to the planner.
+    """Heal a pending outcome's verify spec in-place after a False verdict,
+    rather than surfacing a possibly-broken verdict to the planner.
 
-    Loop body: diagnose(trace) → if cause=='verifier_mismatch' AND
-    patch budget left, reauthor(spec, trace, diag) → re-run verifier.
-    Stops when verdict=True, cause=='planner_action', reauthor fails,
-    or ``INSTEP_REAUTHOR_MAX_ROUNDS`` reached.
+    Loop: diagnose(trace) → if cause=='verifier_mismatch' and budget left,
+    reauthor → re-verify. Stops on verdict=True, cause!='verifier_mismatch',
+    reauthor failure, or ``INSTEP_REAUTHOR_MAX_ROUNDS``.
 
-    Mutates ``outcome.verify`` and ``cache.patch_applied[outcome.id]``
-    in place. Returns ``(verify_spec, verdict, trace, rounds_log)``.
-
-    ``rounds_log`` is a list of per-round dicts capturing each
-    (old spec → diagnosis → cause → new spec → re-verify result)
-    transition, intended for the debug dump so a human can replay why
-    the verifier converged (or gave up).
+    Mutates ``outcome.verify`` and ``outcome.patch_applied``. Returns
+    ``(verify_spec, verdict, trace, rounds_log)``; rounds_log records each
+    (old spec → diagnosis → cause → new spec → result) for replay.
     """
     from dataclasses import asdict
     from mm_agents.structagent.ledger.core.timeline import (
@@ -813,15 +744,11 @@ def _instep_reauthor_loop(
     trace = current_trace
     rounds_log: List[Dict[str, Any]] = []
 
-    # Step-0 gate. At step 0 the actor has not had a turn yet, so any
-    # outcome that requires actor work will naturally verify=False —
-    # this is the ``planner_action`` cause (actor hasn't acted), NOT
-    # ``verifier_mismatch`` (spec is wrong). The diagnoser empirically
-    # mis-classifies step-0 verdicts as verifier_mismatch (the trace
-    # has no "what the actor wrote" signal to anchor template (a) on),
-    # which triggers up to INSTEP_REAUTHOR_MAX_ROUNDS wasted LLM calls
-    # at task start producing equivalent specs that all still fail.
-    # Skip reauthor until at least one actor turn has happened.
+    # Step-0 gate. No actor turn yet, so verify=False here is ``planner_action``
+    # (actor hasn't acted), not ``verifier_mismatch``. The diagnoser misreads
+    # step-0 traces as verifier_mismatch (no "what the actor wrote" signal),
+    # wasting up to INSTEP_REAUTHOR_MAX_ROUNDS LLM calls on equivalent failing
+    # specs. Skip reauthor until at least one actor turn.
     step_idx = getattr(current_step, "step_idx", 0)
     if step_idx == 0:
         logger.info(
@@ -832,9 +759,8 @@ def _instep_reauthor_loop(
         )
         return verify, verdict, trace, rounds_log
 
-    # initial_obs slot for reauthor — pass the current step's screenshot
-    # since spec rewriting cares about NOW, not task start. Reauthor
-    # tolerates None.
+    # Pass the current screenshot — reauthor cares about NOW, not task start
+    # (tolerates None).
     initial_obs = {
         "screenshot": getattr(current_step, "screenshot_bytes", None),
     }
@@ -852,7 +778,7 @@ def _instep_reauthor_loop(
             "stop_reason": None,
         }
 
-        # Budget guard — shared with post-step apply_reauthor_pass.
+        # Budget guard, shared with post-step apply_reauthor_pass.
         if outcome.patch_applied >= VERIFIER_REAUTHOR_MAX_PATCHES:
             logger.info(
                 "[InStep-Reauthor] %s round=%d patch budget exhausted (%d) — stopping",
@@ -862,9 +788,8 @@ def _instep_reauthor_loop(
             rounds_log.append(round_rec)
             break
 
-        # Diagnose (uses trace signature cache — _trace_signature was
-        # updated to include exit_code + stdout head so different specs
-        # produce fresh diagnoses).
+        # Diagnose. _trace_signature includes exit_code + stdout head so
+        # different specs produce fresh diagnoses (not a stale cache hit).
         diag_text = _diagnose_outcome(
             outcome, verify, trace,
             call_llm=call_llm, model=model,
@@ -881,7 +806,7 @@ def _instep_reauthor_loop(
             rounds_log.append(round_rec)
             break
 
-        # Reauthor — produce a new VerifySpec for THIS outcome.
+        # Reauthor — new VerifySpec for this outcome.
         try:
             new_spec = reauthor_outcome_verifier(
                 instruction=instruction,
@@ -913,7 +838,7 @@ def _instep_reauthor_loop(
             rounds_log.append(round_rec)
             break
 
-        # Commit new spec + bump patch counter (shared budget).
+        # Commit new spec + bump patch counter.
         outcome.verify = new_spec
         outcome.patch_applied = outcome.patch_applied + 1
         verify = new_spec
@@ -939,7 +864,7 @@ def _instep_reauthor_loop(
             rounds_log.append(round_rec)
             break
 
-        # Re-record trace (overwrites the pre-rewrite one for this step).
+        # Re-record trace (overwrites the pre-rewrite one).
         try:
             if isinstance(trace, dict):
                 outcome.record_verifier_trace(trace)
@@ -962,12 +887,11 @@ def _instep_reauthor_loop(
             rounds_log.append(round_rec)
             break
 
-        # Still failing — keep looping (cause re-evaluated next iteration
-        # against the new trace).
+        # Still failing — loop again (cause re-evaluated against the new trace).
         round_rec["stop_reason"] = "continue"
         rounds_log.append(round_rec)
     else:
-        # Loop ran to MAX_ROUNDS without break.
+        # Hit MAX_ROUNDS without a break.
         if rounds_log:
             rounds_log[-1]["stop_reason"] = "max_rounds_exhausted"
 
@@ -1012,12 +936,10 @@ def _outcomes_table(
 ) -> str:
     """Render the per-outcome state table for the KeyNode prompt.
 
-    For ``a11y_match`` outcomes, also emit the dual-channel safety net
-    (``visual_must_hold`` / ``visual_must_not_hold``) the ledger
-    initializer wrote, so the LLM judges them BOTH on a11y rows AND
-    on the screenshot. Failure of any visual clause keeps the outcome
-    at its previous state — the LLM must not emit ``outcome_satisfied``
-    in that case (see system prompt).
+    For ``a11y_match`` outcomes, also emit the dual-channel visual gates
+    (``visual_must_hold`` / ``visual_must_not_hold``) so the LLM judges on both
+    a11y rows and the screenshot. Any failed visual clause must keep the outcome
+    at its previous state (see system prompt).
     """
     lines = ["outcome_id | current_state | evidence_hint"]
     lines.append("-" * 60)
@@ -1029,9 +951,9 @@ def _outcomes_table(
         verify = getattr(o, "verify", None)
         if verify is None:
             continue
-        # Only a11y_match is gated by visual clauses (per design — file_grep
-        # / url_match are deterministic). Other kinds: skip rendering even
-        # if the fields happen to be set, to avoid confusing the LLM.
+        # Only a11y_match is visually gated (file_grep / url_match are
+        # deterministic). Skip rendering for other kinds even if the fields
+        # are set, to avoid confusing the LLM.
         if getattr(verify, "kind", None) != "a11y_match":
             continue
         must_hold = list(getattr(verify, "visual_must_hold", []) or [])
@@ -1047,8 +969,8 @@ def _outcomes_table(
             for c in must_not:
                 lines.append(f"      MUST NOT HOLD : {c}")
         else:
-            # Author left them empty; warn the LLM that this outcome is
-            # judged on a11y alone (legacy) so it knows to be conservative.
+            # No gates authored — warn the LLM this is a11y-only so it stays
+            # conservative.
             lines.append(
                 f"  └ visual gates for `{o.id}`: NONE — a11y-only "
                 f"judging (be conservative; transient overlay rows can "
@@ -1061,13 +983,11 @@ _VERDICT_GLYPH = {"yes": "✓", "no": "✗", "partial": "~", "unknown": "?"}
 
 
 def _render_perceiver_prior(snapshot: Any) -> str:
-    """Render the SubgoalSnapshot as a 'PERCEIVER PRE-VERIFICATION' block
-    for the KeyNode detector prompt. Strong prior — KeyNode treats the
-    perceiver as having already attempted clause-level verification on
-    the same screen, so KeyNode focuses on edge cases / overrides.
+    """Render the SubgoalSnapshot as a 'PERCEIVER PRE-VERIFICATION' prior block.
 
-    Duck-typed access; returns a graceful empty-ish block on attribute
-    failure so KeyNode doesn't crash on a malformed snapshot.
+    Treated as a strong prior (perceiver already attempted clause-level verify on
+    the same screen), so KeyNode focuses on edge cases / overrides. Duck-typed;
+    returns a placeholder block on attribute failure so KeyNode never crashes.
     """
     try:
         lines: List[str] = [
@@ -1156,14 +1076,13 @@ def _build_messages(
     actor_action_summary: str,
     a11y_delta_block: Optional[str],
     snapshot: Optional[Any] = None,           # SubgoalSnapshot — perceiver pre-distilled
-    doc_inspect_block: Optional[str] = None,  # office SP/DP block (authoritative for structural props)
+    doc_inspect_block: Optional[str] = None,  # office SP/DP block, authoritative for structural props
     earlier_steps: Optional[List[StepRecord]] = None,  # frames OLDER than prev (oldest→newest)
 ) -> List[Dict[str, Any]]:
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": _SYSTEM_PROMPT}
     ]
 
-    # User text + images for current observation (always present)
     user_blocks: List[Dict[str, Any]] = []
 
     user_blocks.append({"type": "text", "text": (
@@ -1176,12 +1095,11 @@ def _build_messages(
         f"{actor_action_summary or '(unknown)'}"
     )})
 
-    # Earlier observations (screenshots only — extra frames so the judge sees a
-    # multi-step workflow, e.g. a print→save-dialog flow, not just prev+current.
-    # A short-lived UI state visible only mid-workflow — a save dialog that
-    # confirms a file landed before it closes — would otherwise be invisible to
-    # a 2-frame judge. a11y omitted here to bound tokens; prev+current carry the
-    # full a11y.) Oldest first so the sequence reads chronologically.
+    # Earlier observations (screenshots only) give the judge multi-step workflow
+    # context, e.g. a print→save-dialog flow: a short-lived mid-workflow state
+    # (save dialog confirming a file landed before it closes) is invisible to a
+    # 2-frame judge. a11y omitted to bound tokens (prev+current carry it).
+    # Oldest first so the sequence reads chronologically.
     for _es in (earlier_steps or []):
         if getattr(_es, "screenshot_b64", None):
             user_blocks.append({"type": "text", "text": (
@@ -1220,7 +1138,7 @@ def _build_messages(
                        header="a11y rows (tag\\ttext\\tstate):")
     )})
 
-    # Machine a11y delta block (from compute_window_delta) — auxiliary signal
+    # Machine a11y delta (from compute_window_delta) — auxiliary signal
     if a11y_delta_block:
         user_blocks.append({"type": "text", "text": (
             "[Machine-computed a11y delta (already diffed for you)]\n"
@@ -1228,24 +1146,18 @@ def _build_messages(
                           header="delta rows (tag\\ttext\\tstate, prefixed with +/-):")
         )})
 
-    # Perceiver pre-distilled view — strong prior. Treat the perceiver's
-    # clause verdicts and relevant_controls as "another LLM has already
-    # looked at this same screen and tried to verify". Use as a starting
-    # point; override only when you have specific contrary visual /
-    # a11y evidence.
+    # Perceiver pre-distilled view — strong prior (another LLM already looked at
+    # this screen and tried to verify). Use as a starting point; override only on
+    # specific contrary visual / a11y evidence.
     if snapshot is not None:
         user_blocks.append({"type": "text",
                             "text": _render_perceiver_prior(snapshot)})
 
-    # Office structured block (SlidePerceiver / SheetPerceiver /
-    # DocPerceiver). For libreoffice_calc / libreoffice_impress /
-    # libreoffice_writer this is read DIRECTLY from the UNO document
-    # model — every font property, color hex, alignment, cell value,
-    # shape size is the ground truth. When checking outcomes that
-    # name structural properties (bold / underline / italic / color
-    # / size / font name / alignment / cell-value), prefer this block
-    # over screenshot pixel guesses. Screenshots show rendered output
-    # which can mask subtle font-weight changes; the SP block doesn't.
+    # Office structured block (Slide/Sheet/Doc Perceiver). For the libreoffice
+    # domains this is read directly from the UNO document model, so every font
+    # property, color hex, alignment, cell value, shape size is ground truth.
+    # Prefer it over screenshot guesses for structural outcomes — rendered
+    # pixels can mask subtle font-weight changes; the UNO model can't.
     if doc_inspect_block:
         user_blocks.append({"type": "text", "text": (
             "[Document structure block — AUTHORITATIVE for font / "
@@ -1281,8 +1193,8 @@ def _parse_response(
     current_outcome_states: Dict[str, str],
 ) -> List[KeyNode]:
     """Extract KeyNodes from the LLM response. Tolerant of fence/whitespace
-    drift; drops any KeyNode that fails validation (missing evidence,
-    invalid kind/confidence, target not in outcomes for outcome_* kinds)."""
+    drift; drops nodes failing validation (no evidence, bad kind/confidence,
+    or outcome_* target not in required_outcomes)."""
     if not raw:
         return []
     text = raw.strip()
@@ -1294,11 +1206,9 @@ def _parse_response(
         except json.JSONDecodeError:
             payload = None
     if payload is None:
-        # Fallback: find first balanced {...} object. If a <patch> opening
-        # tag is present (even without a closing tag — common when the
-        # response is truncated mid-emit), restrict the brace search to
-        # text after that tag so we don't accidentally swallow literal
-        # braces inside the <reasoning> block (e.g. `{outcome_id}` notes).
+        # Fallback: find the first balanced {...}. If a <patch> open tag exists
+        # (even unclosed — common on truncation), search only after it so we
+        # don't swallow literal braces in <reasoning> (e.g. `{outcome_id}`).
         search_from = 0
         patch_open = re.search(r"<patch>", text, re.IGNORECASE)
         if patch_open is not None:
@@ -1311,9 +1221,8 @@ def _parse_response(
             except json.JSONDecodeError:
                 payload = None
     if payload is None or not isinstance(payload, dict):
-        # Distinguish truncation (no <patch> opened, no {} present) from
-        # real parse failures (malformed JSON) — the former means raise
-        # max_tokens, the latter means the model emitted bad JSON.
+        # Distinguish truncation (no <patch>, no braces → raise max_tokens) from
+        # a real parse failure (malformed JSON).
         has_patch_open = "<patch>" in text.lower()
         has_brace = "{" in text
         if not has_patch_open and not has_brace:
@@ -1365,8 +1274,8 @@ def _parse_response(
         if not target:
             continue
 
-        # Outcome-kind validation: target must reference a real outcome,
-        # and the transition must be coherent with current state.
+        # Outcome kinds: target must be a real outcome and the transition
+        # coherent with current state.
         if kind in (KN_OUTCOME_SATISFIED, KN_OUTCOME_INVALIDATED):
             if target not in valid_outcome_ids:
                 logger.warning("[KeyNodeDetector] dropping outcome target=%r — not in required_outcomes",

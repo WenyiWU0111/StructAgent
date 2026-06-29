@@ -1,41 +1,11 @@
 """Render L2 (task-level) and L1 (subgoal-level) experience-memory
-blocks for injection into the Causal-Agent planner / actor prompts.
+blocks for injection into the planner / actor prompts.
 
-Mirrors verifier_audit/prompt_injection.py's STRONG / MID / WEAK_PITFALLS_ONLY
-/ OOD pattern.
+Two entry points return ``(block_str, meta)``; the block is "" on OOD or
+error so memory injection never breaks the agent loop. ``meta`` carries
+mode (STRONG/MID/WEAK_PITFALLS_ONLY/OOD/ERROR), layer, hits, query_text.
 
-Two public entry points:
-
-  render_for_planner_initial(task_text) -> (block_str, meta)
-      Called by _pa_build_initial_plan_prompt with the augmented task
-      instruction. Returns (markdown block to splice, debug meta dict).
-      Block is "" and meta has "OOD" mode when no hit / on error.
-
-  render_for_actor_subgoal(subgoal, task_text) -> (block_str, meta)
-      Called by _pa_call_actor_points before passing the decomposer
-      template to the model. Returns (markdown block, debug meta).
-
-Helper:
-  dump_memory_debug(results_dir, stage_tag, block, meta, *,
-                     subgoal=None) -> Path | None
-      Writes the rendered block + retrieval metadata to a sidecar file
-      under ``<results_dir>/planner_memory_debug/`` for post-hoc
-      forensics. Skipped silently if results_dir is None or block empty.
-
-Failure-safe: any internal exception → returns ("", meta_with_mode=ERROR)
-so memory injection NEVER breaks the agent loop.
-
-meta shape:
-  {
-    "mode": "STRONG" | "MID" | "WEAK_PITFALLS_ONLY" | "OOD" | "ERROR",
-    "layer": "L2" | "L1",
-    "n_hits": int,
-    "hits": [
-      {"rank": int, "id": str, "score": float, "source": str},
-      ...
-    ],
-    "query_text": str,
-  }
+Mirrors verifier_audit/prompt_injection.py's mode pattern.
 """
 
 from __future__ import annotations
@@ -49,13 +19,10 @@ from typing import Any, Dict, Optional, Tuple
 def render_for_planner_initial(task_text: str,
                                  domain: str = "",
                                  ) -> Tuple[str, Dict[str, Any]]:
-    """Top entry — returns (block, meta). Block is "" on OOD/error.
+    """Task-start entry. Returns (block, meta); block "" on OOD/error.
 
-    Routes to the unified multi-layer (v3/v4) retriever (L2 plans + L3a
-    cluster patterns + L3c domain rule sheet) and uses that block +
-    v3-shaped meta. The legacy v2 path has been removed.
-
-    ``domain`` is REQUIRED to drive L3c lookup.
+    Routes to the multi-layer retriever (L2 plans + L3a cluster patterns
+    + L3c domain rule sheet). ``domain`` is required for the L3c lookup.
     """
     from mm_agents.structagent.memory.runtime.retrieval.query_multi_layer_memory \
         import render_task_start
@@ -66,13 +33,10 @@ def render_for_actor_subgoal(subgoal: str,
                               task_text: str = "",
                               domain: str = "",
                               ) -> Tuple[str, Dict[str, Any]]:
-    """Subgoal-transition entry. Returns (block, meta). Block "" on OOD.
+    """Subgoal-transition entry. Returns (block, meta); block "" on OOD.
 
-    Routes to the unified multi-layer (v3/v4) retriever (per-domain L1
-    actions + L3a rule index) and uses that block + v3-shaped meta. The
-    legacy v2 path has been removed.
-
-    ``domain`` is REQUIRED to pick the per-domain L1 index.
+    Routes to the multi-layer retriever (per-domain L1 actions + L3a rule
+    index). ``domain`` is required to pick the per-domain L1 index.
     """
     from mm_agents.structagent.memory.runtime.retrieval.query_multi_layer_memory \
         import render_subgoal_transition
@@ -91,15 +55,11 @@ def _slugify(text: str, max_len: int = 40) -> str:
 
 
 def format_log_summary(meta: Dict[str, Any], top_k: int = 3) -> str:
-    """One-line + indented top-K summary suitable for _logger.info().
-    Caller does the actual log call to keep this module logger-free.
-
-    Handles both v2 meta (``layer``/``mode``/``hits``) and v3 meta
-    (``layer``/``mode``/``l2_hits``/``l3a_cluster_hits``/...).
+    """One-line + indented top-K summary for the caller to log (kept
+    logger-free). Handles both v2 and v3-shaped meta.
     """
     if meta.get("memory_version") in ("v3", "v4"):
-        # Delegate to v3-shaped formatter so the multi-layer hit summary
-        # gets the right per-tier rendering.
+        # v3 meta has per-tier hits; delegate to its formatter.
         from mm_agents.structagent.memory.runtime.retrieval.query_multi_layer_memory \
             import format_log_summary_v3
         return format_log_summary_v3(meta, top_k=top_k)
@@ -123,26 +83,11 @@ def dump_memory_debug(results_dir: Optional[Any],
                        meta: Dict[str, Any],
                        *,
                        subgoal: Optional[str] = None) -> Optional[Path]:
-    """Write the rendered block + retrieval metadata to a sidecar file
-    under ``<results_dir>/planner_memory_debug/``. Returns the written
-    path, or None if skipped (no results_dir / write error).
+    """Dump the rendered block + retrieval meta to a sidecar text file
+    under ``<results_dir>/planner_memory_debug/`` for post-hoc forensics.
+    Returns the path, or None if skipped (no results_dir / write error).
 
-    File contents (text, human-readable):
-      # planner memory debug
-      stage: <stage_tag>
-      query: <truncated query text>
-      mode: <STRONG | MID | WEAK_PITFALLS_ONLY | OOD | ERROR>
-      n_hits: <int>
-      hits:
-        - rank=1 id=... score=... source=...
-        - ...
-
-      === BLOCK INJECTED ===
-      <full rendered block, or "(none — OOD/empty)">
-
-    File naming:
-      <stage_tag>[_<subgoal_slug>].txt
-      e.g. "init_l2.txt" or "actor_l1_subgoal_open_chrome_settings.txt"
+    Filename: ``<stage_tag>[_<subgoal_slug>].txt``
     """
     if results_dir is None:
         return None
@@ -153,8 +98,8 @@ def dump_memory_debug(results_dir: Optional[Any],
         if subgoal:
             name = f"{stage_tag}_{_slugify(subgoal)}"
         path = out_dir / f"{name}.txt"
-        # Append-safe: if same filename collides (rare — same stage +
-        # same subgoal slug fires twice), suffix with a counter.
+        # On filename collision (same stage + subgoal fires twice),
+        # suffix with a counter.
         if path.exists():
             i = 2
             while (out_dir / f"{name}__{i}.txt").exists():

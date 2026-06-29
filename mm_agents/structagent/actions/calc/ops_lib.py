@@ -1,34 +1,20 @@
-"""Pre-built LibreOffice Calc operations exposed to the actor.
+"""Pre-built LibreOffice Calc ops, injected into ``cli_run_uno`` scripts.
 
-The string :data:`CALC_OPS_LIBRARY` is concatenated into every
-``cli_run_uno`` script whose domain is ``libreoffice_calc``, right
-after the connect + domain setup blocks. It defines:
+:data:`CALC_OPS_LIBRARY` is concatenated into every ``libreoffice_calc``
+script after the connect/setup blocks. It defines:
 
-  - ``op_*(...)``      — mutation operations the actor invokes.
-                          Returns ``True`` on success; raises on bad
-                          input. The actor's snippet then prints
-                          ``PASS`` / ``FAIL: <reason>`` based on
-                          the return / exception, in line with the
-                          existing cli_run_uno verify convention.
-  - ``verify_*(...)``  — read-only checks for the init_ledger
-                          verify_spec. Returns ``True`` / ``False``;
-                          the caller prints ``PASS`` / ``FAIL``.
+  - ``op_*(...)``     — mutations the actor invokes; return True or raise.
+  - ``verify_*(...)`` — read-only checks for the init_ledger verify_spec;
+                        return True/False.
 
-Both kinds rely on the globals ``doc``, ``sheets``, ``controller``
-already being bound by the wrapper. They do NOT re-connect to UNO
-themselves — that is the wrapper's job, and re-connecting in the
-actor body was a frequent source of bridge-state bugs (importing
-``com.sun.star.X`` constant groups before the bridge is warm, etc.).
+Both rely on ``doc`` / ``sheets`` / ``controller`` already bound by the
+wrapper — they do NOT re-connect (re-connecting in the actor body was a
+frequent source of bridge-state bugs, e.g. importing ``com.sun.star.X``
+constant groups before the bridge is warm).
 
-Design contract:
-  * Every op is keyword-only (``*,``) so the actor cannot get arg
-    order wrong.
-  * Every op ends with ``doc.store()``.
-  * Op functions raise ``ValueError`` for input that cannot succeed
-    (missing sheet, unknown field name). The wrapper catches this,
-    sets returncode=1, and writes the traceback to stderr — the
-    planner sees the concrete cause in the next turn's
-    ``[Last cli_run output]`` block.
+Contract: every op is keyword-only, ends with ``doc.store()``, and raises
+``ValueError`` on input that can't succeed (missing sheet, unknown field).
+The wrapper turns that into a stderr traceback the planner sees next turn.
 """
 
 CALC_OPS_LIBRARY = '''

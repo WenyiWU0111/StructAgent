@@ -1,18 +1,13 @@
 """Phase 3 — L2 plan-template polish for the unified-pool tight-tier clusters.
 
 For each cluster (n>=3) under ``results/unified_memory/_clusters_v3_tight/``,
-ask the polisher to emit **one OR MORE** L2 skills, depending on how
-many distinct plan families it sees among the member trajectories. A
-30-member impress cluster could legitimately hold a "format slide title"
-skill + a "format slide background" skill + a few unassigned outliers;
-forcing one skill per cluster would average those into a useless union.
+emit one OR MORE L2 skills depending on how many distinct plan families the
+members hold — forcing one skill per cluster averages distinct families into a
+useless union. Output is a JSON record with ``skills: [...]`` plus
+``unassigned_task_hashes`` for outliers; each skill keeps the v2 single-skill
+field set so downstream retrieval/index code doesn't fork.
 
-Output per cluster: a JSON record with ``skills: [...]`` (variable
-length) plus ``unassigned_task_hashes`` for any outlier task that fits
-no skill. Each skill carries the same field set as the v2 single-skill
-output so downstream retrieval/index code doesn't have to fork.
-
-Workflow per preview_then_batch memory:
+Workflow (preview then batch):
   1. ``--render-only --cluster X``  dump prompt for ONE cluster, no LLM
   2. ``--max 3``                    polish 3 clusters; eyeball the JSON
   3. ``--full``                     polish every multi-member cluster
@@ -315,7 +310,7 @@ def process_cluster(cluster_id: str,
         return {"cluster_id": cluster_id, "status": "bad-shape",
                 "elapsed_s": round(elapsed, 1)}
 
-    # Validate: every task_hash accounted for exactly once
+    # every input task_hash must appear exactly once across skills + unassigned
     input_hashes = {r.task_hash for r in records}
     seen: List[str] = []
     for sk in parsed.get("skills") or []:

@@ -1,30 +1,13 @@
-"""Render a verifier-experience-memory block to inject into the
-init_ledger LLM prompt.
+"""Render a verifier-experience-memory block for the init_ledger prompt.
 
-Public entrypoint:
-  render_for_init_ledger(task_text: str) -> str
-      Returns the markdown-flavored text block that init_ledger's
-      prompt builder appends to ``text_parts``. Returns "" when no
-      recipe match clears the WEAK threshold (caller should not
-      append empty strings).
+Entrypoint: render_for_init_ledger(task_text) -> str, returns "" below
+the WEAK threshold (caller must not append empty strings).
 
-Behavior driven by query() mode:
-
-  STRONG  (score >= 0.7):
-      Header + full content of every hit with score >= 0.7
-      (dimensions + pitfalls). LLM told to use as a high-confidence
-      checklist.
-
-  MID  (score 0.5-0.7):
-      Header + full content of hits with score >= 0.5
-      (dimensions + pitfalls). LLM told to verify applicability.
-
-  WEAK_PITFALLS_ONLY  (score 0.35-0.5):
-      Header + ONLY the pitfalls of the top-1 hit. Dimensions are
-      suppressed. LLM told to self-filter pitfalls.
-
-  OOD  (< 0.35):
-      Returns "" — no injection. init_ledger behaves as before.
+Rendering by query() mode:
+  STRONG (>=0.7): full content (dimensions + pitfalls), as a checklist.
+  MID (0.5-0.7): full content, but verify applicability.
+  WEAK_PITFALLS_ONLY (0.35-0.5): top-1 pitfalls only, dimensions dropped.
+  OOD (<0.35): no injection.
 """
 
 from __future__ import annotations
@@ -147,16 +130,15 @@ def _render_pitfalls_only(hit: QueryHit) -> str:
 
 
 def _filter_filegrep_hits(hits, domain):
-    """For GUI-only domains (chrome/gimp/thunderbird, ENABLE_DOMAIN_CODING_GATE
-    on) drop retrieved verify-spec recipes that rely on file_grep /
-    shell_command. Those domains verify on LIVE app state via a11y/url — the
-    on-disk config file flickers / is overwritten, which is exactly the
-    transient-file_grep false-PASS that let chrome bookmark tasks false-DONE.
-    The bank is domain-agnostic, so a chrome task can match a file_grep recipe
-    mined from os/vs_code; dropping it reinforces domain/verifier/<d>.md's
-    a11y-default. The init_ledger LLM can still author shell_command from its
-    domain knowledge if a task genuinely produces a file. Gate off / non-GUI-
-    only → unchanged."""
+    """Drop file_grep/shell_command recipes for GUI-only domains.
+
+    For chrome/gimp/thunderbird with the domain coding gate on, these
+    domains verify on live app state (a11y/url); on-disk config files
+    flicker/get overwritten, which is the transient-file_grep false-PASS
+    that let chrome bookmark tasks false-DONE. The bank is
+    domain-agnostic so a chrome task can match a file_grep recipe mined
+    from os/vs_code — dropping it keeps the a11y default. Gate off /
+    non-GUI-only → unchanged."""
     try:
         from mm_agents.structagent.config import CAConfig
         from mm_agents.structagent.domain import is_gui_only

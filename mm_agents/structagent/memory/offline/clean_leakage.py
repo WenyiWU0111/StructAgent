@@ -1,49 +1,37 @@
 """Abstract task-instance leakage out of the mined memory bank.
 
-WHY
----
-L1/L2/verifier entries mined from a single trajectory (``singleton``) carry the
-*literal* task arguments verbatim — e.g. a subgoal "Search for Women's Nike
-Jerseys using store search" or an action 'type "Women's Nike Jerseys"'. That is
-(a) verbatim leakage of eval-task content into the agent's memory and
-(b) overfitting: the entry only matches the one task it came from.
-
-This tool rewrites the FREE-TEXT fields of each in-scope entry, replacing
-task-instance VALUES (specific products / queries / file names / URLs / emails /
-sheet values / brand-site names) with natural general placeholders, while
-PRESERVING the reusable procedure (which app-native control to act on, the action
-type and order, structural patterns like a =SUM(range) formula shape, menu/dialog
-names that belong to the app).
+L1/L2/verifier entries mined from a single trajectory carry literal task
+arguments verbatim (e.g. a subgoal "Search for Women's Nike Jerseys using store
+search"). That leaks eval-task content into the agent's memory and overfits the
+entry to one task. This tool rewrites the free-text fields, replacing instance
+VALUES (products / queries / file names / URLs / emails / sheet values / brand
+names) with natural placeholders while preserving the reusable procedure (which
+control to act on, action type/order, formula shapes, app menu/dialog names).
 
   "Search for Women's Nike Jerseys using store search"
       -> "Search for a target product using the store search bar"
-  'Click search bar, type "Women's Nike Jerseys", press Enter'
-      -> "Click the search bar, type the product query, press Enter"
   applicable_task_classes: ["nba_store_browse_filtered_products"]
       -> ["store_browse_filtered_products"]
 
-STYLE = natural placeholders, NOT slot tokens ("the product query", not "{product}").
+Placeholders are natural ("the product query"), not slot tokens ("{product}").
 
-SCOPE (decision: 程序层) = L1 + L2 + verifier intent recipes, across BOTH the v3
-(live; ``MEMORY_BANK_VERSION=v3``) and v2 (code fallback) banks. L3a/L3c rule
-sheets are out of scope (already general). After cleaning v3 sources, rebuild the
-FAISS indexes so retrieval embeds the abstracted text:
+Scope: L1 + L2 + verifier intent recipes, across both the v3 (live) and v2
+(fallback) banks. L3a/L3c rule sheets are already general. After cleaning v3,
+rebuild the FAISS indexes so retrieval embeds the abstracted text:
 
     PYTHONPATH=. python -m mm_agents.structagent.memory.offline.build_indexes.build_multi_layer_indexes
 
 USAGE
 -----
-  # 1) free offline scan — counts + flagged examples, no LLM, no writes
+  # scan only — counts + examples, no LLM, no writes
   PYTHONPATH=. python -m mm_agents.structagent.memory.offline.clean_leakage --dry-run [--banks v3,v2]
-
-  # 2) quality check — rewrite only N flagged entries, print before/after (needs key)
+  # rewrite N flagged entries, print before/after (needs key)
   OPENROUTER_API_KEY=... PYTHONPATH=. python -m mm_agents.structagent.memory.offline.clean_leakage --sample 8
-
-  # 3) full clean — backup, rewrite all flagged, write change report (needs key)
+  # full clean — backup + rewrite all flagged + change report (needs key)
   OPENROUTER_API_KEY=... PYTHONPATH=. python -m mm_agents.structagent.memory.offline.clean_leakage --apply
 
-The abstraction instruction lives in ABSTRACTION_RULE so the mining prompts can
-import the exact same wording (prevents re-leakage on re-mining).
+The rule lives in ABSTRACTION_RULE so the mining prompts import the exact same
+wording (prevents re-leakage on re-mining).
 """
 from __future__ import annotations
 
@@ -65,7 +53,7 @@ MODEL = os.environ.get("VERIFIER_POLISH_MODEL", "anthropic/claude-sonnet-4-5")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 
-# ── The single source of truth for "what to abstract" ──────────────────────
+# Single source of truth for "what to abstract" (also imported by mining prompts).
 ABSTRACTION_RULE = """\
 This entry is a REUSABLE skill, mined from agent trajectories. It must generalize
 to ANY similar task, not the specific task instance it was mined from.
@@ -120,24 +108,22 @@ Preserve list structure and length. Do not add commentary. Return ONLY the JSON 
 
 # ── Leak prefilter ───────────────────────────────────────────────────────────
 # leak_level(text) -> 2 strong / 1 weak / 0 none.
-#   strong = a literal value almost certainly task-specific (quoted value, file
-#            name, email, URL-with-path, large number, or a multi-word proper
-#            noun like "Women's Nike Jerseys" / "NBA Store").
-#   weak   = a single capitalized token that is not an app/UI word (e.g. "Amazon")
-#            — often a leak, but lower precision; reviewed in --apply, reported
-#            separately in --dry-run.
-# A false positive only costs one LLM call that returns the text unchanged.
+#   strong = literal value almost certainly task-specific (quoted value, file,
+#            email, URL-with-path, big number, multi-word proper noun).
+#   weak   = single capitalized non-app/UI token (e.g. "Amazon") — often a leak,
+#            lower precision; reviewed in --apply, reported separately in --dry-run.
+# A false positive costs one LLM call that returns the text unchanged.
 _FILE_RE = re.compile(r"\b[\w\-]+\.(?:xlsx|xls|docx|doc|pptx|ppt|csv|tsv|pdf|png|jpe?g|gif|svg|txt|md|py|js|ts|json|ya?ml|html?|xml|zip|tar|gz|mp4|mp3|wav|odt|ods|odp)\b", re.I)
-_URL_RE = re.compile(r"https?://\S{3,}|www\.\S{3,}")              # explicit URL only
+_URL_RE = re.compile(r"https?://\S{3,}|www\.\S{3,}")
 _EMAIL_RE = re.compile(r"\b[\w.\-]+@[\w.\-]+\.\w+\b")
 _QUOTED_RE = re.compile(r"[\"'“”‘’]([^\"'“”‘’]{2,})[\"'“”‘’]")
 _NUM_RE = re.compile(r"[$€£]\s?\d|\b\d{4,}\b|\b\d{1,3}(?:,\d{3})+\b")  # money / big / grouped
 _CAPTOK_RE = re.compile(r"[A-Z][A-Za-z'\-]{2,}")
 _MULTI_RE = re.compile(r"\b[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+)+\b")
 
-# App / UI / generic-noun / imperative-verb tokens that are legitimately part of
-# a reusable procedure (NOT task-instance leaks). Brand/site names (amazon, nike,
-# reddit, espn, nba, youtube, github, …) are deliberately ABSENT so they flag.
+# App / UI / generic-noun / imperative-verb tokens that legitimately belong to a
+# reusable procedure (not leaks). Brand/site names (amazon, nike, reddit, …) are
+# deliberately ABSENT so they flag.
 _WHITELIST = {
     # apps / formats / acronyms
     "chrome", "firefox", "libreoffice", "calc", "writer", "impress", "gimp", "vlc",
@@ -171,15 +157,15 @@ _WHITELIST = {
     "block", "accept", "decline", "dismiss", "more", "less", "new", "all", "none",
     "other", "default", "custom", "advanced", "general", "options", "preview",
     "ok", "done", "next", "back", "finish", "start", "stop", "skip", "retry",
-    # menu connectors / function words frequently Title-cased ("Open With", "Save As")
+    # function words Title-cased in menus ("Open With", "Save As")
     "with", "as", "to", "from", "of", "in", "on", "for", "and", "or", "the", "a",
     "an", "your", "this", "that", "by", "at", "into", "out", "up", "down", "off",
 }
 
 
 def _strip_leading_cap(text: str) -> str:
-    """Lowercase the first word so a sentence-initial imperative verb ("Launch …")
-    doesn't masquerade as a proper noun."""
+    """Lowercase the first word so a sentence-initial verb ("Launch …") doesn't
+    masquerade as a proper noun."""
     return re.sub(r"^(\W*)([A-Z][a-z]+)", lambda m: m.group(1) + m.group(2).lower(), text, count=1)
 
 
@@ -191,16 +177,16 @@ def _nonwhite_caps(text: str) -> List[str]:
     return [t for t in _CAPTOK_RE.findall(text) if _norm(t) and _norm(t) not in _WHITELIST]
 
 
-# typed-value context: a quote right after these verbs is a VALUE, not a UI label
+# A quote right after these verbs is a typed VALUE, not a UI label.
 _TYPING_CTX = re.compile(
     r"\b(typ\w*|enter|input|search(?:\s+for)?|nam\w*|titl\w*|call\w*|quer\w*|writ\w*|paste|fill\s+in|label(?:l?ed)?)\W*$",
     re.I)
 
 
 def _quoted_leaky(text: str) -> bool:
-    """A quoted span is a leak only if it is a typed VALUE (typing-verb context) or
-    a multi-word phrase carrying a non-UI proper noun. Bare UI labels like 'Save',
-    'Browse', 'Change Foreground Color' are NOT leaks."""
+    """A quoted span leaks only if it's a typed VALUE (typing-verb context) or a
+    multi-word phrase with a non-UI proper noun. Bare UI labels ('Save',
+    'Change Foreground Color') are not leaks."""
     for m in _QUOTED_RE.finditer(text):
         content = m.group(1).strip()
         if _TYPING_CTX.search(text[max(0, m.start() - 20):m.start()]):
@@ -212,9 +198,9 @@ def _quoted_leaky(text: str) -> bool:
 
 
 def _force_review(key: str) -> bool:
-    """Fields that DEFINE the task instance — always review (recall > precision),
-    since lowercase instance values (e.g. 'green', 'best pizza') evade regex.
-    Identifier fields are forced too (the LLM keeps clean slugs unchanged)."""
+    """Fields that DEFINE the task instance — always review, since lowercase
+    instance values ('green', 'best pizza') evade the regex. Identifier fields
+    are forced too (the LLM leaves clean slugs unchanged)."""
     k = key.lower()
     return ("subgoal" in k) or k.endswith("task_class") or k.endswith("_id") or k == "id"
 
@@ -241,8 +227,8 @@ def looks_leaky(text: str) -> bool:
 
 
 # ── In-scope field extraction / application, per bank layer ─────────────────
-# A "handler" turns one entry-file's parsed JSON into a flat {key: text} dict of
-# in-scope strings, and writes a {key: text} dict back into the same structure.
+# A handler turns one parsed entry into a flat {key: text} dict of in-scope
+# strings, and writes a {key: text} dict back into the same structure.
 
 @dataclass
 class Target:
@@ -387,7 +373,7 @@ def _rec_extract(d: dict) -> Dict[str, str]:
     _flatten("when_to_use", r.get("when_to_use"), out)
     for i, dim in enumerate(r.get("verification_dimensions") or []):
         _flatten(f"dim[{i}].description", dim.get("description"), out)
-        # literal expected values inside a check are leakage AND a correctness bug
+        # literal expected values inside a check are both leakage and a correctness bug
         for fld in ("expected", "expected_value", "value", "check", "how_to_check", "evidence"):
             _flatten(f"dim[{i}].{fld}", dim.get(fld), out)
     return out
@@ -424,8 +410,8 @@ def _iter_files(t: Target) -> List[Path]:
 
 # ── LLM rewrite ─────────────────────────────────────────────────────────────
 def _parse_obj(txt: str) -> dict:
-    """Robustly pull a JSON object out of an LLM reply (handles <think> blocks,
-    ```json fences, surrounding prose, and single-quoted dicts)."""
+    """Pull a JSON object out of an LLM reply (handles <think> blocks, ```json
+    fences, surrounding prose, single-quoted dicts)."""
     txt = re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL | re.I)
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", txt, re.DOTALL)
     if m:
@@ -459,8 +445,8 @@ def _rewrite(flat_leaky: Dict[str, str], model: str, base_url: str, api_key: str
     import openai
     client = openai.OpenAI(base_url=base_url, api_key=api_key or "EMPTY")
     # Sanitize keys: brackets/dots in JSON keys (e.g. "actions[0].typical_actions[1]")
-    # make some models drop a key-closing quote -> invalid JSON. Send underscore keys
-    # (semantic suffixes like "_action_id" survive, so the id rule still fires).
+    # make some models drop a closing quote -> invalid JSON. Send underscore keys;
+    # semantic suffixes like "_action_id" survive so the id rule still fires.
     safe2orig: Dict[str, str] = {}
     safe_flat: Dict[str, str] = {}
     for i, (k, v) in enumerate(flat_leaky.items()):
@@ -470,7 +456,7 @@ def _rewrite(flat_leaky: Dict[str, str], model: str, base_url: str, api_key: str
         safe2orig[sk] = k
         safe_flat[sk] = v
     user = json.dumps(safe_flat, ensure_ascii=False, indent=2)
-    # Qwen3.x on vLLM: disable the <think> reasoning pass (faster, clean JSON out)
+    # Qwen3.x on vLLM: disable the <think> pass (faster, clean JSON out)
     extra: Dict[str, Any] = {}
     if "qwen" in model.lower():
         extra["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
@@ -483,7 +469,7 @@ def _rewrite(flat_leaky: Dict[str, str], model: str, base_url: str, api_key: str
                 **extra,
             )
             obj = _parse_obj(resp.choices[0].message.content or "")
-            # map back to original keys; fall back to original text on missing/non-str
+            # map back to original keys; keep original text on missing/non-str
             return {orig: (obj[sk] if isinstance(obj.get(sk), str) else flat_leaky[orig])
                     for sk, orig in safe2orig.items()}
         except Exception as e:  # noqa
@@ -519,8 +505,8 @@ def run(banks: List[str], mode: str, sample_n: int, model: str,
     report_rows: List[dict] = []
     sampled = 0
 
-    # --out-version: clean a fresh COPY (e.g. _l1_actions_v3 -> _l1_actions_v4),
-    # leaving the source bank untouched. Only affects --apply (writes).
+    # --out-version: clean a fresh COPY (_l1_actions_v3 -> _l1_actions_v4),
+    # leaving the source bank untouched. Apply-only.
     if mode == "apply" and out_version:
         def _static_dir(glob: str) -> str:
             keep = []
@@ -542,8 +528,8 @@ def run(banks: List[str], mode: str, sample_n: int, model: str,
                 shutil.rmtree(v4base)
             shutil.copytree(base, v4base)
             copied.add(str(base))
-            # blank ``raw_response`` (full original mining output, carries every
-            # literal) — not indexed, but stripped so v4 holds no leak at rest.
+            # Blank raw_response (original mining output, carries every literal).
+            # Not indexed, but stripped so v4 holds no leak at rest.
             n_files = n_stripped = 0
             for fp in v4base.rglob("*.json"):
                 n_files += 1

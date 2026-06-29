@@ -1,22 +1,15 @@
 """Behavior narratives for bBoN: compress a rollout into its decisive moments.
 
-============================  FACTS, NOT VERDICTS  ============================
-The judge must be an INDEPENDENT check that can OVERRIDE our own verifier — that is
-the whole value of best-of-N. So a narrative carries only OBJECTIVE evidence (the
-action emitted, the KeyNode *evidence* quote, the URL change, the screenshot) plus
-the RUBRIC (``required_outcomes``) separately; the judge forms its own per-outcome
-verdict.
+FACTS, NOT VERDICTS. The judge must be an independent check that can override our
+own verifier — that's the point of best-of-N. So a narrative carries only objective
+evidence (action emitted, KeyNode.evidence quote, url change, screenshot) plus the
+rubric (``required_outcomes``); the judge forms its own per-outcome verdict.
 
-  KEEP (objective): actor_action_summary, KeyNode.evidence (a concrete a11y/visual
-    quote), url change, screenshots (before+after on revert frames), final a11y /
-    doc-structure / cli output, the outcomes' descriptions+evidence_hint as RUBRIC.
-
-  NEVER render: KeyNode.kind ("outcome_satisfied"/"outcome_invalidated"), the
-    per-outcome state ("verified"/"reverted") — those are OUR verifier's fallible
-    judgments. We use ``kind`` ONLY to locate + prioritise turning points; we render
-    its ``evidence`` (the fact behind it). A revert is SHOWN (before/after frames),
-    not labelled. The agent self-claim is attached only under
-    ``include_self_verdict`` (ablation), clearly quarantined.
+We use KeyNode.kind / per-outcome state ONLY to locate and prioritise turning points,
+never render them — those are our verifier's fallible judgments. We render the
+``evidence`` behind them. A revert is shown (before/after frames), not labelled. The
+agent self-claim is attached only under ``include_self_verdict`` (ablation),
+quarantined.
 """
 from __future__ import annotations
 
@@ -32,10 +25,8 @@ from mm_agents.structagent.ledger.core.timeline import (
 DEFAULT_MAX_FRAMES = 8
 
 
-# --------------------------------------------------------------------------- #
-# Data carried out of one finished rollout (decouples this module from the
-# agent: the runner fills it from the agent instance + obs sequence).
-# --------------------------------------------------------------------------- #
+# Data carried out of one finished rollout. The runner fills it from the agent
+# instance + obs sequence, so this module stays decoupled from the agent.
 @dataclass
 class RolloutArtifacts:
     task: str
@@ -109,10 +100,8 @@ class BehaviorNarrative:
         return "\n".join(L)
 
 
-# --------------------------------------------------------------------------- #
-# Turning-point selection (objective; kind only steers selection/priority)
-# --------------------------------------------------------------------------- #
-# priority: reverts/done/anchors are keep-always (see _cap); the rest fill by rank.
+# Turning-point selection. ``kind`` only steers selection/priority, never shown.
+# reverts/done/anchors are keep-always (see _cap); the rest fill by rank.
 _PRIORITY = {
     "reverted": 100, "done": 95, "done_rejected": 92, "initial": 90, "final": 90,
     "satisfied": 70, "value": 60, "replan": 50, "strategy_failed": 45,
@@ -122,8 +111,8 @@ _KEEP_ALWAYS_KINDS = {"reverted", "done", "done_rejected", "initial", "final"}
 
 
 def _classify(step: Any, is_first: bool, is_last: bool, prev_url: Optional[str]):
-    """Return (kind, priority) or (None, 0). Highest-signal label wins; the label
-    is internal — only used to select/prioritise/contrast, never shown as a verdict."""
+    """Return (kind, priority) or (None, 0). Highest-signal label wins; label is
+    internal (select/prioritise/contrast only), never shown as a verdict."""
     kinds = {kn.kind for kn in (step.key_nodes or [])}
     dec = (step.planner_decision or "").upper()
     if KN_OUTCOME_INVALIDATED in kinds:
@@ -177,9 +166,9 @@ def _cap(tps: List[TurningPoint], max_frames: int,
 
 def select_turning_points(timeline: List[Any], *,
                           max_frames: int = DEFAULT_MAX_FRAMES) -> List[TurningPoint]:
-    """Locate the decisive steps from the timeline (read-only). Selector = key-nodes
-    ∪ subgoal boundaries (REPLAN/DONE) ∪ objective url-deltas ∪ first/last anchors.
-    Capped to ``max_frames`` by priority; reverts/done/first/last never dropped."""
+    """Pick decisive steps (read-only): key-nodes ∪ subgoal boundaries (REPLAN/DONE)
+    ∪ url-deltas ∪ first/last anchors. Capped to ``max_frames`` by priority;
+    reverts/done/first/last never dropped."""
     if not timeline:
         return []
     tps: List[TurningPoint] = []
@@ -199,9 +188,9 @@ def select_turning_points(timeline: List[Any], *,
         if s.url:
             prev_url = s.url
     capped = _cap(tps, max_frames, timeline[0].step_idx, timeline[-1].step_idx)
-    # Mode-agnostic tail fill: keynode-less runs (boundary mode) yield only
-    # first/last turning points. Top up with the most-recent steps so the judge
-    # always sees the last ``max_frames`` steps' screenshots + actions.
+    # Tail fill: keynode-less runs (boundary mode) yield only first/last points.
+    # Top up with most-recent steps so the judge always sees the last
+    # ``max_frames`` steps' screenshots + actions.
     if len(capped) < max_frames:
         have = {t.step for t in capped}
         for s in reversed(timeline):
@@ -244,8 +233,8 @@ def render_behavior_narrative(art: RolloutArtifacts, *,
                               max_frames: int = DEFAULT_MAX_FRAMES,
                               include_self_verdict: bool = False) -> BehaviorNarrative:
     """Build one rollout's narrative from its artifacts. Objective facts only;
-    rubric from ``required_outcomes``; self-claim only if ``include_self_verdict``
-    (quarantined). See the module header for the facts-not-verdicts rule."""
+    rubric from ``required_outcomes``; self-claim only if ``include_self_verdict``.
+    See module header for the facts-not-verdicts rule."""
     outcomes = list(getattr(art.ledger, "required_outcomes", None) or [])
     rubric = [
         f"{o.id}: {o.description}"

@@ -1,24 +1,20 @@
-"""Phase 4 — MultiLayerMemoryRetriever v3 + natural-language prompt renderer.
+"""MultiLayerMemoryRetriever v3 + natural-language prompt renderer.
 
 Two-stage retrieval matching planner / actor decision points:
 
-  retrieve_for_task_start(task_instruction, domain)
-      → top-K L2 plan templates (similar past tasks + their full plans)
-      → top-K L3a cluster summaries (patterns across this task class)
-      → L3c domain rule sheet (what's always true in this app)
+  retrieve_for_task_start(instruction, domain)
+      → top-K L2 plan templates (similar past tasks + full plans)
+      → top-K L3a cluster summaries (patterns across the task class)
+      → L3c domain rule sheet (always-true facts for the app)
 
-  retrieve_for_subgoal_transition(subgoal_text, domain)
-      → top-K L1 typical_actions in this domain (how this subgoal has
-        been accomplished before)
-      → top-K L3a rules relevant to this subgoal (specific gotchas)
+  retrieve_for_subgoal_transition(subgoal, domain)
+      → top-K L1 typical_actions (how this subgoal was done before)
+      → top-K L3a rules relevant to this subgoal (gotchas)
 
-render_task_start_block / render_subgoal_transition_block produce
-natural-language prompt blocks (NO L1/L2/L3 labels — model doesn't know
-that taxonomy; we describe what each block IS in plain English).
+The render_* blocks use plain-English prose, no L1/L2/L3 labels (the
+model doesn't know that taxonomy).
 
-Env switch: callers wrap via get_memory_retriever() which checks
-``MEMORY_BANK_VERSION``; default ``v2`` (existing pipeline), set
-``MEMORY_BANK_VERSION=v3`` to use this multi-layer retriever.
+Env: MEMORY_BANK_VERSION selects the index bank (default v2; v3/v4 here).
 
 Run smoke test:
   PYTHONPATH=. python -m mm_agents.structagent.memory.runtime.retrieval.query_multi_layer_memory \\
@@ -45,7 +41,7 @@ from mm_agents.structagent._paths import REPO_ROOT
 
 logger = logging.getLogger(__name__)
 
-# v3 (current) or v4 (cleaned/abstracted L1+L2 + IDs). Selected by MEMORY_BANK_VERSION.
+# v3 (current) or v4 (cleaned/abstracted L1+L2 + IDs), per MEMORY_BANK_VERSION.
 _BANK_VER = os.environ.get("MEMORY_BANK_VERSION", "v2")
 INDEXES_DIR = REPO_ROOT / "results" / "unified_memory" / (
     f"_indexes_{_BANK_VER}" if _BANK_VER in ("v3", "v4") else "_indexes_v3")
@@ -56,7 +52,7 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 @dataclass
 class Hit:
     """One retrieval hit."""
-    score: float                  # cosine similarity (0..1 since unit vectors)
+    score: float                  # cosine similarity (0..1, unit vectors)
     payload: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -85,10 +81,8 @@ class _FaissHandle:
 
 # ─── Retriever ─────────────────────────────────────────────────────────────
 class MultiLayerMemoryRetriever:
-    """v3 multi-layer memory retriever.
-
-    Loads L2 / L3a-cluster / L3a-rule / L3c on init; L1 per-domain
-    indexes load lazily (most tasks touch one domain only)."""
+    """Loads L2 / L3a-cluster / L3a-rule / L3c on init; L1 per-domain
+    indexes load lazily (most tasks touch one domain)."""
 
     def __init__(self, embed_model: str = EMBED_MODEL):
         self.model = SentenceTransformer(embed_model)
@@ -259,12 +253,8 @@ class MultiLayerMemoryRetriever:
 
 # ─── Env switch ─────────────────────────────────────────────────────────────
 def get_memory_retriever():
-    """Returns the unified multi-layer memory retriever.
-
-    ``MEMORY_BANK_VERSION`` (``v3`` default / ``v4`` cleaned bank) selects
-    which ``_indexes_<ver>`` the retriever loads; the legacy v2 module-style
-    retriever has been removed.
-    """
+    """The unified multi-layer retriever. MEMORY_BANK_VERSION picks the
+    index bank; the legacy v2 module-style retriever is gone."""
     return _get_singleton_retriever()
 
 
@@ -273,8 +263,8 @@ _RETRIEVER_INSTANCE: Optional[MultiLayerMemoryRetriever] = None
 
 
 def _get_singleton_retriever() -> MultiLayerMemoryRetriever:
-    """Lazy-loaded process-wide singleton. SentenceTransformer + FAISS
-    index loads take ~3s; we pay it once per process, not per request."""
+    """Process-wide singleton. SentenceTransformer + FAISS loads take ~3s;
+    pay it once per process."""
     global _RETRIEVER_INSTANCE
     if _RETRIEVER_INSTANCE is None:
         _RETRIEVER_INSTANCE = MultiLayerMemoryRetriever()
@@ -330,9 +320,8 @@ def render_task_start(task_text: str, domain: str = "",
                          k_l3a_cluster: int = 2,
                          ) -> Tuple[str, Dict[str, Any]]:
     """Drop-in v3 replacement for ``render_for_planner_initial``.
-    Returns (rendered_block, meta) — meta shape mirrors v2 conventions
-    so ``format_log_summary`` + ``dump_memory_debug`` work for both.
-    """
+    Returns (block, meta); meta shape mirrors v2 so format_log_summary +
+    dump_memory_debug work for both."""
     if not task_text or not task_text.strip():
         return "", {"layer": "MULTILAYER_TASK_START",
                     "memory_version": "v3",
@@ -343,8 +332,7 @@ def render_task_start(task_text: str, domain: str = "",
                     "l2_hits": [], "l3a_cluster_hits": [],
                     "l3c_domain_loaded": False,
                     "n_total_hits": 0}
-    # Operator override for retrieval depth (MEMORY_TOP_K env). When
-    # set, replaces the default k for the primary layer (L2 here).
+    # MEMORY_TOP_K override: replaces the primary-layer default k (L2 here).
     _env_k = os.environ.get("MEMORY_TOP_K", "").strip()
     if _env_k:
         try:
@@ -441,8 +429,7 @@ def render_subgoal_transition(subgoal: str, domain: str = "",
 
 
 def format_log_summary_v3(meta: Dict[str, Any], top_k: int = 3) -> str:
-    """One-line log summary for v3 meta. Mirrors v2's format_log_summary
-    shape so callers can use either uniformly."""
+    """One-line log summary for v3 meta; mirrors v2's format_log_summary."""
     layer = meta.get("layer") or "?"
     mode = meta.get("mode") or "?"
     domain = meta.get("domain") or "-"

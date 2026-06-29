@@ -1,34 +1,19 @@
-"""Phase 2 of the (e') unified mining pipeline: embed + cluster the pooled
-UnifiedRecord corpus (internal + AgentNet + Mind2Web).
+"""Embed + cluster the pooled UnifiedRecord corpus (internal + AgentNet +
+Mind2Web). Phase 2 of the unified mining pipeline.
 
-Reads:
-  via ``loaders.pool_all_sources()``  — currently ~4725 records:
-    internal 261 + AgentNet 2450 + Mind2Web 2014
+Reads ``loaders.pool_all_sources()`` (~4725 records). Writes per-cluster
+``members.json`` + a ``_summary.json`` under ``results/unified_memory/``.
 
-Produces (under ``results/unified_memory/_clusters_v3/``):
-  cluster_NNN/members.json     # one entry per record, identified by task_hash
-  _summary.json                # cluster stats + per-source/per-domain breakdown
-                               # + per-cluster source/domain distribution
+Algorithm: all-MiniLM-L6-v2 + cosine + Agglomerative average linkage,
+distance_threshold 0.55. Embedding text is instruction ONLY — embedding
+domain/outcomes/pitfalls lets per-record idiosyncrasies (paths, cell refs,
+URLs) collapse the similarity surface; we want "book a flight on United"
+and "find a flight on Delta" to cluster together.
 
-Algorithm: same as the v2 cluster_tasks pipeline that produced the 25-40
-cluster L2 bank on the internal 262 records:
-  - sentence-transformers/all-MiniLM-L6-v2
-  - cosine + Agglomerative average linkage
-  - distance_threshold 0.55 (broad-but-coherent task clusters)
-
-Embedding text = instruction only (NO domain / outcomes / pitfalls). Same
-rationale as v2: per-record idiosyncrasies (file paths, cell refs, URLs)
-collapse the similarity surface if embedded. We want "book a flight on
-United" and "find a flight on Delta" to cluster together.
-
-Open-source packaging note (per (e')): cluster members carry both the
-SHA1[:12] ``task_hash`` (primary identifier in shipped artifacts) and
-the original ``task_id`` (kept for internal traceability — never
-overwritten). ``source_label`` is the neutral label
-(``linux_desktop_trajectories`` / ``web_navigation_trajectories``); the
-provenance-revealing ``_source_raw`` (``internal`` / ``agentnet`` /
-``mind2web``) is also kept but lives in ``raw_meta`` so downstream
-packaging can choose whether to strip it.
+Members carry both the SHA1[:12] ``task_hash`` (ship id) and original
+``task_id`` (internal trace, never overwritten). ``source_label`` is
+neutral; the provenance-revealing ``_source_raw`` lives in ``raw_meta`` so
+packaging can strip it.
 
 Run:
   PYTHONPATH=. python -m mm_agents.structagent.memory.offline.cluster.cluster_unified
@@ -62,27 +47,16 @@ logging.basicConfig(level=logging.INFO,
 OUT_BASE = REPO_ROOT / "results" / "unified_memory"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-# Threshold semantics: cosine-distance cutoff for AgglomerativeClustering.
-# SMALLER threshold = stricter = MORE, TIGHTER clusters. Names below
-# track tightness, not size — ``tight`` means the cluster is narrow,
-# ``loose`` means it admits more variance.
+# Cosine-distance cutoff for AgglomerativeClustering. SMALLER = stricter =
+# more, tighter clusters. Names track tightness, not size.
 #
-#   tight  (0.40)  → L2 plan template polish (plan-level coherence)
-#                    • split_cross_domain: per-domain cohesion is REQUIRED
-#                      for L2 plan templates (a writer "format paragraph"
-#                      plan ≠ a calc "format cell" plan), so any cluster
-#                      spanning multiple domains is broken apart.
-#                    • sub_cluster_above 30 / sub_threshold 0.25: heads
-#                      remaining after the per-domain split are re-clustered
-#                      to break "format slide *anything*" hairballs.
-#
-#   loose  (0.55)  → L3a cluster-rule / L3c domain-rule polish
-#                    • split_cross_domain: NO — cross-domain cohesion is
-#                      precisely the L3a signal we want ("insert image"
-#                      across writer/calc/impress, "open document" across
-#                      apps), keep them lumped.
-#                    • sub_cluster_above 50 / sub_threshold 0.35: only the
-#                      very largest heads (n>50) get refined.
+#   tight (0.40) → L2 plan-template polish. split_cross_domain ON:
+#     L2 needs per-domain cohesion (writer "format paragraph" ≠ calc
+#     "format cell"). sub_cluster heads to break "format slide *anything*"
+#     hairballs.
+#   loose (0.55) → L3a cluster-rule / L3c domain-rule polish.
+#     split_cross_domain OFF: cross-domain cohesion ("insert image" across
+#     writer/calc/impress) IS the L3a signal. Refine only the largest heads.
 VARIANTS = {
     "tight": {"threshold": 0.40, "out_subdir": "_clusters_v3_tight",
               "split_cross_domain": True,
@@ -99,13 +73,10 @@ def _split_cross_domain(
     groups: List[Tuple[List[int], Dict[str, Any]]],
     pool: List[UnifiedRecord],
 ) -> List[Tuple[List[int], Dict[str, Any]]]:
-    """Break apart any cluster whose members span multiple domains.
+    """Slice any cluster spanning multiple domains into per-domain pieces.
 
-    The L2 plan-template tier wants per-app cohesion (a writer "format
-    paragraph" plan ≠ a calc "format cell" plan), so cross-domain
-    clusters that survived the initial agglomerative pass get sliced by
-    domain. Each per-domain piece keeps its lineage via ``parent_cluster``
-    + ``split`` metadata so we can audit the transformation later."""
+    L2 plan templates need per-app cohesion. Each piece keeps ``split``
+    metadata for audit."""
     out: List[Tuple[List[int], Dict[str, Any]]] = []
     for g, meta in groups:
         by_dom: Dict[str, List[int]] = {}
@@ -134,14 +105,10 @@ def _recursive_split(g: List[int], dist: np.ndarray, *,
                      ) -> List[Tuple[List[int], Dict[str, Any]]]:
     """Split ``g`` agglomeratively until every sub-group has len <= cap.
 
-    On each recursion: cluster on the sub-block of the precomputed
-    distance matrix at ``threshold``. If the cluster doesn't split
-    (all members too similar at this threshold), recurse with a tighter
-    threshold. Once a sub-group is at cap or smaller, stop. At
-    depth/threshold limits, fall back to even slicing (consecutive
-    chunks of size ``cap``) to guarantee the cap holds — the slicing
-    is arbitrary but rare in practice (only when the model can't tell
-    members apart at all)."""
+    Clusters on the sub-block of the precomputed distance matrix; if a
+    threshold doesn't split (members too similar), recurse tighter. At the
+    depth/threshold limit, fall back to even slicing into ``cap``-sized
+    chunks to guarantee the cap (arbitrary, but rare)."""
     if len(g) <= cap:
         m = dict(parent_meta)
         if depth > 0:
@@ -149,7 +116,7 @@ def _recursive_split(g: List[int], dist: np.ndarray, *,
         return [(g, m)]
 
     if depth >= _SUB_MAX_DEPTH or threshold < _SUB_MIN_THRESHOLD:
-        # Hard fallback: even chunks. Mark so we can audit.
+        # Hard fallback: even chunks, marked for audit.
         out: List[Tuple[List[int], Dict[str, Any]]] = []
         for i in range(0, len(g), cap):
             m = dict(parent_meta)
@@ -195,11 +162,8 @@ def _sub_cluster_heads(
     dist: np.ndarray,
     *, above: int, threshold: float,
 ) -> List[Tuple[List[int], Dict[str, Any]]]:
-    """Recursively split any cluster with > ``above`` members until ALL
-    pieces have at most ``above`` members. Initial cluster pass on the
-    sub-block of the precomputed distance matrix at ``threshold``; if a
-    split fails to bring sizes below cap, recurse with progressively
-    tighter thresholds. Hard cap is guaranteed."""
+    """Split any cluster with > ``above`` members until all pieces fit the
+    cap. See ``_recursive_split`` — cap is guaranteed."""
     out: List[Tuple[List[int], Dict[str, Any]]] = []
     for g, meta in groups:
         out.extend(_recursive_split(g, dist,
@@ -214,21 +178,14 @@ def _sub_cluster_heads(
 def build_embed_text(rec: UnifiedRecord) -> str:
     """Instruction only — no domain prefix.
 
-    Earlier experiment used ``[{domain}] {instruction}`` to enforce
-    per-app cohesion, but it backfired: ``[libreoffice_impress]`` as a
-    fixed prefix dominated MiniLM's first attention positions, so every
-    impress task was pulled close to every other impress task regardless
-    of plan, producing 332-member "format impress" hairballs at the head
-    while leaving tail tasks stranded as singletons. Without the prefix,
-    instructions like "Create a bar chart …" can cluster with cross-app
-    chart-creation tasks, "Format the page background …" can find its
-    real plan-shape neighbors, etc. The domain field is still preserved
-    on each UnifiedRecord (and surfaced per-cluster as a distribution
-    statistic) — we just don't make MiniLM see it.
+    A ``[{domain}]`` prefix backfired: as a fixed leading token it
+    dominated MiniLM's attention, pulling every impress task together into
+    332-member "format impress" hairballs while stranding the tail as
+    singletons. Without it, "Create a bar chart …" can cluster cross-app.
+    Domain is still kept per-record and surfaced as a cluster distribution.
 
-    ``instruction`` is the rich ``natural_language_task`` for AgentNet
-    (after patch), the original query for Mind2Web, and the OSWorld
-    task instruction for Internal."""
+    ``instruction`` = ``natural_language_task`` (AgentNet, post-patch),
+    original query (Mind2Web), or task instruction (Internal)."""
     return (rec.instruction or "")[:1500]
 
 
@@ -287,8 +244,8 @@ def main() -> None:
     n = len(pool)
     logger.info(f"  pool size: {n}")
 
-    # Drop records with empty instruction — they would all collapse together
-    # under the encoder and pollute every cluster they fall into.
+    # Drop empty-instruction records — they collapse together and pollute
+    # whatever cluster they land in.
     pool = [r for r in pool if (r.instruction or "").strip()]
     dropped = n - len(pool)
     if dropped:

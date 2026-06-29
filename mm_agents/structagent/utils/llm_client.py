@@ -1,12 +1,9 @@
-"""LLM client mixin: vLLM + DashScope dispatch + system-prompt composition.
+"""LLM client mixin folded into StructAgent: vLLM + DashScope dispatch and
+system-prompt composition.
 
-Provides three methods folded into StructAgent:
   call_llm(payload, model)            — DashScope / vLLM dispatch
   _call_llm_vllm(payload)             — vLLM (or OpenRouter-via-vLLM) backend
-  _compose_system_prompt(base, role)  — append runtime debug patches
-
-All three preserve the original ``self.X`` access patterns; nothing was
-re-shaped semantically.
+  _compose_system_prompt(base, role)  — prepend the OSWorld env block
 """
 
 import logging
@@ -32,10 +29,8 @@ _logger = logging.getLogger("desktopenv.qwen25vl_agent_planner")
 
 
 class LLMClient:
-    """LLM dispatch + system-prompt composition. Folded into ``StructAgent``
-    via inheritance — methods access ``self.model`` / ``self.max_tokens`` /
-    etc on the composed instance.
-    """
+    """LLM dispatch + system-prompt composition, mixed into ``StructAgent``;
+    methods read ``self.model`` / ``self.max_tokens`` / etc on the instance."""
 
     @backoff.on_exception(
         backoff.constant,
@@ -86,31 +81,25 @@ class LLMClient:
         return ""
 
     def _call_llm_vllm(self, payload):
-        """Call LLM via vLLM backend (same logic as agent.py / qwen3vl_agent.py)."""
+        """vLLM backend (same logic as agent.py / qwen3vl_agent.py)."""
         model_key = payload["model"].split("_")[-1]
         model_name_, server_url = ME.resolve(model_key)
         api_key = os.environ.get("OPENROUTER_API_KEY") or "EMPTY"
         _logger.info("Generating content with vLLM model: %s (server: %s)", payload["model"], server_url)
         client = openai.OpenAI(base_url=server_url, api_key=api_key)
-        # Qwen3.5-VL thinking mode toggle. Default OFF (clean structured
-        # output, lower latency). Enable via env QWEN35_THINKING=1; when
-        # enabled, also bump max_tokens up to QWEN35_THINKING_MAX_TOKENS
-        # (default 15000) so the <think> block has headroom before the
-        # actual answer is generated.
+        # Thinking-mode toggle, default OFF (clean structured output, lower
+        # latency). Enabling bumps max_tokens to give the <think> block headroom.
         extra_kwargs: Dict[str, Any] = {}
         max_tokens_override = payload.get("max_tokens", self.max_tokens)
-        # Both qwen35-vl (local vLLM :8001) and qwen35-27b (local vLLM :8002,
-        # serve_qwen35_27b.sh) share the QWEN35_THINKING env var — both Qwen 3.5
-        # family. The thinking wire format differs by backend: OpenRouter expects
-        # `reasoning.enabled`, vLLM expects `chat_template_kwargs.enable_thinking`.
-        # We branch on server_url (not model_key), so a future OpenRouter-hosted
-        # qwen35-* still gets the right format from its alias entry above.
+        # qwen35-vl and qwen35-27b share QWEN35_THINKING (both Qwen 3.5). Wire
+        # format differs by backend: OpenRouter wants `reasoning.enabled`, vLLM
+        # wants `chat_template_kwargs.enable_thinking`. Branch on server_url (not
+        # model_key) so a future OpenRouter-hosted qwen35-* gets the right format.
         if model_key == "qwen3.7-plus":
-            # qwen3.7-plus (OpenRouter): thinking ON by default for best quality.
-            # Reasoning comes back in a SEPARATE `reasoning` field, so `content`
-            # stays clean. Bump max_tokens to a high floor so the reasoning trace
-            # + final answer never get truncated (response completeness). Turn off
-            # with QWEN37_THINKING=0; raise the floor with QWEN37_THINKING_MAX_TOKENS.
+            # qwen3.7-plus (OpenRouter): thinking ON by default. Reasoning comes
+            # back in a separate `reasoning` field so `content` stays clean. High
+            # max_tokens floor avoids truncating reasoning + answer. Off via
+            # QWEN37_THINKING=0; floor via QWEN37_THINKING_MAX_TOKENS.
             thinking_on = os.environ.get("QWEN37_THINKING", "1").strip().lower() in ("1", "true", "yes", "on")
             extra_kwargs["extra_body"] = {"reasoning": {"enabled": thinking_on}}
             if thinking_on:
@@ -121,11 +110,10 @@ class LLMClient:
                 if max_tokens_override < floor:
                     max_tokens_override = floor
         elif model_key in ("qwen35-vl", "qwen35-27b"):
-            # ``force_thinking`` on the payload overrides the global switch —
-            # the feasibility judge (attribution/feasibility_verdict.py) needs
-            # Qwen-3.5 thinking ON regardless of QWEN35_THINKING (validated:
-            # thinking-off 误伤's). No-op for non-Qwen-3.5 models (this branch
-            # is skipped). See memory ``project-ca-infeasible-design``.
+            # payload ``force_thinking`` overrides the global switch: the
+            # feasibility judge (attribution/feasibility_verdict.py) needs Qwen-3.5
+            # thinking ON regardless of QWEN35_THINKING (validated — thinking-off
+            # gives false negatives). See memory ``project-ca-infeasible-design``.
             thinking_on = bool(payload.get("force_thinking")) or \
                 os.environ.get("QWEN35_THINKING", "").strip().lower() in ("1", "true", "yes", "on")
             if "openrouter.ai" in server_url:
@@ -139,14 +127,13 @@ class LLMClient:
                     floor = 15000
                 if max_tokens_override < floor:
                     max_tokens_override = floor
-        # OpenRouter's Cloudflare provider silently truncates long completions on
-        # Qwen coder models; route around it.
+        # OpenRouter's Cloudflare provider silently truncates long Qwen-coder
+        # completions; route around it.
         if "openrouter.ai" in server_url:
             eb = extra_kwargs.setdefault("extra_body", {})
-            # Some OpenRouter models serve VISION on only specific providers;
-            # default routing lands on text-only providers that silently drop the
-            # image (empty/garbled completion). Lock each to a provider verified
-            # to serve its vision endpoint with accurate grounding coords.
+            # Some models serve vision on only specific providers; default routing
+            # lands on text-only ones that silently drop the image. Pin each to a
+            # provider verified to serve vision with accurate grounding coords.
             _VISION_PROVIDER = {
                 "kimi-k2.6": "SiliconFlow",
                 "qwen3.5-397b-a17b": "Alibaba",
@@ -166,17 +153,10 @@ class LLMClient:
         return response.choices[0].message.content or ""
 
     def _compose_system_prompt(self, base: str, role: str = "planner") -> str:
-        """Append any runtime prompt patches (set by the online debug loop)
-        to the given base system prompt. Returns ``base`` unchanged when no
-        patch is active.
+        """Prepend the constant OSWorld env block to ``base``.
 
-        Args:
-            base: the hard-coded system prompt for this call site
-            role: which agent role this prompt is for — "planner" / "actor".
-                Patches target planner/actor independently so an
-                actor-level hard_override doesn't leak into planner context
-                and a planner-level strategic guidance doesn't confuse the
-                actor's tool calling.
+        ``role`` (planner/actor) scopes prompt patches so they target one role
+        independently.
         """
         osworld_block = (
             "OSWorld VM environment (constant across all tasks):\n"

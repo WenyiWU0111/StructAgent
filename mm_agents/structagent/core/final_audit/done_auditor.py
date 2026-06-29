@@ -1,14 +1,10 @@
 """Done-Auditor LLM call + VERDICT parser + top-level audit_done.
 
-Used by both:
-
-  - ``tests/replay_done_audit.py`` (offline replay, Phase A validation)
-  - ``agent._pa_predict`` DONE-acceptance hook (runtime, Phase B)
-
-Both paths build a ``DoneAuditSnapshot`` (see ``snapshot.py``) and then
-call ``audit_done(snapshot)``. Runtime calls use the agent's configured
-``done_auditor_model`` and the shared causal-agent ``LLMClient`` routing,
-so auditor endpoints cannot drift from the main model dispatch table.
+Used by ``tests/replay_done_audit.py`` (offline replay) and
+``agent._pa_predict``'s DONE-acceptance hook (runtime). Both build a
+``DoneAuditSnapshot`` and call ``audit_done``. Runtime uses the agent's
+``done_auditor_model`` over the shared ``LLMClient`` routing, so auditor
+endpoints can't drift from the main dispatch table.
 """
 from __future__ import annotations
 
@@ -25,10 +21,8 @@ from mm_agents.structagent.utils.llm_client import LLMClient
 Verdict = Literal["PASS", "FAIL", "PARTIAL"]
 
 
-# Verdict parser — match the LAST 'VERDICT: <X>' line in the response.
-# Matches at line start, optional whitespace; ignores inline mentions.
-# If multiple matches, last one wins (handles "I almost decided FAIL,
-# reconsidered to PARTIAL" reasoning chains).
+# Match 'VERDICT: <X>' at line start (ignores inline mentions). Last match
+# wins, handling "almost FAIL, reconsidered to PARTIAL" reasoning chains.
 _VERDICT_RE = re.compile(
     r"^\s*VERDICT:\s*(PASS|FAIL|PARTIAL)\b",
     re.IGNORECASE | re.MULTILINE,
@@ -36,12 +30,10 @@ _VERDICT_RE = re.compile(
 
 
 def parse_verdict(text: str) -> Optional[Verdict]:
-    """Return the LAST VERDICT line in ``text``, or None if absent.
+    """Return the LAST VERDICT in ``text``, or None if absent.
 
-    None means the parser found nothing — callers should treat as
-    PARTIAL (conservative refusal). The distinction "no verdict" vs
-    "explicit PARTIAL" is preserved so batch metrics can flag
-    parser-fail runs separately.
+    None (parser found nothing) should be treated as PARTIAL by callers; it's
+    kept distinct from explicit PARTIAL so batch metrics can flag parser-fails.
     """
     if not text:
         return None
@@ -52,11 +44,10 @@ def parse_verdict(text: str) -> Optional[Verdict]:
 
 
 class _StandaloneAuditorClient(LLMClient):
-    """Small adapter for offline replay.
+    """Adapter for offline replay (no agent instance).
 
-    Live runtime calls pass through ``agent.call_llm`` directly. Offline
-    replay has no agent instance, so this adapter supplies the attributes
-    expected by ``LLMClient`` while still using the same central routing table.
+    Runtime calls go through ``agent.call_llm`` directly; this supplies the
+    attributes ``LLMClient`` expects while using the same routing table.
     """
 
     def __init__(self, *, max_tokens: int, temperature: float, top_p: float):
@@ -74,13 +65,11 @@ def call_auditor_llm(
     timeout_s: float = 120.0,
     model_alias: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Call the auditor LLM via the shared causal-agent LLM client.
+    """Call the auditor LLM via the shared LLM client.
 
-    Returns ``(response_text, meta)``. ``meta`` includes elapsed_s,
-    model, and route_source. ``temperature=0.0`` so the same snapshot
-    always produces the same verdict — we want deterministic behavior
-    for offline replay AND repeatable A/B vs the structured verifier
-    in production.
+    Returns ``(response_text, meta)`` (meta: elapsed_s, model, route_source).
+    ``temperature=0.0`` so a snapshot always yields the same verdict —
+    deterministic for offline replay and repeatable for A/B in production.
     """
     model = model_alias or "vllm_qwen35-vl"
     client = _StandaloneAuditorClient(
@@ -113,11 +102,9 @@ def call_auditor_llm(
 class AuditResult:
     """Result of one audit call.
 
-    ``verdict`` is None when the LLM responded but the parser couldn't
-    find a VERDICT line. ``error`` is non-None on transport errors
-    (network, timeout, OpenAI-compatible backend exception). Runtime
-    callers should treat errors and parser failures as unavailable, not
-    as task refutations.
+    ``verdict`` is None when the LLM responded but no VERDICT line parsed.
+    ``error`` is set on transport errors (network, timeout, backend exception).
+    Treat both as "auditor unavailable", not as task refutations.
     """
 
     verdict: Optional[Verdict]
@@ -127,11 +114,10 @@ class AuditResult:
 
 
 def run_audit(snap: DoneAuditSnapshot, model_alias: Optional[str] = None) -> AuditResult:
-    """End-to-end: build messages, call LLM, parse verdict.
+    """Build messages, call LLM, parse verdict.
 
-    Best-effort: any LLM-level error is returned in ``error`` rather
-    than raising — the agent loop's DONE site must not crash on a
-    transient auditor failure.
+    Any LLM error is returned in ``error`` rather than raised — the DONE site
+    must not crash on a transient auditor failure.
     """
     msgs = build_chat_messages(snap)
     try:
@@ -157,15 +143,10 @@ def run_audit(snap: DoneAuditSnapshot, model_alias: Optional[str] = None) -> Aud
 def audit_done(agent: Any) -> Tuple[Verdict, str, AuditResult]:
     """Run the auditor at the agent's current DONE attempt.
 
-    Builds the snapshot from live agent state, calls the LLM, returns
-    ``(verdict, reason, full_result)`` where ``verdict`` is always one
-    of PASS/FAIL/PARTIAL (errors and parser-fails map to PARTIAL —
-    conservative uncertainty). ``reason`` is a short summary suitable for
-    staging into ``self._force_replan_reason``.
-
-    The ``full_result`` includes the auditor's reasoning + LLM meta;
-    callers should persist it to ``<results_dir>/audit_debug/`` for
-    offline triage.
+    Returns ``(verdict, reason, full_result)``. verdict is always
+    PASS/FAIL/PARTIAL (errors and parser-fails → PARTIAL). reason is a short
+    summary for ``self._force_replan_reason``. Persist full_result to
+    ``<results_dir>/audit_debug/`` for offline triage.
     """
     from mm_agents.structagent.core.final_audit.snapshot import (
         build_snapshot_from_live_state,
@@ -220,27 +201,22 @@ def audit_done(agent: Any) -> Tuple[Verdict, str, AuditResult]:
     if verdict == "PASS":
         return verdict, "done audit accepted DONE", result
 
-    # FAIL or PARTIAL — extract a one-line "reason" by grabbing the
-    # GAP ANALYSIS or last non-VERDICT line of the response. The full
-    # reasoning is in ``result.response_text``.
+    # FAIL/PARTIAL — one-line reason from GAP ANALYSIS or the last non-VERDICT
+    # line; full reasoning stays in ``result.response_text``.
     reason = _summarize_reason(result.response_text, verdict)
     return verdict, reason, result
 
 
-# Match the GAP ANALYSIS header WITH the trailing colon so the iterator
-# below starts at the next line. Without ``:?`` the regex stops at the
-# letter ``S`` and the next "line" is just ``:``, which then becomes the
-# extracted reason — yielding logs like ``done audit FAIL: :`` and
-# hiding the real auditor message.
+# Match the GAP ANALYSIS header WITH its trailing colon (``:?``), so iteration
+# starts on the next line. Without it the regex stops at ``S`` and the lone
+# ``:`` becomes the reason — logs like ``done audit FAIL: :`` hiding the real
+# message.
 _GAP_HEADER_RE = re.compile(r"(?im)^\s*GAP ANALYSIS\s*:?")
 
 
 def _summarize_reason(text: str, verdict: Verdict) -> str:
-    """Extract a 1-line gap summary from the auditor response.
-
-    Strategy: prefer the first non-empty bullet under GAP ANALYSIS.
-    Fallback: the last non-VERDICT line of the response.
-    """
+    """Extract a 1-line gap summary: first non-empty bullet under GAP ANALYSIS,
+    else the last non-VERDICT line."""
     if not text:
         return f"done audit returned {verdict} with empty response"
 
@@ -249,9 +225,8 @@ def _summarize_reason(text: str, verdict: Verdict) -> str:
         tail = text[m.end():]
         for line in tail.splitlines():
             stripped = line.strip().lstrip("-* ").strip()
-            # Skip empties + punctuation-only residue (e.g. a lone ``:``
-            # left over when the GAP-ANALYSIS header was split across
-            # lines, or a bullet that's literally a separator).
+            # Skip empties + punctuation-only residue (lone ``:`` from a split
+            # header, or a separator bullet).
             if not stripped or all(c in ":-*. " for c in stripped):
                 continue
             if stripped.startswith("VERDICT:"):

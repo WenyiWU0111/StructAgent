@@ -1,65 +1,35 @@
 """Helpers for the ``cli_run`` actor action.
 
-Used by the decomposer when the subgoal is best handled by a one-shot
-shell command — typical cases:
+Used when a subgoal is best handled by a one-shot shell command: launch a
+GUI app on a path (``code <dir>``, ``xdg-open <file>``), line-level ``sed -i``
+edits (non-JSON; for JSON prefer ``edit_json``), arbitrary in-VM file
+mutations edit_json can't express, and process/system commands a task wants
+run "from the command line" (kill, git, pip, gsettings, …).
 
-  * launch a GUI app on a path: ``code /home/user/project``,
-    ``firefox <url>``, ``xdg-open <file>``;
-  * line-level text edits via ``sed -i`` (when the target is NOT a
-    JSON config — for JSON, prefer ``edit_json``);
-  * arbitrary in-VM file mutations the existing dict/list ``edit_json``
-    ops can't express;
-  * process / system commands a task asks for "from the command line"
-    (kill, git, pip, gsettings, …).
+Wire format (AST-parsed upstream, like edit_json):
 
-The action wire format mirrors edit_json — a function-call string the
-upstream AST parser can read:
+    cli_run(command='<bash one-liner>', background=<bool>, wait_seconds=<int>)
 
-    cli_run(command='<bash one-liner>',
-            background=<bool>,
-            wait_seconds=<int>)
+Runtime is TERMINAL-AWARE. If an on-screen terminal window is open the
+command is run inside it (visible on-screen, recorded in ~/.bash_history —
+many evaluators grep the history to confirm work was "done from the
+terminal"). Otherwise it falls back to a detached ``/bin/bash -lc``
+subprocess: fast, but invisible to the screen and to history. Either way the
+result lands in ``/tmp/_last_cli_run.json`` for the planner. background=True
+returns immediately (GUI-launch case).
 
-Runtime behaviour — TERMINAL-AWARE (executed on the VM):
+Framework-internal probes (init_ledger probe, lsof, ops-lib upload, verify
+scripts) bypass this helper and call run_python_script / run_bash_script
+directly. Only the actor's cli_run is terminal-routed.
 
-  The generated script first looks for an on-screen terminal window
-  (``xdotool search --class terminal``).
-
-  * **A terminal IS open** → the command is TYPED INTO that terminal
-    like a real user (``xdotool type`` + Return). This is the correct
-    behaviour for ``[multi_apps]`` / ``os`` tasks: the command then
-    (a) runs in the interactive shell the user is looking at, (b) is
-    recorded in ``~/.bash_history`` — many task evaluators check the
-    history to confirm the work was "done from the terminal", and
-    (c) its output is on-screen so the perceiver can read it.
-    For foreground commands the typed line wraps the command with an
-    output+returncode capture (``> /tmp/_clirun_<tok>.out`` …) so the
-    result is still persisted to ``/tmp/_last_cli_run.json`` for the
-    planner; the script polls the returncode sentinel for completion.
-
-  * **No terminal open** → falls back to the legacy detached
-    subprocess (``/bin/bash -lc``): fast, but invisible to the screen
-    and to ``~/.bash_history``.
-
-  ``background=True`` launches and returns immediately (GUI-app launch
-  case) — in a terminal it types ``<cmd> &``; without one it
-  ``Popen``-detaches.
-
-Note: framework-internal probes (init_ledger environment probe, lsof,
-ops-lib upload, structured verify scripts) do NOT go through this
-helper — they call ``run_python_script`` / ``run_bash_script``
-directly and stay invisible/fast. Only the actor's ``cli_run`` action
-is terminal-routed.
-
-Safety: this is the OSWorld VM, throwaway per task; we accept
-arbitrary bash commands. The agent decides what to run, not us.
+Safety: throwaway per-task OSWorld VM — arbitrary bash is accepted by design.
 """
 from __future__ import annotations
 import json
 
 
-# Static body of the generated VM script. The per-call header (defining
-# ``_cmd`` / ``_bg`` / ``_wait``) is prepended by build_runtime_script;
-# keeping the body brace-free avoids f-string escaping.
+# Static body of the generated VM script. build_runtime_script prepends the
+# per-call header (_cmd / _bg / _wait); kept f-string-free to avoid escaping.
 _RUNTIME_BODY = r'''
 import subprocess, time, json, os, shlex
 
@@ -248,19 +218,17 @@ def build_runtime_script(
     background: bool = False,
     wait_seconds: int = 1,
 ) -> str:
-    """Build the Python script the VM will execute for a ``cli_run``.
+    """Build the self-contained Python script the VM runs for a ``cli_run``.
 
-    The script is self-contained. It routes the command into an
-    on-screen terminal when one is open (visible + recorded in
-    ``~/.bash_history``), and falls back to a detached subprocess
-    otherwise. Either way it persists the result to
-    ``/tmp/_last_cli_run.json`` and prints a one-line status.
+    Routes into an on-screen terminal when one is open (visible + recorded in
+    ~/.bash_history), else a detached subprocess. Persists the result to
+    /tmp/_last_cli_run.json and prints a one-line status.
     """
     if not isinstance(command, str) or not command.strip():
         raise ValueError("cli_run requires a non-empty `command` string")
     if not isinstance(wait_seconds, int) or wait_seconds < 0:
         wait_seconds = 1
-    wait_seconds = min(wait_seconds, 30)  # hard cap
+    wait_seconds = min(wait_seconds, 30)  # cap
     header = (
         "_cmd = " + json.dumps(command) + "\n"
         "_bg = " + ("True" if background else "False") + "\n"

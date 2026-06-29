@@ -1,22 +1,12 @@
-"""DocPerceiver — framework-level structural probe for libreoffice_writer
-tasks running the UNO Bridge route.
+"""DocPerceiver — structural probe for libreoffice_writer tasks on the UNO route.
 
-Mirrors the role of the GUI Perceiver but on the DOCUMENT MODEL side:
-the GUI perceiver tells the planner "what's on screen", DocPerceiver
-tells it "what's in the doc" — paragraph list with content-index, style,
-font/size/color/alignment/spacing, comma_count, and a text snippet, plus
-the table list and view-cursor position.
+Document-model counterpart to the GUI Perceiver: tells the planner "what's in
+the doc" (paragraphs with content-index/style/font/color/alignment/spacing/
+comma_count/snippet, plus tables and view-cursor position).
 
-Triggered automatically by the planner agent:
-  - TASK START: before the first planner call.
-  - AFTER MUTATION: after every cli_run_uno action that completed.
-
-Runs via ``env.controller.run_python_script`` — a synchronous server-side
-Python call against the OSWorld VM. The probe is read-only (no
-``doc.store()``), so it cannot corrupt the document.
-
-Output is a compact text block injected into the planner prompt
-alongside the existing UNO snippet retrieval block.
+Fires at task start and after every completed cli_run_uno mutation. Runs via
+``env.controller.run_python_script`` against the OSWorld VM; read-only (no
+``doc.store()``). Output is a compact text block for the planner prompt.
 """
 from __future__ import annotations
 import json
@@ -28,10 +18,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------- #
 # UNO probe script (runs in the VM via run_python_script)
 # ---------------------------------------------------------------------- #
-# Reads the LIVE LibreOffice document via the UNO socket and prints a
-# JSON blob between ``===DOC_INSPECT_BEGIN===`` / ``===DOC_INSPECT_END===``
-# sentinels. Read-only: walks paragraphs (body + text frames) and tables,
-# emits per-paragraph attribute records.
+# Reads the live LibreOffice doc via the UNO socket and prints a JSON blob
+# between ``===DOC_INSPECT_BEGIN===`` / ``===DOC_INSPECT_END===`` sentinels.
+# Read-only: walks paragraphs (body + text frames) and tables.
 #
 # Output schema (JSON):
 #   {
@@ -230,8 +219,8 @@ print(_END)
 # Agent-side parser + collapser
 # ---------------------------------------------------------------------- #
 
-# Per-paragraph fingerprint for collapse-eligibility. Length / text are
-# EXCLUDED (they vary even within a coherent block).
+# Per-paragraph fingerprint for collapse-eligibility. Length/text excluded
+# (they vary even within a coherent block).
 def _fingerprint(p: Dict[str, Any]) -> Tuple:
     return (
         p.get("style"),
@@ -240,7 +229,7 @@ def _fingerprint(p: Dict[str, Any]) -> Tuple:
         round(p["font_size"], 1) if p.get("font_size") else None,
         p.get("color"),
         p.get("para_adjust"),
-        # Bucket line height to 5/100 so 100 vs 100 line up but 100/150 differ
+        # bucket line height to 5/100mm so 100/100 align but 100/150 differ
         (p["line_height"] // 5 * 5) if p.get("line_height") else None,
         p.get("line_mode"),
         bool(p.get("bold")),
@@ -274,8 +263,8 @@ def _snippet(p: Dict[str, Any], n: int = 60) -> str:
 
 
 def _render_paragraphs(paragraphs: List[Dict[str, Any]]) -> List[str]:
-    """Walk + collapse: blank runs → ``(×K blank)``; same-fingerprint
-    consecutive non-blank → range header + indented text list."""
+    """Collapse blank runs to ``(×K blank)`` and consecutive same-fingerprint
+    paragraphs to a range header + indented text list."""
     lines: List[str] = []
     i = 0
     body = [p for p in paragraphs if "frame_idx" not in p]
@@ -330,9 +319,8 @@ def _render_paragraphs(paragraphs: List[Dict[str, Any]]) -> List[str]:
 
 
 def _emu_to_inch(emu: Optional[int]) -> float:
-    """1 inch = 2540 (1/100 mm). The UNO Width/Height are in 1/100 mm,
-    not EMU — this naming is for backward compat; the conversion is
-    /2540 not /914400."""
+    """UNO Width/Height are 1/100 mm, not EMU (the name is legacy): 1 inch =
+    2540, so divide by 2540, not 914400."""
     if emu is None: return 0.0
     return emu / 2540.0
 
@@ -398,24 +386,16 @@ def _dump_artifacts(results_dir: Optional[str], step_idx: Optional[int],
                     block: Optional[str],
                     logger: Optional[logging.Logger]) -> None:
     """Persist per-step probe I/O under
-    ``<results_dir>/doc_perceiver/step_NNN_inspect_{raw,parsed,rendered}.*``.
-
-    Three files per probe so debugging can trace each stage:
-      - ``*_raw.txt``      — the entire stdout from run_python_script,
-                             including any non-sentinel chatter
-      - ``*_parsed.json``  — the JSON record extracted from between the
-                             sentinels (pretty-printed)
-      - ``*_rendered.txt`` — the final text block injected into the
-                             planner prompt
-
-    Graceful-fail: any error logs and returns, no raise."""
+    ``<results_dir>/doc_perceiver/step_NNN_inspect_{raw,parsed,rendered}.*``
+    (raw stdout / extracted JSON / rendered planner block) for offline
+    debugging. Any error logs and returns; never raises."""
     if not results_dir:
         return
     try:
         out_dir = os.path.join(results_dir, "doc_perceiver")
         os.makedirs(out_dir, exist_ok=True)
         prefix = f"step_{(step_idx + 1):03d}" if step_idx is not None else "step_xxx"
-        # raw stdout — always dump (helps diagnose probe-script crashes)
+        # always dump raw stdout (diagnoses probe-script crashes)
         with open(os.path.join(out_dir, f"{prefix}_inspect_raw.txt"),
                   "w", encoding="utf-8") as f:
             f.write(raw_stdout or "")
@@ -434,12 +414,11 @@ def _dump_artifacts(results_dir: Optional[str], step_idx: Optional[int],
 
 def _attempt_inspect(env, logger: Optional[logging.Logger]
                      ) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """Single try: run the script in the VM, return (raw_stdout, parsed_or_None).
+    """One probe attempt: run the script in the VM, return (raw_stdout, parsed).
 
-    parsed_or_None is None if the response can't even be parsed (no
-    sentinel / bad JSON). When parsed_or_None has an ``"error"`` key
-    it means the script ran but the UNO connect inside it failed —
-    typical at task start before LibreOffice has bound to port 2002.
+    parsed is None when the response can't be parsed (no sentinel / bad JSON).
+    A parsed dict with an ``"error"`` key means the script ran but its UNO
+    connect failed — typical at task start before LO has bound port 2002.
     """
     try:
         resp = env.controller.run_python_script(INSPECT_SCRIPT)
@@ -467,18 +446,15 @@ def run_inspect(env, logger: Optional[logging.Logger] = None,
                 step_idx: Optional[int] = None,
                 max_retries: int = 5,
                 retry_sleep_seconds: float = 2.0) -> Optional[str]:
-    """Execute the UNO probe in the VM, parse stdout, return a planner-ready
-    text block (or None on failure).
+    """Run the UNO probe in the VM and return a planner-ready text block, or
+    None on failure.
 
-    Retries on transient UNO connect failures: at task start LibreOffice
-    is still binding its UNO listener on port 2002, so the first probe
-    typically gets "Connection refused". We retry up to ``max_retries``
-    times with a short sleep between attempts; persistent failures
-    return None (the planner sees no DOCUMENT STRUCTURE block, which is
-    less misleading than a "probe failed" block).
+    Retries transient UNO connect failures: at task start LO is still binding
+    port 2002, so the first probe usually gets "Connection refused". On
+    persistent failure returns None (no DOCUMENT STRUCTURE block — less
+    misleading to the planner than a "probe failed" block).
 
-    If ``results_dir`` is set, persists raw stdout / parsed JSON /
-    rendered block under ``<results_dir>/doc_perceiver/step_NNN_*``.
+    With ``results_dir`` set, persists per-step artifacts (see _dump_artifacts).
     """
     if env is None or not hasattr(env, "controller"):
         if logger: logger.info("[DocPerceiver] env.controller unavailable")
@@ -489,7 +465,7 @@ def run_inspect(env, logger: Optional[logging.Logger] = None,
     for attempt in range(max_retries):
         raw, parsed = _attempt_inspect(env, logger)
         last_raw, last_parsed = raw, parsed
-        # Success path: parsed JSON AND no "error" key.
+        # Success: parsed JSON with no "error" key.
         if parsed is not None and "error" not in parsed:
             block = render_block(parsed)
             npara = len(parsed.get("paragraphs") or [])
@@ -502,8 +478,7 @@ def run_inspect(env, logger: Optional[logging.Logger] = None,
                 )
             _dump_artifacts(results_dir, step_idx, raw, parsed, block, logger)
             return block
-        # Retry-eligible: UNO connect refused (LO still starting), no
-        # sentinel (probe script aborted partway), or JSON parse failed.
+        # Retry-eligible: connect refused, missing sentinel, or JSON parse fail.
         err_msg = None
         if parsed is not None and "error" in parsed:
             err_msg = parsed["error"]
@@ -521,18 +496,15 @@ def run_inspect(env, logger: Optional[logging.Logger] = None,
             except Exception:
                 pass
 
-    # Exhausted all retries — dump whatever we got last for offline
-    # inspection, return None so the planner is told "no doc structure"
-    # instead of "probe failed".
+    # Retries exhausted — dump the last attempt and return None ("no doc
+    # structure" rather than "probe failed").
     if logger:
         logger.info("[DocPerceiver] probe gave up after %d attempts", max_retries)
     _dump_artifacts(results_dir, step_idx, last_raw, last_parsed, None, logger)
     return None
 
 
-# Domains that benefit from the doc-side probe. Currently only writer —
-# calc / impress have their own data models (sheets / slides) that
-# would need a different probe.
+# Writer only; calc/impress have their own data models needing a different probe.
 _DOMAINS_WITH_DOC_PROBE = {"libreoffice_writer"}
 
 

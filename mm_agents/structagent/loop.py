@@ -29,13 +29,9 @@ logger = None
 
 @dataclass
 class _StepContext:
-    """Per-step input context for the planner-actor pipeline.
-
-    Populated once by ``_pa_begin_step`` (step counting, screenshot decode,
-    perception, instruction augmentation) and read by every downstream phase.
-    Planner OUTPUTS (plan / decision / parsed / last_subgoal_done) are NOT
-    stored here — they flow as explicit return values through ``_pa_predict``
-    so the per-step data pipeline stays visible at the call site.
+    """Per-step input context. Populated once by ``_pa_begin_step``, read by
+    every downstream phase. Planner outputs are NOT stored here — they flow as
+    explicit return values through ``_pa_predict`` to keep the pipeline visible.
     """
     instruction: str
     obs: dict
@@ -64,64 +60,47 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         add_thought_prefix=False,
         planner_max_images=5,
         # ---- Actor: decomposer LLM (inline grounding) ----------
-        decomposer_model=None,                # alias string; None → fall back to planner's model
-        decomposer_api_url=None,              # None → fall back to planner's own model_url
-        decomposer_system_path=None,          # path to A2 template .txt; None → built-in default
-        verifier_model=None,                  # alias string; None → fall back to the planner model.
-                                              # Splits the VERIFICATION stack (init_ledger spec authoring
-                                              # + per-step outcome checks + done-auditor) onto its own
-                                              # model knob; one of the 3 canonical models (planner /
-                                              # verifier / grounding).
-        # T3 Done-Auditor (plan Part I.2). When True, after the
-        # structured ledger gate accepts a DONE, an adversarial
-        # fresh-context LLM call re-checks the claim against the task
-        # text + raw a11y + screenshots. Only an explicit FAIL flips the
-        # acceptance to False. PARTIAL means uncertainty, not refutation.
-        # Default on via the constructor; env can also enable it in
-        # env-driven runs. Per-task budget caps spend.
+        decomposer_model=None,                # None → planner's model
+        decomposer_api_url=None,              # None → planner's model_url
+        decomposer_system_path=None,          # A2 template .txt; None → built-in default
+        verifier_model=None,                  # None → planner model. Splits the verification
+                                              # stack (init_ledger authoring + per-step checks +
+                                              # done-auditor) onto its own model knob.
+        # Done-Auditor: after the ledger gate accepts a DONE, an adversarial
+        # fresh-context LLM re-checks the claim vs task text + a11y + screenshots.
+        # Only explicit FAIL flips acceptance; PARTIAL = uncertain, not refuted.
+        # Env can also enable. Per-task budget caps spend.
         enable_done_auditor=True,
         done_auditor_model="vllm_qwen35-vl",
         done_auditor_max_per_task=10,
-        # Stuck-diagnosis injection switch. When True, the per-outcome
-        # verifier-trace render AND the framework stuck root-cause LLM
-        # output are injected as a dedicated block in the force_replan
-        # planner prompt. When False (default), neither runs and the
-        # builder injects nothing — preserves baseline e8c4db0 behaviour
-        # exactly. Opt-in via kwarg or env ``ENABLE_STUCK_DIAGNOSIS_
-        # INJECTION=1`` so CI sweeps can A/B without recompiling.
+        # Stuck-diagnosis injection: when on, the per-outcome verifier-trace +
+        # stuck root-cause LLM output go into the force_replan prompt. Off (default)
+        # = baseline e8c4db0 behaviour. Opt-in via kwarg or ENABLE_STUCK_DIAGNOSIS_INJECTION=1.
         enable_stuck_diagnosis_injection=False,
-        # NB: ``disable_specialized_executors`` was removed. All specialized
-        # executors (LO/OS/VLC/VSCode/Thunderbird/Wiki/MultiHop/MultiApp)
-        # have been deleted from the planner. Tasks now route through the
-        # planner-actor GUI path uniformly.
-        **_legacy_kwargs,                     # absorb any old kwargs (e.g.
-                                              # disable_specialized_executors)
-                                              # so existing callers don't break.
+        # disable_specialized_executors removed — all specialized executors deleted;
+        # tasks route through the planner-actor GUI path uniformly.
+        **_legacy_kwargs,                     # absorb old kwargs so callers don't break
     ):
         self.platform = platform
         self.model = model
-        # Verifier model: init_ledger spec authoring + per-step outcome verification
-        # + the done-auditor run on THIS model. Defaults to the planner model, so a
-        # single-model run is byte-identical; set it to split verification onto a
-        # separate (e.g. stronger) model without touching the planner.
+        # Verifier model: init_ledger authoring + per-step outcome checks + done-auditor.
+        # Defaults to the planner model (single-model run is byte-identical).
         self.verifier_model = verifier_model or model
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.temperature = temperature
         self.action_space = action_space
         self.observation_type = observation_type
-        self.history_n = history_n  # Control how many previous interactions to include
+        self.history_n = history_n
         self.add_thought_prefix = add_thought_prefix
         self.planner_max_images = planner_max_images
-        # Actor: decomposer LLM (inline grounding)
         self.decomposer_model = decomposer_model
         self.decomposer_api_url = decomposer_api_url
         self.decomposer_system_path = decomposer_system_path
-        # Cache for the A2 decomposer system template (lazy-loaded on first use)
-        self._decomposer_system_template: Optional[str] = None
+        self._decomposer_system_template: Optional[str] = None  # A2 template, lazy-loaded
         assert action_space in ["pyautogui"], "Invalid action space"
         assert observation_type in ["screenshot"], "Invalid observation type"
-        # — config (construction-only) + per-task state (shared with reset) —
+        # config (construction-only) + per-task state (shared with reset)
         self._init_runtime_config(
             enable_done_auditor,
             enable_stuck_diagnosis_injection, done_auditor_model,
@@ -131,56 +110,38 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
     def _init_runtime_config(self, enable_done_auditor,
                              enable_stuck_diagnosis_injection,
                              done_auditor_model, done_auditor_max_per_task):
-        """Resolve all CONSTRUCTION-time config: runtime feature flags
-        (``self.cfg`` + derived gates), fixed thresholds, and the
-        done-auditor / stuck-diagnosis knobs. Set ONCE at
-        construction — NOT re-run by reset() (config is process-stable;
-        only per-task state resets)."""
-        # memory_steps_text + osworld memory dicts removed —
-        # cross-run memory retrieval gone.
+        """Resolve all construction-time config: runtime feature flags
+        (``self.cfg`` + derived gates), thresholds, done-auditor / stuck-diagnosis
+        knobs. Set once at construction — NOT re-run by reset() (config is
+        process-stable; only per-task state resets)."""
         self.plan_update_interval: int = 1
-        # Boundary-verify (always on): verify the current subgoal's TARGET
-        # milestones when an actor burst hands control back to the planner,
-        # then render the result as planner evidence.
-        # Resolve ALL runtime feature flags ONCE, here, into self.cfg. Every
-        # other site reads self.cfg.* — no scattered os.environ or repeated
-        # from_env() in the per-step path.
+        # Resolve ALL runtime feature flags once, here, into self.cfg. Every other
+        # site reads self.cfg.* — no scattered os.environ in the per-step path.
         self.cfg = CAConfig.from_env()
         self._ACTOR_BURST_MAX_TURNS: int = max(1, self.cfg.actor_burst_max_turns)
         self._ACTOR_BURST_NO_EFFECT_LIMIT: int = max(
             1, self.cfg.actor_burst_no_effect_limit)
-        # Feed retrieved check recipes into the boundary verifier when verifier
-        # memory is enabled (this is where verifier memory now actually lands).
+        # Feed retrieved check recipes into the boundary verifier (where verifier
+        # memory now lands).
         self._verifier_memory_on: bool = self.cfg.verifier_experience_memory
-        # Threshold: after this many consecutive REPLANs without a single
-        # subgoal getting marked done, treat the task as stuck on "no-known-
-        # UI-path" and force a tactic-switching replan (dispatcher Rule #6).
+        # After this many consecutive REPLANs with no subgoal marked done, treat the
+        # task as stuck on "no-known-UI-path" and force a tactic switch (dispatcher rule #6).
         self._REPLAN_WITHOUT_PROGRESS_THRESHOLD: int = 3
-        # working memory: event timeline + per-turn KeyNode detector.
-        # `MEMORY_VERSION=v1` env var falls back to legacy summarizer-only path.
+        # working memory version; MEMORY_VERSION=v1 falls back to legacy summarizer-only.
         self._memory_version: str = self.cfg.memory_version
         if logger:
             logger.info("[Memory] version=%s", self._memory_version)
-        # Perceiver feature flag (Phase: SubgoalSnapshot — see
-        # docs/PROGRESS_LEDGER_V2_CHANGELOG.md §17). Default OFF for
-        # zero-regression risk. Toggle with env var PERCEIVER_ENABLED=1.
-        # When ON: a11y is intent-prefiltered, perceiver produces a
-        # SubgoalSnapshot, planner sees snapshot block + crop image
-        # instead of raw screenshot + raw a11y.
+        # Perceiver (PERCEIVER_ENABLED=1, default off). On: a11y is intent-prefiltered
+        # and the planner sees a SubgoalSnapshot + crop instead of raw screenshot + a11y.
+        # See docs/PROGRESS_LEDGER_V2_CHANGELOG.md §17.
         self.use_perceiver: bool = self.cfg.perceiver
-        # T3 Done-Auditor state. Constructor default is ON. The env
-        # switch is still OR'd in so CI sweeps can enable it without
-        # recompiling the kwarg list.
+        # Done-auditor; env switch OR'd in for CI sweeps.
         self.enable_done_auditor: bool = (
             bool(enable_done_auditor)
             or self.cfg.done_auditor_env
         )
-        # Stuck-diagnosis injection: gates BOTH the per-outcome
-        # verifier-trace render AND the diagnose_stuck root-cause LLM
-        # call in the force_replan path (planner.py). Default OFF →
-        # neither runs, no injection, identical to baseline behaviour.
-        # ON → both run and their output is bundled into
-        # ``verifier_feedback`` for build_prompt_force_replan to inject.
+        # Stuck-diagnosis injection: gates the verifier-trace render + diagnose_stuck
+        # LLM call in the force_replan path. Off (default) = baseline behaviour.
         self.enable_stuck_diagnosis_injection: bool = (
             bool(enable_stuck_diagnosis_injection)
             or self.cfg.stuck_diagnosis_injection_env
@@ -189,174 +150,116 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         self.done_auditor_max_per_task: int = int(done_auditor_max_per_task)
 
     def _reset_task_state(self):
-        """Initialize / clear ALL per-task mutable state. Called by BOTH
-        __init__ and reset() so the two can never drift — a fresh agent and
-        a reset agent hold byte-identical per-task state. Reads (never
+        """Initialize / clear ALL per-task mutable state. Called by both __init__
+        and reset() so a fresh agent and a reset agent never drift. Reads (never
         writes) the config attrs set by _init_runtime_config()."""
         self.thoughts = []
         self.actions = []
         self.observations = []
-        self.responses = []  # Store model responses
-        self.screenshots = []  # Store processed screenshots
-        # Planner state (plan-with-memory)
+        self.responses = []
+        self.screenshots = []
         self.current_plan: Optional[str] = None
         self.next_step_hint: Optional[str] = None
-        # Planner-actor subgoal state
         self.subgoal_queue: List[str] = []
-        # Phase-2 subgoal contract: each entry in subgoal_queue has a
-        # parallel ``expected_post_state`` string describing what the next
-        # screenshot should show after the subgoal succeeds. Populated by
-        # ``_pa_parse_plan_into_subgoals`` at plan-parse time; the
-        # planner's NEXT call reads these to judge ``done`` without a
-        # separate check. Empty strings are allowed (legacy fallback).
+        # Parallel to subgoal_queue: what the next screenshot should show after each
+        # subgoal succeeds. Set at plan-parse time; the planner's next call reads these
+        # to judge ``done`` without a separate check. Empty strings allowed (fallback).
         self.subgoal_expected_post_states: List[str] = []
         self.current_subgoal_expected_post_state: Optional[str] = None
-        # Multi-app only: per-subgoal app tag parsed from <step app="...">.
-        # Parallel to subgoal_queue. Drives _current_domain switching —
-        # the execution context follows the app the PLANNER says the
-        # current step runs in (not the verifier's focus-outcome app).
+        # Multi-app only: per-subgoal app tag from <step app="...">, parallel to
+        # subgoal_queue. Drives _current_domain switching — follows the app the PLANNER
+        # says the step runs in (not the verifier's focus-outcome app).
         self.subgoal_apps: List[Optional[str]] = []
         self.current_subgoal_app: Optional[str] = None
-        # Ledger-driven subgoal completion (C / P1). Per-subgoal list
-        # of outcome ids the step is supposed to advance to verified,
-        # parsed from <step ... targets="X,Y">. Parallel to
-        # subgoal_queue. Empty list = legacy fallback to planner's
-        # self-assessment against expected_post_state.
+        # Per-subgoal outcome ids the step should advance to verified, from
+        # <step ... targets="X,Y">. Parallel to subgoal_queue. Empty = fallback to
+        # the planner's self-assessment against expected_post_state.
         self.subgoal_targets: List[List[str]] = []
         self.current_subgoal_targets: List[str] = []
-        # Initial-file registry: {app_id: file_path} OBSERVED at task
-        # start (a wmctrl/lsof probe of the running env — see
-        # open_app.build_initial_files_probe_script). Lets open_app
-        # re-open the right file by path when called without one.
-        # Populated once at step 0; empty for single-app tasks.
+        # {app_id: file_path} observed at task start via a wmctrl/lsof env probe (NOT
+        # the task spec). Lets open_app re-open the right file by path. Step 0 only;
+        # empty for single-app tasks.
         self._initial_open_files: Dict[str, str] = {}
         self._initial_files_probed: bool = False
         self.completed_subgoals: List[str] = []
-        # Subgoals that hit MAX_SUBGOAL_STEPS without finishing and were
-        # force-replanned. Kept separately so neither the planner prompts
-        # nor the corrector treat them as "already done" and skip their
-        # re-introduction — they're failed attempts, not completions.
+        # Subgoals that hit MAX_SUBGOAL_STEPS and were force-replanned. Kept separate so
+        # prompts/corrector don't treat them as "already done" — they're failed attempts.
         self.abandoned_subgoals: List[str] = []
         self.current_subgoal: Optional[str] = None
         self.current_subgoal_step: int = 0
-        # Planner's per-turn advisory message for the actor (set when
-        # the planner emits <feedback_to_actor> on a done=NO assessment).
-        # Cleared after one actor call; does NOT mutate current_subgoal.
+        # Planner's one-turn advisory for the actor (from <feedback_to_actor> on a
+        # done=NO assessment). Cleared after one actor call; does NOT mutate current_subgoal.
         self.feedback_to_actor: Optional[str] = None
         self.current_subgoal_feedbacks: List[str] = []
         self.actor_history: List[dict] = []
         self._actor_burst_state: ActorBurstState = ActorBurstState()
         self._pending_planner_verifier_report: Optional[str] = None
         self.planner_history: List[tuple] = []
-        # One-sentence label describing WHY force_replan should fire on
-        # the NEXT turn. Set by the DONE-acceptance gate after a
-        # rejection, or by other code paths
-        # that pre-stage a known-stuck signal. Consumed by
-        # ``_decide_planner_mode_and_reason`` rule #3 (which clears it
-        # after reading) and surfaced in the force_replan prompt's
-        # <stuck_reason>.
+        # One-sentence WHY force_replan should fire next turn. Set by the DONE-acceptance
+        # gate on rejection (or other pre-staged stuck signals). Consumed + cleared by
+        # _decide_planner_mode_and_reason rule #3; surfaced in the prompt's <stuck_reason>.
         self._force_replan_reason: Optional[str] = None
-        # Parallel to ``_force_replan_reason``: a coarse category that
-        # tags WHICH stuck pattern triggered the force_replan, so the
-        # prompt builder can dispatch ONE focused plan-shape guidance
-        # instead of dumping every possible category at the planner.
-        # Values:
-        #   "actor_failure"      — actor IMPOSSIBLE / no-bash-body (rule #2)
-        #   "done_rejected"      — DONE rejected by ledger gate (rule #3)
-        #   "budget_exhausted"   — subgoal step budget burned (rule #4)
-        #   "queue_empty_no_done"— queue drained but task end-state unverified (rule #5)
-        #   "replan_cadence"     — N consecutive REPLANs within same strategy (rule #6)
-        #   None                 — no force_replan staged
-        # Cleared together with ``_force_replan_reason`` whenever the
-        # mode decision consumes the staged signal.
+        # Parallel coarse category for which stuck pattern triggered force_replan, so the
+        # prompt builder dispatches one focused guidance. Values:
+        #   actor_failure / done_rejected / budget_exhausted / queue_empty_no_done /
+        #   replan_cadence / None. Cleared with ``_force_replan_reason``.
         self._force_replan_category: Optional[str] = None
-        # Set at the END of an actor turn when the actor failed (returned
-        # IMPOSSIBLE, FAIL, or the code-actor produced no body). Read at
-        # the START of the next turn by
-        # ``_decide_planner_mode_and_reason`` rule #2 to choose
-        # mode="force_replan" with this string as the reason. Cleared
-        # after the mode decision consumes it.
+        # Set at end of an actor turn on failure (IMPOSSIBLE / FAIL / empty code body).
+        # Read next turn by _decide_planner_mode_and_reason rule #2; cleared on consume.
         self._pending_actor_failure_reason: Optional[str] = None
-        # Counters that let us detect "planner keeps self-REPLAN-ing but
-        # nothing is getting committed" — the Actor-side subgoal-step-cap
-        # never fires in that case (each REPLAN resets current_subgoal_step
-        # to 0), so we need a second stuck detector keyed on REPLAN cadence.
+        # Detects "planner self-REPLANs but nothing commits" — the actor-side step-cap
+        # can't catch it (each REPLAN resets current_subgoal_step), so key on REPLAN cadence.
         self._replans_since_last_progress: int = 0
         self._last_search_fired_at_replan: int = -99  # so the first fire passes gate
         self._total_replan_count: int = 0
-        # Fix 1 (feasibility verdict): the replan count at which we last ran
-        # the INFEASIBLE judge. -999 so the first fire at replan>=K passes the
-        # re-check cadence gate. Reset per task. See _maybe_feasibility_verdict.
+        # Replan count at the last INFEASIBLE-judge run. -999 so the first fire at
+        # replan>=K passes the re-check cadence gate. See _maybe_feasibility_verdict.
         self._last_feasibility_check_at_replan: int = -999
-        # IMPOSSIBLE handling: the actor's explicit "can't do this" must NOT be
-        # routed to actor_redo (retrying the impossible, never bumping the replan
-        # count → feasibility verdict starves). The flag makes the diagnose/router
-        # hook skip this turn (→ normal planner force_replan, count++); the
-        # consecutive count triggers an early feasibility verdict.
+        # Actor IMPOSSIBLE must NOT route to actor_redo (would retry the impossible and
+        # starve the feasibility verdict). Flag makes diagnose/router skip the turn (→
+        # normal force_replan, count++); the consecutive count triggers an early verdict.
         self._actor_emitted_impossible: bool = False
         self._consecutive_impossible_count: int = 0
-        # Read-only mirror of the above counters + the dispatcher's most
-        # recent transition receipt. Refreshed once per turn in
-        # ``_finalize_recovery_state`` (called immediately after the
-        # mode dispatcher decides). T1 scope: ``self._*`` counters
-        # remain source of truth; this is for tests + future T3
-        # done-auditor escalation reads. See plan file Part I.1.
+        # Read-only mirror of the counters + dispatcher's last transition receipt.
+        # Refreshed per turn in _finalize_recovery_state; for tests + future escalation.
         self._recovery_state: RecoveryState = RecoveryState.bootstrap()
-        # Two-layer FailedPath tracking.
-        #   ``current_plan_strategy`` — the one-sentence <strategy> the
-        #     planner declared at the head of its most recent committed
-        #     <plan>. None until the first plan commits.
-        #   ``replans_within_current_strategy`` — number of REPLANs the
-        #     planner has done while keeping (a token-Jaccard equivalent of)
-        #     the SAME strategy. Resets to 0 whenever the strategy changes.
-        #     Rule #6 fires as an ACTION-level FailedPath only when this
-        #     counter crosses _REPLAN_WITHOUT_PROGRESS_THRESHOLD (i.e. the
-        #     specific click/step is stuck within an otherwise-fine
-        #     strategy). When the planner SWITCHES to a structurally
-        #     different strategy (Jaccard < threshold), the old strategy
-        #     itself is recorded as a STRATEGY-level FailedPath instead.
-        #   ``current_strategy_started_at_step`` — env-step index where
-        #     ``current_plan_strategy`` was first committed; used to slice
-        #     ``self.actions`` into the action_sequence summary stored on
-        #     the strategy-level FailedPath when the strategy is abandoned.
+        # Two-layer FailedPath tracking:
+        #   current_plan_strategy — the <strategy> declared at the head of the last
+        #     committed <plan>. None until the first commit.
+        #   replans_within_current_strategy — REPLANs done while keeping a token-Jaccard
+        #     equivalent of the SAME strategy; resets on strategy change. Rule #6 fires an
+        #     ACTION-level FailedPath when it crosses the threshold (step stuck within an
+        #     otherwise-fine strategy); a structurally different strategy records the OLD
+        #     one as a STRATEGY-level FailedPath instead.
+        #   current_strategy_started_at_step — env-step where the strategy was committed;
+        #     slices self.actions into the action_sequence summary when it's abandoned.
         self.current_plan_strategy: Optional[str] = None
         self.replans_within_current_strategy: int = 0
         self.current_strategy_started_at_step: int = 0
-        # Cache for ``_judge_strategy_similar`` — keyed on the (a, b)
-        # pair (plus reverse-key check on lookup) so we issue at most
-        # one LLM "is this the same approach?" call per unique pair
-        # within a task.
+        # Cache for _judge_strategy_similar, keyed on (a, b) (+ reverse-key lookup) so we
+        # issue at most one "same approach?" LLM call per unique pair per task.
         self._strategy_judge_cache: Dict[Tuple[str, str], bool] = {}
-        # LLM-driven dead-end curator state. Strategy events accumulate
-        # on each plan commit (install / same / switch); action-level
-        # stuck events accumulate on each rule-#6 cadence trigger fire.
-        # The curator runs after each REPLAN, looks at this full
-        # history + currently-recorded failed_paths + outcome states,
-        # and re-derives the authoritative ``ledger.failed_paths``
-        # list. Replaces the old "every switch → write FailedPath"
-        # mechanical behavior, which couldn't see across multiple
-        # switches and produced fuzzy-duplicate / actor-flailing
-        # entries.
+        # LLM dead-end curator state. Strategy events accumulate on each plan commit;
+        # action-stuck events on each rule-#6 fire. The curator runs after each REPLAN over
+        # this full history + recorded failed_paths + outcome states and re-derives the
+        # authoritative ledger.failed_paths (can drop/merge/revise its own prior entries),
+        # replacing the old "every switch → write FailedPath" that produced fuzzy duplicates.
         self._strategy_history: List[Any] = []  # List[StrategyEvent]
         self._action_stuck_history: List[Any] = []  # List[ActionStuckEvent]
-        # Cached per-strategy notes from the most recent curator pass.
-        # Keyed by strategy_text → "<verdict> — <rationale>" so the
-        # timeline render can annotate each span box with the curator's
-        # reading. Cleared on reset.
+        # Per-strategy notes from the last curator pass, keyed strategy_text →
+        # "<verdict> — <rationale>", so the timeline render can annotate each span.
         self._last_curator_strategy_notes: Dict[str, str] = {}
         self.actor_subgoal_done_for_planner: bool = False
         self.actor_exhausted_for_planner: bool = False
         self.all_done_after_step: bool = False
         self.planner_response: Optional[str] = None
         self.planner_decision: Optional[str] = None
-        # Full parsed planner output (Phase-2 contract: last_subgoal_done,
-        # evidence, feedback_to_actor, decision, plan). Refreshed each
-        # ``_pa_call_planner``; consumed by ``_pa_predict`` control flow.
+        # Full parsed planner output (last_subgoal_done, evidence, feedback_to_actor,
+        # decision, plan). Refreshed each _pa_call_planner; read by _pa_predict.
         self.planner_parsed: Dict[str, Any] = {}
-        # Progress ledger — structured proprioception. Init lazy (needs first obs).
-        # Accumulators collect the per-step screenshots + actions until we hit
-        # a subgoal boundary (CONTINUE / REPLAN / DONE / exhaust / max_steps),
-        # at which point the summarizer runs and the lists reset.
+        # Progress ledger — structured proprioception. Lazy init (needs first obs).
+        # Accumulators collect per-step screenshots + actions until a subgoal boundary,
+        # then the summarizer runs and the lists reset.
         self.ledger = None                                     # ProgressLedger | None
         self._ledger_subgoal_screenshots: List[bytes] = []
         self._ledger_subgoal_actions: List[str] = []
@@ -364,141 +267,86 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         self.timeline: List[Any] = []   # List[TimelineEvent]
         self._candidate_step: Optional[Any] = None  # transient — current turn's StepRecord
         self._ledger_subgoal_plan_step: str = ""
-        self._ledger_last_done_reason: Optional[str] = None    # for HTML/log when ledger gate blocks DONE
-        # Periodic-trigger state (Phase 3: simple every-N-turns summarizer).
-        # We fire after every N actor turns (N = _LEDGER_FIRE_EVERY_N_TURNS)
-        # plus once at planner DONE. All other boundary tags removed.
+        self._ledger_last_done_reason: Optional[str] = None    # for HTML/log when gate blocks DONE
+        # Periodic summarizer: fire every _LEDGER_FIRE_EVERY_N_TURNS actor turns plus once
+        # at planner DONE. All other boundary tags removed.
         self._ledger_turns_accumulated: int = 0
-        # Window start state (captured at last fire). Used to compute the
-        # observable delta (URL + a11y diff) over the firing window.
+        # Window-start state (captured at last fire) for the observable delta (URL + a11y).
         self._ledger_url_at_window_start: Optional[str] = None
         self._ledger_a11y_at_window_start: Optional[str] = None
-        # Snapshot of the obs the previous _pa_call_planner saw.
-        # Used to compute a "last-1-turn delta" — the objective effect
-        # of the most recent actor action — and inject it into the
-        # planner's prompt so its <last_subgoal_assessment> is anchored
-        # to actual observable change rather than free-form interpretation.
+        # Obs the previous _pa_call_planner saw — used for a "last-1-turn delta" (the
+        # objective effect of the last actor action) injected so the planner's
+        # <last_subgoal_assessment> is anchored to observable change, not interpretation.
         self._planner_url_at_last_turn: Optional[str] = None
         self._planner_a11y_at_last_turn: Optional[str] = None
         self._current_snapshot: Optional[Any] = None  # SubgoalSnapshot when use_perceiver
-        # INTENDED domain — what the planner says the next step belongs to.
-        # Updated only from the planner's <step app="X"> tag (see
-        # _pick_multi_app_domain). Stable across verifier flukes.
+        # INTENDED domain — what the planner says the step belongs to (from <step app="X">,
+        # see _pick_multi_app_domain). Stable across verifier flukes.
         self._current_domain: Optional[str] = None
-        # PHYSICAL domain — what the OS is currently focused on, observed
-        # from the a11y root every step. Decoupled from intent so a
-        # mismatch is detectable and verifier scope can be gated on
-        # actual UI visibility (see _observe_physical_domain).
+        # PHYSICAL domain — what the OS is actually focused on, from the a11y root each step.
+        # Decoupled from intent so a mismatch is detectable and verifier scope can be gated.
         self._physical_domain: Optional[str] = None
-        # Mismatch run length — how many consecutive steps physical has
-        # disagreed with intended. Used by reconcile() to give up on the
-        # auto-focus push after a few turns and demote intended to
-        # physical (rather than spinning forever on a window that
-        # refuses to come forward). See _reconcile_domains.
+        # Consecutive steps physical has disagreed with intended. Reconcile() gives up the
+        # auto-focus push after a few turns and demotes intended to physical (vs spinning
+        # forever on a window that won't come forward).
         self._domain_mismatch_steps: int = 0
-        # Per-task budget — decremented on EVERY audit call (PASS too),
-        # so a thrashing auditor can't burn unbounded LLM calls.
+        # Per-task budget; decremented on EVERY audit call (PASS too) so a thrashing
+        # auditor can't burn unbounded LLM calls.
         self._done_audit_budget_remaining: int = (
             self.done_auditor_max_per_task
             if self.enable_done_auditor else 0
         )
-        # Distinct from ``_done_rejected_count``: counts ONLY explicit
-        # FAIL rejections by the auditor. PARTIAL is logged as
-        # inconclusive. For offline analytics; the dispatcher does not
-        # read this.
+        # Counts ONLY explicit auditor FAILs (PARTIAL is inconclusive). Offline analytics;
+        # the dispatcher does not read this.
         self._done_audit_reject_count: int = 0
-        # Set by the audit hook on explicit FAIL; consumed by
-        # ``recovery.dispatcher`` Rule #3 to flip the force_replan
-        # category from "done_rejected" to "done_audit_failed".
+        # Set by the audit hook on FAIL; consumed by dispatcher rule #3 to flip the
+        # force_replan category from "done_rejected" to "done_audit_failed".
         self._force_replan_category_pending: Optional[str] = None
-        # Failure-attribution v2: set by the planner-side force_replan
-        # hook when the router decides ``actor_redo`` (i.e. previous
-        # stuck state attributed to ACTOR with prose-level guidance).
-        # Consumed + cleared (one-shot) inside actor's
-        # ``_pa_call_actor_points`` on its next invocation. Schema:
-        # {subgoal_id, root_cause_summary, memory_canonical_approach,
-        #  divergence_description, missing_or_wrong, diagnosis}.
+        # Failure-attribution v2: prose recovery guidance set when the router decides
+        # actor_redo. Consumed one-shot inside the actor's next _pa_call_actor_points.
+        # Schema: {subgoal_id, root_cause_summary, memory_canonical_approach,
+        #          divergence_description, missing_or_wrong, diagnosis}.
         self._pending_actor_recovery_payload: Optional[Dict[str, Any]] = None
-        # Cache of the most recent ``InterventionDecision`` produced by
-        # the v2 pre-replan hook. The planner-side prompt builder
-        # (``_pa_build_subgoal_check_prompt``) consumes this on entry so
-        # the v2 diagnose+router LLM call only happens ONCE per
-        # force_replan turn, not twice.
+        # Cache of the last InterventionDecision from the v2 pre-replan hook, so the
+        # prompt builder reuses it and the v2 diagnose+router LLM call runs once per turn.
         self._cached_failure_attribution_decision: Optional[Any] = None
-        # Audit records from the v2 pre-replan hook's side-effect
-        # executors. Populated when the router decides
-        # ``verifier_override`` / ``env_intervention`` so the dump and
-        # tests can read what actually happened (or what would have
-        # happened in DRY-RUN). One-shot: overwritten each force_replan.
+        # Audit records from the v2 side-effect executors (verifier_override /
+        # env_intervention) for the dump + tests. One-shot per force_replan.
         self._last_verifier_override_audit: Optional[Dict[str, Any]] = None
         self._last_env_intervention_audit: Optional[Dict[str, Any]] = None
-        # Last cli_run's stdout/stderr/returncode — captured from the
-        # VM-side sentinel file ``/tmp/_last_cli_run.json`` (written by
-        # ``cli_run_helpers.build_runtime_script``). cli_run uses
-        # subprocess.run with capture_output=True so the planner's
-        # screenshot can never see its output; injecting this dict into
-        # the planner's observation block lets the planner recognize
-        # cli_run successes (filepath found, command output, etc.)
-        # instead of misjudging "no terminal visible" as failure.
+        # Last cli_run's stdout/stderr/returncode, from the VM sentinel /tmp/_last_cli_run.json.
+        # cli_run uses subprocess.run(capture_output=True) so its output never hits the
+        # screenshot; injecting this lets the planner see cli_run successes instead of
+        # misreading "no terminal visible" as failure.
         self._last_cli_run_output: Optional[Dict[str, Any]] = None
-        # Last extract_info's per-file results. Shape:
-        #   {"ok": bool, "query": str, "schema": dict,
-        #    "files": [{"path": str, "ext": str, "ok": bool,
-        #               "extracted": dict | None, "error": str | None,
-        #               "raw_excerpt": str}, ...]}
-        # Persistent KV notebook — single source of truth for any value
-        # the agent has captured this task. Two write paths:
-        #   (a) ``note_write(key, value)`` action — planner/decomposer
-        #       explicitly save observed strings (an affiliation, a
-        #       URL, a count).
-        #   (b) ``extract_info`` results auto-mirror per-file entries
-        #       (replaces the old per-task ``_extract_info_history``
-        #       list; one notebook is rendered, not two blocks).
-        # A7: ``self._notebook`` has been DELETED. Working memory now
-        # lives per-Outcome in ``ledger.required_outcomes[*].facts``
-        # plus ``ledger.global_facts`` for task-wide captures. The
-        # rendering helper ``fact.render_working_memory`` is used by
-        # both planner and decomposer prompts; goes stale automatically
-        # when source Outcomes REVERT.
-        # DocPerceiver / SheetPerceiver cache — populated by the
-        # appropriate run_inspect() at task start + after every
-        # structured-action mutation. DocPerceiver fires for writer; the
-        # parallel SheetPerceiver fires for calc. Both render into the
-        # SAME injection slot `_doc_inspect_block` because the planner
-        # prompt has only one structure-block section. The dirty flag
-        # flips True after every calc_*/impress_*/writer_* action and
-        # triggers a re-probe on the NEXT _pa_predict() turn.
+        # Working memory now lives per-Outcome in ledger.required_outcomes[*].facts plus
+        # ledger.global_facts (the old self._notebook was deleted). fact.render_working_memory
+        # feeds both planner and decomposer prompts and goes stale automatically on REVERT.
+        # DocPerceiver/SheetPerceiver/SlidePerceiver cache, populated by run_inspect() at task
+        # start + after every structured-action mutation. All render into _doc_inspect_block
+        # (the prompt has one structure slot). Dirty flips True after each calc_*/impress_*/
+        # writer_* action → re-probe next _pa_predict turn.
         self._doc_inspect_block: Optional[str] = None
         self._doc_inspect_dirty: bool = True
-        # Impress: cached slide-focus list extracted once per task from
-        # the task instruction (regex → LLM fallback → active slide).
-        # Reused on every subsequent slide_perceiver probe so we don't
-        # re-pay the focus-LLM cost each turn. Reset on every new task.
+        # Impress: slide-focus list extracted once per task (regex → LLM → active slide) and
+        # reused on every slide_perceiver probe to skip re-paying the focus-LLM cost.
         self._impress_focus_slides: Optional[List[int]] = None
-        # Task instruction cached for the focus extractor (mirrors how
-        # _doc_inspect_block needs the instruction to build the block).
+        # Task instruction cached for the slide-focus extractor.
         self._task_instruction: Optional[str] = None
-        # done_rejected accumulator for stuck detection (signal B).
-        # Bumped each time the ledger gate rejects a planner DONE.
+        # Bumped each time the ledger gate rejects a planner DONE (stuck signal B).
         self._done_rejected_count: int = 0
-        # Text-answer benchmark (WebVoyager / Mind2Web / MMInA) detection.
-        # Used to (a) augment the planner prompt so the model knows to
-        # emit ``finished(answer="...")`` at task DONE and (b) scrape
-        # that emit so the unified text-answer runner can pass it to
-        # the right eval path (LLM judge vs gold-reference match). The
-        # detection block ALSO accepts the legacy ``ANSWER(...)`` shape
-        # for backward-compat with wiki_search_executor.
+        # Text-answer benchmark (WebVoyager / Mind2Web / MMInA) detection: augments the
+        # planner prompt to emit finished(answer="...") at DONE, then scrapes it for the
+        # right eval path. Also accepts legacy ANSWER(...) for wiki_search_executor.
         self._is_text_answer_task: bool = False
         self._text_answer: Optional[str] = None
         self._text_answer_domain: Optional[str] = None
-        # Back-compat aliases. Old runners and replay tools read these
-        # field names; treat them as read-only mirrors of the unified
-        # state above. Deletable once all readers migrate.
+        # Back-compat aliases — read-only mirrors of the unified state above. Deletable
+        # once all readers migrate.
         self._is_mmina_task: bool = False
         self._mmina_answer: Optional[str] = None
         self._mmina_domain: Optional[str] = None
-        # — per-task fields the run harness also relies on (previously
-        #   created only in reset(); set here too so a fresh agent has them) —
+        # per-task fields the run harness relies on (set here too so a fresh agent has them)
         self.action_descriptions = []
         self.instruction = None
         self._raw_instruction = None
@@ -515,8 +363,8 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
     _MAX_ACTOR_RETRIES = 3
     _MAX_SUBGOAL_STEPS = 5
     _LEDGER_FIRE_EVERY_N_TURNS = 5      # periodic ledger summarizer cadence
-    # 'verify the result' steps are usually redundant but non-harmful.
-    # Only drop true no-op WAIT subgoals here.
+    # Drop only true no-op WAIT subgoals; 'verify the result' steps are redundant
+    # but harmless, so keep them.
     _SUBGOAL_SKIP_RE = re.compile(r'\bWAIT\b', re.IGNORECASE)
 
 
@@ -524,15 +372,10 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
 
     @staticmethod
     def _is_multihop(instruction: str) -> bool:
-        """Detect multi-hop MMInA tasks from instruction content.
+        """Detect multi-hop MMInA tasks. They start with the standard preamble
+        ("For actions 'book a hotel',...") and include "return the final url".
 
-        Multi-hop intents always start with the standard preamble:
-        "For actions 'book a hotel','book a car','book a flight'..."
-        and include "return the final url as the answer".
-
-        TODO: Make this more agentic — instead of pattern matching the preamble,
-        use the MetaPlanner LLM to decide if a task is multi-hop based on
-        semantic understanding of the instruction.
+        TODO: make this agentic — use the MetaPlanner LLM instead of pattern-matching.
         """
         lower = (instruction or "").lower()
         return "for actions" in lower and "return the final url" in lower
@@ -543,24 +386,19 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
     # --- ledger helpers ------------------------------------------------- #
 
     def _ledger_disabled(self) -> bool:
-        """Ablation switch: set env DISABLE_LEDGER=1 to turn off the
-        progress-ledger pipeline entirely. Useful for {a11y on/off} ×
-        {ledger on/off} 2x2 experiments without code changes."""
+        """Ablation switch (DISABLE_LEDGER=1): turn off the progress-ledger pipeline
+        for {a11y on/off} × {ledger on/off} experiments without code changes."""
         return self.cfg.disable_ledger
 
     def _is_multi_app(self) -> bool:
-        """True iff this task spans >1 application (the OSWorld
-        ``multi_apps`` domain). Gates all multi-app behaviour — per-app
-        outcome tags, dynamic ``_current_domain`` switching, the
-        multi-app prompt additions. When False, every code path stays
-        byte-identical to the single-domain behaviour."""
+        """True iff this task spans >1 app (OSWorld ``multi_apps``). Gates all
+        multi-app behaviour; when False every path stays byte-identical to single-domain."""
         return len(getattr(self, "_related_apps", None) or []) > 1
 
     @staticmethod
     def _vm_python_runner(env):
-        """Resolve the VM-side python executor — ``run_python_script`` on
-        either the real DesktopEnv (``env.controller``) or APIDesktopEnv
-        (``env``). Returns None when unavailable."""
+        """Resolve the VM-side ``run_python_script`` on either the real DesktopEnv
+        (``env.controller``) or APIDesktopEnv (``env``). None when unavailable."""
         if env is None:
             return None
         ctrl = getattr(env, "controller", None)
@@ -571,13 +409,9 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         return None
 
     def _activate_app_for_domain(self, env, domain: Optional[str]) -> None:
-        """Bring the window for ``domain``'s application to the front via
-        the ``open_app`` script. Best-effort: no-op for the ``os`` domain
-        (shell work, no window to focus) and when no VM runner exists.
-
-        Called on every multi-app ``_current_domain`` switch so the agent
-        never has to juggle windows through the GUI — the framework
-        focuses the right app as a side effect of the planner's phase."""
+        """Bring ``domain``'s app window to the front via the ``open_app`` script.
+        Best-effort: no-op for ``os`` (no window) and when no VM runner exists.
+        Called on every multi-app domain switch so the agent never window-juggles."""
         if not domain or domain == "os":
             return
         runner = self._vm_python_runner(env)
@@ -594,9 +428,8 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                     app_switch_verify_enabled, parse_open_app_result,
                 )
                 if app_switch_verify_enabled():
-                    # Closed loop (§8): read the script's focus-verify sentinel
-                    # instead of fire-and-forget. ok=None (no sentinel / old VM)
-                    # → unverified, behave as before.
+                    # Closed loop: read the script's focus-verify sentinel instead of
+                    # fire-and-forget. ok=None (no sentinel / old VM) → unverified.
                     parsed = parse_open_app_result(res)
                     self._last_app_switch = {"domain": domain, **parsed}
                     if logger:
@@ -614,33 +447,22 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                     "[MultiApp] auto-activate %s failed: %s", domain, e)
 
     def _phase_board(self):
-        """The PhaseBoard for this task, or None. Multi-app tasks build
-        one in init_ledger; single-app tasks never do. Centralizes the
-        ``self.ledger.phase_board`` lookup so every phase call site is a
-        clean no-op (returns None) on single-app tasks."""
+        """The PhaseBoard for this task, or None. Multi-app tasks build one in
+        init_ledger; single-app tasks never do (so phase call sites no-op)."""
         led = getattr(self, "ledger", None)
         return getattr(led, "phase_board", None) if led is not None else None
 
     def _pick_multi_app_domain(self) -> Tuple[Optional[str], Optional[str]]:
-        """Decide the agent's INTENDED app for this turn — i.e. which app
-        the planner says the next step belongs to. Pure, no side effects.
+        """Decide the agent's INTENDED app for this turn. Pure, no side effects.
 
-        Returns ``(domain, source)`` where ``domain`` is a member of
-        ``_related_apps`` (or None when no change applies) and
-        ``source`` is a short human-readable label for the log line.
+        Returns ``(domain, source)`` — ``domain`` a member of ``_related_apps``
+        (None when no change applies), ``source`` a short label for the log.
 
-        Single source of truth: the planner's ``<step app="...">`` tag,
-        surfaced as ``current_subgoal_app``. Phase board / focus
-        outcome / actor open_app were previously consulted as
-        priorities 0/1/3, but all three are downstream of the verifier
-        — when the verifier is wrong, they propagate the error into
-        intent selection. Stripping them isolates "what the agent is
-        TRYING to do" (planner intent) from "what the verifier thinks
-        is done" (which controls phase advance / focus, but should not
-        retroactively choose the active app).
-
-        Returning ``(None, None)`` means "no planner signal yet" — the
-        caller holds the previous ``_current_domain`` unchanged.
+        Single source of truth: the planner's ``<step app="...">`` tag
+        (current_subgoal_app). Phase board / focus outcome / actor open_app were
+        dropped — all downstream of the verifier, so a wrong verifier propagated
+        into intent selection. ``(None, None)`` = no planner signal yet; the caller
+        holds the previous ``_current_domain``.
         """
         if not self._is_multi_app():
             return (None, None)
@@ -653,12 +475,9 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                        "vscode": "vs_code"}.get(_sg_app, _sg_app)
             if _sg_app in related:
                 return (_sg_app, "planner step")
-        # C: planner forgot or mistyped the <step app=...> tag → fall
-        # back to the PhaseBoard's active phase app. Better to follow
-        # the structured phase contract than to leave _current_domain
-        # stale on a turn the planner failed to tag. Only used when
-        # primary signal is absent; planner's explicit tag still wins
-        # when present.
+        # Planner forgot/mistyped the <step app=...> tag → fall back to the
+        # PhaseBoard's active phase app rather than leave _current_domain stale.
+        # Only when the primary signal is absent; the explicit tag still wins.
         pb = self._phase_board()
         if pb is not None:
             try:
@@ -670,15 +489,12 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         return (None, None)
 
     def _pre_planner(self, obs: dict, step_idx: int, env: Any = None) -> None:
-        """Build a candidate StepRecord from current obs, run the KeyNode
-        detector, and fold key_nodes into the ledger BEFORE the planner
-        prompt is built. This way the planner sees fresh outcome state
-        (including [REVERTED] flags) in its read-only Progress Ledger
-        block. Stores the candidate on ``self._candidate_step`` so
-        ``_post_actor`` can finalize it after the actor runs.
+        """Build a candidate StepRecord from current obs (perceiver snapshot,
+        a11y delta) before the planner prompt is built, so the planner sees fresh
+        outcome state in its Progress Ledger block. Stashes it on
+        ``self._candidate_step`` for ``_post_actor`` to finalize.
 
-        working-memory only: no-op when ``MEMORY_VERSION=v1`` or ledger is None /
-        has no required outcomes (initializer failed)."""
+        Working-memory only: no-op when MEMORY_VERSION=v1 or ledger is unusable."""
         if self._memory_version == "v1":
             return
         if self.ledger is None or not self.ledger.required_outcomes:
@@ -687,20 +503,12 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         from mm_agents.structagent.ledger.core.summarizer import compute_window_delta
         import datetime as _dt
 
-        # Orphan-cand guard: ``_pa_predict`` has multiple early-return
-        # paths (DONE accepted, DONE rejected & defer, code-actor empty
-        # body, 2-stage re-grounding success, mmina answer) that skip
-        # the trailing ``_post_actor`` call. The previous turn's
-        # ``_pre_planner`` already folded that turn's KeyNodes into
-        # ``self.ledger.outcome_cache`` (which advances state correctly),
-        # but without a matching ``append_step`` call the cand never
-        # makes it into ``self.timeline``. Renderers then see the
-        # cache reflecting step N while the latest TimelineEvent.steps
-        # still holds step N-1's KeyNodes — exactly the drift that
-        # produced "[REVERTED] verified step 10, INVALIDATED step 11"
-        # alongside a "✓ outcome_satisfied" KeyNode tile in the same
-        # turn's render. Append the orphan now so timeline catches up
-        # before we install the fresh cand for THIS step.
+        # Orphan-cand guard: _pa_predict has early-return paths that skip the
+        # trailing _post_actor, so the prior turn's cand never reaches the timeline
+        # even though its KeyNodes were folded into the ledger cache. That drift
+        # produced "[REVERTED] step 10 / INVALIDATED step 11" next to a
+        # "✓ outcome_satisfied" tile in one render. Append the orphan now so the
+        # timeline catches up before installing this step's fresh cand.
         stale_cand = self._candidate_step
         if stale_cand is not None and getattr(stale_cand, "step_idx", -1) < step_idx:
             try:
@@ -718,11 +526,10 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
             self._candidate_step = None
 
         a11y = _linearize_obs_a11y(obs, max_items=300)
-        # Chrome: append CHECKER-SOURCE web DOM (CSS class + ARIA state) — the
-        # layer AT-SPI a11y lacks but the chrome checker actually reads (filter
-        # chips, active tabs). One append HERE flows to every downstream consumer
-        # of StepRecord.a11y (perceiver / planner / boundary / done-auditor).
-        # Off via WEB_DOM_INJECT=0. Fails soft (CDP hiccup -> plain a11y).
+        # Chrome: append the checker-source web DOM (CSS class + ARIA state) — the layer
+        # AT-SPI a11y lacks but the chrome checker reads (filter chips, active tabs). One
+        # append flows to every StepRecord.a11y consumer. Off via WEB_DOM_INJECT=0;
+        # fails soft to plain a11y on a CDP hiccup.
         if (os.environ.get("WEB_DOM_INJECT", "1") == "1"
                 and (self._current_domain or "").lower() == "chrome"
                 and getattr(self, "_vm_ip", None)):
@@ -756,11 +563,9 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         # Flatten timeline (event→steps) into one chronological StepRecord list.
         _all_steps = [s for ev in self.timeline for s in (ev.steps or [])]
         prev_step = _all_steps[-1] if _all_steps else None
-        # The 3 frames just BEFORE prev (with a screenshot) → with prev+current
-        # the visual judge sees up to 5 frames of the workflow, not only 2. A
-        # save/print dialog confirming a file landed before it closes is
-        # invisible to a 2-frame judge (task e1e75309). Slicing never raises
-        # IndexError — a short/empty list just yields fewer (or zero) frames.
+        # The 3 frames before prev → with prev+current the visual judge sees up to 5
+        # workflow frames, not 2. A save/print dialog confirming a file landed before it
+        # closes is invisible to a 2-frame judge (task e1e75309). Short list → fewer frames.
         _earlier_steps = [s for s in _all_steps[-4:-1]
                           if getattr(s, "screenshot_b64", None)]
         # Compute a11y delta for detector context
@@ -775,17 +580,11 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
             except Exception as e:
                 if logger:
                     logger.warning("[working_mem] window_delta failed: %s", e)
-        # ── Perceiver FIRST (gated by PERCEIVER_ENABLED). Produces a
-        # SubgoalSnapshot the planner will consume + acts as a STRONG
-        # PRIOR for KeyNode below. Order: perceiver → KeyNode → ledger
-        # gate (single source of truth on outcome state). See
-        # docs/PROGRESS_LEDGER_V2_CHANGELOG.md §17.
+        # Perceiver (PERCEIVER_ENABLED): SubgoalSnapshot for the planner + strong prior
+        # for KeyNode. Order: perceiver → KeyNode → ledger gate. See §17 of the changelog.
         self._current_snapshot = None
-        # Initial plan turn — no "last action" exists, no current_subgoal
-        # has been emitted yet, no expected_post_state to score against.
-        # Running the perceiver here produces meaningless "did last action
-        # achieve expected state? NO" verdicts that just add noise to the
-        # initial-plan prompt. Skip until step >= 1.
+        # Skip on the initial plan turn: no last action / current_subgoal / expected_post_state
+        # yet, so the perceiver only emits noisy "did last action achieve expected state? NO".
         if self.use_perceiver and step_idx > 0:
             try:
                 from mm_agents.structagent.ledger.support.a11y_prefilter import (
@@ -801,8 +600,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                     outcome_evidence_hints=hints,
                     top_n=80,
                 )
-                # Screen size for the perceiver (so it can return full-screen
-                # bbox when uncertain). Decode PNG dims once from cand.
+                # Screen size (so the perceiver can return a full-screen bbox when uncertain).
                 screen_size: Tuple[int, int] = (1920, 1080)  # safe default
                 shot_bytes = obs.get("screenshot") if isinstance(obs, dict) else None
                 if shot_bytes:
@@ -815,7 +613,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                 last_action = (prev_step.actor_action_summary
                                 if prev_step is not None else "") or ""
 
-                # ── Debug dump: perceiver INPUT (before LLM call) ──
+                # Debug dump: perceiver input (before LLM call)
                 results_dir = getattr(self, "_results_dir", None)
                 a11y_full_rows = (a11y or "").count("\n")
                 perceiver_debug.dump_perceiver_input(
@@ -832,8 +630,8 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                     screenshot_bytes=shot_bytes,
                 )
 
-                # raw_sink captures the perceiver's raw LLM response so
-                # we can dump it even if parsing fails downstream.
+                # Capture the perceiver's raw LLM response so we can dump it even if
+                # parsing fails downstream.
                 _captured_raw = {"text": None}
 
                 def _raw_sink(text: str) -> None:
@@ -859,11 +657,9 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                     unbound_slots=_unbound_slots,
                 )
 
-                # Promote any new perceiver-resolved slot bindings into
-                # the ledger. Bind-once: an already-bound slot is never
-                # overwritten — protects against per-step drift (e.g. the
-                # active URL changes after the value was captured).
-                # Unknown slot names from the perceiver are ignored.
+                # Promote new perceiver-resolved slot bindings into the ledger. Bind-once:
+                # an already-bound slot is never overwritten (guards against per-step drift,
+                # e.g. the active URL changing after capture). Unknown slot names ignored.
                 if (self._current_snapshot is not None
                         and self.ledger and self.ledger.slots
                         and self._current_snapshot.slot_bindings):
@@ -881,7 +677,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                                 (b.evidence or "")[:80],
                             )
 
-                # ── Debug dump: perceiver OUTPUT (raw + parsed) ──
+                # Debug dump: perceiver output (raw + parsed)
                 perceiver_debug.dump_perceiver_raw(
                     results_dir=results_dir,
                     step_idx=step_idx,
@@ -908,8 +704,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                             len(snap.relevant_controls),
                             snap.visual_focus.bbox,
                             len(snap.unexpected_blockers))
-                # Persist on the StepRecord so timeline replay /
-                # ledger render / curator can see it later.
+                # Persist on the StepRecord for timeline replay / ledger render / curator.
                 cand.snapshot = self._current_snapshot
             except Exception as e:
                 if logger:
@@ -917,51 +712,42 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                                     step_idx, e)
                 self._current_snapshot = None
 
-        # ── Boundary-verify mode (always on): the per-step KeyNode poll is
-        # bypassed. Outcome states are refreshed by boundary verifier reports
-        # when an actor burst hands control back to the planner, plus at final
-        # DONE. The StepRecord / a11y-delta / perceiver snapshot were already
-        # built above (infra the planner + timeline need); only the expensive
-        # per-step KeyNode detection + ledger fold is skipped.
+        # Boundary-verify mode (always on): skip the per-step KeyNode poll. Outcome
+        # states are refreshed by boundary-verifier reports at actor-burst exit + DONE.
+        # The StepRecord / a11y-delta / perceiver snapshot above are still built.
         cand.key_nodes = []
         self._candidate_step = cand
 
     def _run_boundary_verify(self, outcomes, step_idx, env, *,
                              dump_name, dump_targets):
-        """Shared boundary-verify core.
-
-        Used by actor-loop-exit reports and verify-on-DONE. Builds context from
-        the current candidate step, runs verify_milestone over ``outcomes``,
-        marks verified ones on the ledger, and debug-dumps the verdict list.
-        """
+        """Shared boundary-verify core (actor-loop-exit reports + verify-on-DONE).
+        Builds context from the candidate step, runs verify_milestone over ``outcomes``,
+        marks verified ones on the ledger, and debug-dumps the verdicts."""
         from mm_agents.structagent.core.verifier.boundary_verify import (
             verify_milestone, VerifyContext, allowed_probes_for_domain)
         from mm_agents.structagent.ledger.core.ledger import OUTCOME_VERIFIED
         from mm_agents.structagent.ledger.support.a11y_prefilter import (
             prefilter_linearized_a11y)
         cand = self._candidate_step
-        # Domain drives the per-domain trust map (allowed probes + ground-truth
-        # guidance): the current (task / focused-app) domain — NOT the transient
-        # _physical_domain (often unset early → chrome wrongly defaulted). Fall
-        # back to _physical_domain.
+        # Domain drives the per-domain trust map (allowed probes + guidance): use the
+        # task/focused-app domain, NOT the transient _physical_domain (often unset early →
+        # wrongly defaulted to chrome). Fall back to _physical_domain.
         dom = self._current_domain or self._physical_domain or ""
-        # Intent-prefilter the a11y to subgoal + milestone-relevant rows (same
-        # processing the perceiver/planner get); raw a11y on content-heavy pages
-        # is huge.
+        # Intent-prefilter a11y to subgoal + milestone-relevant rows (raw a11y is huge on
+        # content-heavy pages); same processing the perceiver/planner get.
         a11y_text = prefilter_linearized_a11y(
             linearized_text=getattr(cand, "a11y", "") or "",
             subgoal_text=self.current_subgoal or "",
             outcome_evidence_hints=[getattr(o, "evidence_hint", "") for o in outcomes],
             top_n=80,
         )
-        # Last few prior screenshots (oldest→newest) for workflow context — the
-        # current frame is cand.screenshot_b64; add up to 4 earlier frames from
-        # the timeline so the verifier sees the最近 5 张 (like the KeyNode judge).
+        # Up to 4 earlier timeline frames (oldest→newest) for workflow context; with the
+        # current frame (cand.screenshot_b64) the verifier sees ~5, like the KeyNode judge.
         _all_steps = [s for ev in self.timeline for s in (ev.steps or [])]
         prior_shots = [s.screenshot_b64 for s in _all_steps[-4:]
                        if getattr(s, "screenshot_b64", None)]
-        # Verifier memory: retrieve check recipes for this milestone class and fold
-        # them into the verify prompt (opt-in via ENABLE_VERIFIER_EXPERIENCE_MEMORY).
+        # Verifier memory (ENABLE_VERIFIER_EXPERIENCE_MEMORY): fold retrieved check
+        # recipes for this milestone class into the verify prompt.
         check_recipe_block = ""
         if self._verifier_memory_on:
             try:
@@ -981,10 +767,9 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
             domain=dom,
             subgoal_text=self.current_subgoal or "",
             expected_post_state=self.current_subgoal_expected_post_state or "",
-            # actor_history entries are {"screenshot_b64": <~1MB>, "response":
-            # text} — take ONLY response text. str(a) would dump the full
-            # screenshot b64 as TEXT (~1M chars ≈ 260k tokens) and blow the
-            # context window (observed BadRequestError 400).
+            # Take ONLY the response text from each actor_history entry. str(a) would dump
+            # the ~1MB screenshot b64 as text (~260k tokens) and blow the context window
+            # (observed BadRequestError 400).
             actor_history=[
                 (a.get("response") if isinstance(a, dict) else str(a)) or ""
                 for a in (self.actor_history or [])
@@ -1057,12 +842,9 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
 
     def _boundary_verify_done_leaves(self, obs: dict, step_idx: int,
                                      env: Any = None) -> None:
-        """verify-on-DONE (boundary mode).
-
-        The per-step KeyNode poll is bypassed, so run the boundary verifier on
-        any still-PENDING leaf outcome at task-DONE time. Already-verified
-        leaves are trusted. The DONE gate then reads the updated state.
-        """
+        """verify-on-DONE: run the boundary verifier on any still-PENDING leaf
+        outcome at task-DONE (the per-step KeyNode poll is bypassed). Already-verified
+        leaves are trusted; the DONE gate then reads the updated state."""
         led = self.ledger
         if led is None:
             return
@@ -1085,12 +867,9 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                 "now verified", step_idx, nv, len(pending))
 
     def _verify_actor_loop_exit_for_planner(self, ctx, exit_reason: str) -> None:
-        """Run milestone verification after actor control returns to planner.
-
-        This replaces the old per-step KeyNode subgoal gate. It updates
-        verified ledger outcomes, then writes a one-shot report for the planner.
-        It never advances the subgoal, rejects the subgoal, or stages replan.
-        """
+        """Run milestone verification after actor control returns to the planner
+        (replaces the old per-step KeyNode gate). Updates verified ledger outcomes and
+        writes a one-shot report. Never advances/rejects the subgoal or stages replan."""
         step_idx = ctx.step_idx
         env = ctx.env
         targets = list(self.current_subgoal_targets or [])
@@ -1164,12 +943,9 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         planner_decision: Optional[str],
         planner_done_assessment: Optional[str],
     ) -> None:
-        """Finalize this turn's StepRecord (fill in actor + decision),
-        close the previous TimelineEvent if appropriate (using THIS
-        turn's done/decision re the prev subgoal), and append the
-        candidate step to the timeline.
-
-        working-memory only and harmless if ``_pre_planner`` was skipped."""
+        """Finalize this turn's StepRecord (actor + decision), close the previous
+        TimelineEvent if this turn's done/decision warrants it, and append the
+        candidate to the timeline. Harmless if ``_pre_planner`` was skipped."""
         if self._memory_version == "v1":
             return
         cand = self._candidate_step
@@ -1179,22 +955,18 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
             append_step, close_current_event, event_outcome_for_decision,
             EV_ONGOING, EV_ABANDONED_REPLAN,
         )
-        # Fill in turn-end fields
         if actor_response:
             cand.actor_action_summary = actor_response.replace("\n", " ").strip()[:240]
             cand.actor_action_raw = action_code if action_code else None
         cand.planner_decision = planner_decision
         cand.planner_done_assessment = planner_done_assessment
 
-        # Close previous event using this turn's done/decision (which
-        # refers to prev event's subgoal). Must happen BEFORE append_step
-        # so the new step opens a fresh event when subgoal changes.
+        # Close the previous event (this turn's done/decision refers to its subgoal).
+        # Must precede append_step so the new step opens a fresh event on subgoal change.
         prev_outcome = event_outcome_for_decision(planner_decision, planner_done_assessment)
         if prev_outcome != EV_ONGOING and self.timeline:
-            # Capture the planner's <Bottleneck> from THIS turn as the
-            # closing reason for the event we're about to close — but
-            # only when the event is being abandoned (REPLAN). For
-            # commit/done outcomes there's no failure to explain.
+            # Use this turn's <Bottleneck> as the close reason, but only on REPLAN
+            # (abandon) — commit/done outcomes have no failure to explain.
             close_reason = None
             if prev_outcome == EV_ABANDONED_REPLAN:
                 close_reason = (self.planner_parsed or {}).get("bottleneck")
@@ -1202,24 +974,21 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                                 at_step=max(0, cand.step_idx - 1),
                                 reason=close_reason)
         append_step(self.timeline, cand, self.current_subgoal or "")
-        # consume — clear so a stray reference can't leak across turns
-        self._candidate_step = None
+        self._candidate_step = None  # clear so it can't leak across turns
 
     def _pa_run_actor(self, ctx):
-        """Actor phase: resolve the subgoal (+ one-shot planner hint), run the
-        2-stage re-grounding fast path, call the actor, handle
-        WAIT/IMPOSSIBLE/DONE/FAIL, accumulate the ledger window and finalize
-        this turn's timeline StepRecord. Always returns (response, [actions])."""
+        """Actor phase: resolve the subgoal (+ one-shot planner hint), call the actor,
+        handle WAIT/IMPOSSIBLE/DONE/FAIL, accumulate the ledger window, finalize this
+        turn's StepRecord. Always returns (response, [actions])."""
         instruction, obs, env, step_idx = (
             ctx.instruction, ctx.obs, ctx.env, ctx.step_idx)
         screenshot_bytes = ctx.screenshot_bytes
         screen_width = ctx.screen_width
         screen_height = ctx.screen_height
-        # 2) ACTOR: single call (retries happen across predict() calls)
+        # ACTOR: single call (retries happen across predict() calls)
         subgoal = self.current_subgoal or "Proceed with the task."
-        # Phase-2: pipe the planner's advisory feedback (emitted when the
-        # last_subgoal_assessment was done=NO) to the actor as a hint.
-        # ONLY for this turn — not mutating current_subgoal.
+        # Pipe the planner's advisory feedback (from a done=NO assessment) to the actor
+        # as a one-turn hint — does not mutate current_subgoal.
         if self.feedback_to_actor:
             subgoal = (
                 f"{subgoal}\n"
@@ -1269,24 +1038,17 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
 
         # Check impossible
         if len(parsed_check) == 1 and parsed_check[0] == "IMPOSSIBLE":
-            # Stage a force_replan signal for next turn — rule #2 of
-            # _decide_planner_mode_and_reason will pick it up. Burst mode
-            # always hands the actor failure back to the planner through
-            # the actor-loop verifier report, so the legacy
-            # _pending_actor_failure_reason / _actor_emitted_impossible
-            # path is not taken here.
+            # Burst mode hands actor failure back to the planner via the actor-loop
+            # verifier report, so the legacy _pending_actor_failure_reason /
+            # _actor_emitted_impossible path is not taken here.
             actor_exhausted = True
             self._actor_emitted_impossible = False
             self._consecutive_impossible_count += 1
 
         self.actor_history.append({"screenshot_b64": current_b64, "response": actor_response})
 
-        # Progress Ledger: accumulate (screenshot, action) into the
-        # current window. Fire summarizer periodically every N actor
-        # turns (plus once at DONE in the planner-decision branch above).
-        # Boundary-tag-based firing (continue/replan/exhaust/max_steps)
-        # has been removed — periodic fire covers the common case and
-        # DONE fire covers the gate-decision case.
+        # Progress Ledger: accumulate (screenshot, action), fire the summarizer every
+        # N actor turns (plus once at DONE). Boundary-tag firing has been removed.
         self._ledger_accumulate(obs, actor_response)
         self._ledger_turns_accumulated += 1
         if (self.ledger is not None
@@ -1294,21 +1056,16 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
             self._ledger_fire_boundary("periodic", obs, step_idx)
             self._ledger_turns_accumulated = 0
 
-        # Text-answer benchmarks: detect terminal sentinel in actor
-        # response. Accepts BOTH new ``finished(answer="...")`` (the
-        # canonical form planner instructs the model to emit) and
-        # legacy ``ANSWER(...)`` (kept so wiki_search_executor and any
-        # replay against MMInA-era trajectories still terminate
-        # correctly). Both populate ``self._text_answer`` and mirror it
-        # onto the legacy ``_mmina_answer`` alias for back-compat
-        # readers.
+        # Text-answer benchmarks: detect the terminal sentinel in the actor response.
+        # Accepts both finished(answer="...") (canonical) and legacy ANSWER(...) (kept
+        # for wiki_search_executor + MMInA-era replays). Mirrors onto _mmina_answer.
         if (self._is_text_answer_task or self._is_mmina_task) \
                 and actor_response:
             from mind2web_eval import extract_text_answer
             _ta = extract_text_answer(actor_response)
             if _ta:
                 self._text_answer = _ta
-                self._mmina_answer = _ta            # legacy mirror
+                self._mmina_answer = _ta
                 self.all_done_after_step = True
                 if logger:
                     logger.info("[TextAnswer] sentinel detected: %s",
@@ -1317,58 +1074,50 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                 self.actions.append(_emit)
                 return _emit, ["pyautogui.hotkey('Escape')"]
 
-        # Actor confirmed subgoal done
         if len(parsed_check) == 1 and parsed_check[0] == "DONE":
             actor_subgoal_done = True
 
-        # FAIL
         if len(parsed_check) == 1 and parsed_check[0] == "FAIL":
             actor_exhausted = True
 
-        # Real actions
         if not actor_subgoal_done and not actor_exhausted:
             final_actions = parsed_check
             self._consecutive_impossible_count = 0   # a real action breaks the streak
         elif actor_subgoal_done:
-            # Actor-DONE is only a claim. Emit a harmless WAIT so the runner
-            # advances to a fresh observation for low-level verify.
+            # Actor-DONE is only a claim — emit a harmless WAIT so the runner advances
+            # to a fresh observation for low-level verify.
             final_actions = ["WAIT"]
         elif actor_exhausted:
-            # Actor failure is handed to the planner through the actor-loop
-            # verifier report, not the legacy force_replan path.
+            # Failure is handed to the planner via the actor-loop verifier report.
             final_actions = ["WAIT"]
 
         self.current_subgoal_step += 1
         self.actor_subgoal_done_for_planner = actor_subgoal_done
         self.actor_exhausted_for_planner = actor_exhausted
 
-        # Record action description (full response for coord extraction in 2-stage grounding)
+        # Record action description (full response, for coord extraction).
         self.actions.append(actor_response if actor_response else "")
 
-        # Action overlay: annotate the pre-action screenshot with the
-        # decided actor action (CLICK marker, TYPE/HOTKEY/SCROLL labels)
-        # and propagate the annotated frame to ALL stores so planner
-        # history / actor history / ledger window / timeline / HTML
-        # all show the same self-explanatory image.
+        # Action overlay: annotate the pre-action screenshot with the decided action
+        # (CLICK marker, TYPE/HOTKEY/SCROLL labels) and propagate to every store
+        # (planner/actor history, ledger window, timeline, HTML) so all show the same image.
         try:
             from mm_agents.structagent.utils.screenshot_annotator import annotate_screenshot_with_action
             _pre_action_bytes = obs.get("screenshot") if isinstance(obs, dict) else None
             if _pre_action_bytes and final_actions:
                 _annotated_bytes = annotate_screenshot_with_action(_pre_action_bytes, final_actions)
                 _annotated_b64 = base64.b64encode(_annotated_bytes).decode("ascii")
-                # 1. candidate step (was set with raw bytes in _pre_planner)
+                # candidate step (set with raw bytes in _pre_planner)
                 if self._candidate_step is not None:
                     self._candidate_step.screenshot_b64 = _annotated_b64
-                # 2. planner_history last entry (re-process so it's
-                #    sized for the planner's vision model)
+                # planner_history last entry (re-process for the planner's vision model)
                 if self.planner_history:
                     feedback = self.planner_history[-1][1]
                     self.planner_history[-1] = (process_image(_annotated_bytes), feedback)
-                # 3. actor_history last entry (last actor saw the raw frame;
-                #    we replace with annotated for downstream replay)
+                # actor_history last entry (annotated, for downstream replay)
                 if self.actor_history:
                     self.actor_history[-1]["screenshot_b64"] = _annotated_b64
-                # 4. ledger boundary-summarizer window (last appended entry)
+                # ledger boundary-summarizer window (last appended entry)
                 if self._ledger_subgoal_screenshots:
                     self._ledger_subgoal_screenshots[-1] = _annotated_bytes
         except Exception as _ann_e:
@@ -1383,7 +1132,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
             actor_exhausted=actor_exhausted,
         )
 
-        # finalize this turn's StepRecord and append to timeline
+        # finalize this turn's StepRecord and append to the timeline
         _done_assess = None
         if isinstance(self.planner_response, str):
             _m = re.search(r"<done>\s*(YES|NO)\s*</done>", self.planner_response)
@@ -1399,55 +1148,36 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         return actor_response, final_actions
 
     def _pa_begin_step(self, ctx):
-        """Per-step setup before the planner: cache instruction + step/
-        screenshot, fetch the cli-run sentinel, resolve the domain, run the
-        multi-app phase-advance / domain-switch / physical reconcile, pre-upload
-        the ops lib, probe initial files, augment the instruction, re-probe the
-        open document (SP/DP/Slide) and init the ledger. Populates ctx with the
-        loop-locals the rest of the step needs (step_idx, screenshot_bytes,
-        screen_width, screen_height) and the augmented instruction."""
+        """Per-step setup before the planner: cache instruction + screenshot, fetch the
+        cli-run sentinel, resolve the domain, run multi-app phase-advance/domain-switch/
+        reconcile, pre-upload the ops lib, probe initial files, augment the instruction,
+        re-probe the open doc (SP/DP/Slide), init the ledger. Fills ctx (step_idx,
+        screenshot_bytes, screen_width/height, augmented instruction)."""
         instruction = ctx.instruction
         obs = ctx.obs
         env = ctx.env
         wall_step_idx = ctx.wall_step_idx
-        # Cache the task instruction so per-turn perceivers (notably
-        # slide_perceiver) can extract the slide focus once.
+        # Cache the instruction so per-turn perceivers (slide_perceiver) extract focus once.
         self._task_instruction = instruction
-        # Stash the outer step counter so per-step debug dumps
-        # (perceiver artifacts, planner messages) can name files correctly.
+        # Outer step counter for naming per-step debug dumps.
         self._wall_step_idx = wall_step_idx
         step_idx = len(self.actions)
         screenshot_bytes = obs["screenshot"]
         screen_img = Image.open(BytesIO(screenshot_bytes))
         screen_width, screen_height = screen_img.size
 
-        # Clear DONE-rejection reason at the start of every turn so HTML /
-        # logs only display it on the step where the ledger gate actually
-        # rejected. Without this, ``_ledger_last_done_reason`` is set once
-        # at the rejection step and persists to every subsequent step's
-        # render — a stale reason appearing long after the cache state
-        # has evolved.
+        # Clear the DONE-rejection reason each turn so HTML/logs show it only on the
+        # step where the gate actually rejected — otherwise it persists stale.
         self._ledger_last_done_reason = None
 
-        # cli_run / structured-action output retrieval — if the most
-        # recent action was a cli_run or a calc_* / impress_* / writer_*
-        # structured action, fetch ``/tmp/_last_cli_run.json`` from the
-        # VM so the planner can see its stdout/stderr/exit. Without this
-        # the planner only sees the post-action screenshot, which
-        # doesn't surface command output (cli_run runs via
-        # subprocess.run with capture_output=True; structured actions
-        # exec() with stdout redirect). Stash on self for the
-        # planner-prompt builder; cleared again after the planner
-        # consumes it.
+        # cli_run / structured-action output: if the last action was a cli_run or a
+        # calc_*/impress_*/writer_* action, fetch /tmp/_last_cli_run.json so the planner
+        # sees stdout/stderr/exit (the post-action screenshot can't surface command output).
+        # Stashed for the prompt builder; cleared after the planner consumes it.
         self._last_cli_run_output = None
-        # ``actor_history`` is cleared on every subgoal advance, but
-        # ``self.actions`` is the cumulative action summary log so it
-        # survives that — use it to detect whether the most recent
-        # action was a cli_run / calc_* / impress_* / writer_*. The
-        # structured actions are built server-side by their respective
-        # ``action_to_runtime_script`` into a UNO runtime script, so
-        # their stdout/stderr lands in the same ``/tmp/_last_cli_run.json``
-        # sentinel and they mutate the open document — gate identically.
+        # Use self.actions (cumulative; survives the actor_history clear on subgoal advance)
+        # to detect the last action's type. Structured actions compile to a UNO runtime
+        # script whose output lands in the same sentinel, so gate them identically.
         last_action_summary = (self.actions[-1] if self.actions else "") or ""
         from mm_agents.structagent.actions.calc.actions import CALC_ACTION_NAMES as _CALC_NAMES
         from mm_agents.structagent.actions.impress.actions import IMPRESS_ACTION_NAMES as _IMPRESS_NAMES
@@ -1477,58 +1207,31 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
             except Exception as e:
                 if logger:
                     logger.debug("[cli_run] failed to fetch sentinel: %s", e)
-            # DocPerceiver / SheetPerceiver / SlidePerceiver: a
-            # calc_* / impress_* / writer_* action may have mutated the
-            # doc — mark the cached structure block stale so the next
-            # turn re-probes before building the planner prompt.
+            # A calc_*/impress_*/writer_* action may have mutated the doc — mark the
+            # cached structure block stale so the next turn re-probes.
             if (last_is_calc_action
                     or last_is_impress_action
                     or last_is_writer_action):
                 self._doc_inspect_dirty = True
 
-        # Extract domain from instruction prefix like "[libreoffice_writer] ..."
-        # Tolerate space-separated variants like "[libreoffice calc]" —
-        # OSWorld task metadata uses both; we normalize to underscore form
-        # so handler routing (which keys on "libreoffice_calc" etc.) works.
+        # Extract domain from a prefix like "[libreoffice_writer] ...". Normalize
+        # space-separated variants ("[libreoffice calc]") to underscore form for routing.
         if self._current_domain is None:
             domain_m = re.match(r'^\[([^\]]+)\]', instruction or "")
             if domain_m:
                 raw = domain_m.group(1).strip().lower().replace(" ", "_")
-                # ``[multi_apps]`` is not a real domain — it's the tag
-                # for multi-app tasks. Don't route on it; leave
-                # _current_domain unset (lib_run_single sets it from
-                # related_apps[0] before predict() in the normal path).
+                # [multi_apps] is a tag, not a domain — don't route on it (lib_run_single
+                # sets _current_domain from related_apps[0] before predict()).
                 if raw != "multi_apps":
                     self._current_domain = raw
 
-        # MULTI-APP context switch (D+E+F+G). For a multi_apps task,
-        # re-point ``_current_domain`` to the app the agent is actually
-        # OPERATING IN this turn. Everything app-specific then follows:
-        #   • ops-lib pre-upload below (G) re-uploads the new app's lib
-        #   • the perceiver block (F) re-probes via should_probe(domain)
-        #   • domain_knowledge / evidence_guide / structured-action
-        #     setup (E) are all rebuilt from _current_domain each turn
-        #
-        # Source priority:
-        #   1. PLANNER — the current subgoal's ``<step app="...">`` tag.
-        #      The planner organizes a multi-app task as per-app phases
-        #      and knows which app the current step runs in; this is the
-        #      EXECUTION-context signal and is authoritative.
-        #   2. VERIFIER (fallback) — the ledger focus-outcome's app.
-        #      Used only when the planner didn't tag the step. The
-        #      focus outcome is "the next deliverable to verify", which
-        #      can differ from "the app being operated" (a Writer
-        #      deliverable may need prerequisite work back in Calc), so
-        #      it is a fallback, not the primary driver.
-        #
-        # Gated on _is_multi_app() — single-app tasks skip this entirely,
-        # so _current_domain stays fixed exactly as before. Step 0 has no
-        # subgoal/ledger yet → no switch → initial domain stays
-        # related_apps[0].
-        #
-        # Phase advance runs FIRST: if the active phase's outcomes all
-        # verified, summarize its cross-app handoff and flip to the next
-        # phase, so the domain switch below reads the fresh active phase.
+        # MULTI-APP context switch. Re-point _current_domain to the app the agent is
+        # operating in this turn; everything app-specific (ops-lib upload, perceiver
+        # probe, domain_knowledge / structured-action setup) then follows.
+        # Source: the subgoal's <step app="..."> tag (authoritative execution context),
+        # falling back to the ledger focus-outcome's app when the planner didn't tag.
+        # Gated on _is_multi_app() (single-app tasks skip; step 0 stays related_apps[0]).
+        # Phase advance runs FIRST so the switch below reads the fresh active phase.
         if self._is_multi_app():
             try:
                 from mm_agents.structagent.ledger.core.phase_board import (
@@ -1537,16 +1240,10 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                 _pb = self._phase_board()
                 if _pb is not None and self.ledger is not None:
                     _ps = getattr(self, "_phase_start_action_idx", 0)
-                    # Pull fresh observable state for the phase auditor
-                    # (gated on enable_done_auditor — phase audit shares
-                    # the same opt-in as end-of-task DoneAuditor since
-                    # they are philosophically the same: adversarial
-                    # recheck at a completion boundary). Screenshot is
-                    # base64 of the current observation; a11y is what
-                    # the perceiver last extracted; doc_inspect_block
-                    # is the UNO probe for office tasks. None on any
-                    # missing field — the auditor handles None
-                    # gracefully and omits the section.
+                    # Observable state for the phase auditor (gated on enable_done_auditor —
+                    # same opt-in as the end-of-task DoneAuditor; both are adversarial
+                    # rechecks at a completion boundary). None on any missing field; the
+                    # auditor handles None and omits the section.
                     _audit_screenshot_b64 = None
                     try:
                         import base64 as _b64
@@ -1577,8 +1274,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                     )
                     if _advanced:
                         self._phase_start_action_idx = len(self.actions or [])
-                    # Per-turn status line — greppable phase state in
-                    # runtime.log every turn (`grep "\[PhaseBoard\]"`).
+                    # Per-turn greppable phase state (`grep "\[PhaseBoard\]"`).
                     logger.info("[PhaseBoard] %s", _pb.summary_line())
             except Exception as _e:
                 logger.warning("[Phase] advance check failed: %s", _e)
@@ -1591,37 +1287,27 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                         self._current_domain, _new_dom, _switch_src,
                     )
                     self._current_domain = _new_dom
-                    # Force the perceiver to re-probe for the new app.
-                    self._doc_inspect_dirty = True
-                    # Auto-focus the new app's window so the actor never has to
-                    # window-juggle (dock-click / Alt+Tab). ONLY on the planner's
-                    # explicit <step app=> intent ("planner step"). NOT on the
-                    # phase-board fallback: a stuck phase board would otherwise
-                    # yank focus away from the app the agent is actively typing
-                    # in (observed 6f4073b8: Calc keystrokes lost as focus
-                    # snapped back to a stuck chrome phase). Best-effort.
+                    self._doc_inspect_dirty = True  # re-probe perceiver for the new app
+                    # Auto-focus the new app's window — but ONLY on the planner's explicit
+                    # <step app=> intent, NOT the phase-board fallback: a stuck phase board
+                    # would yank focus from the app being typed in (6f4073b8: Calc keystrokes
+                    # lost as focus snapped to a stuck chrome phase). Best-effort.
                     if _switch_src == "planner step":
                         self._activate_app_for_domain(env, _new_dom)
             except Exception as _e:
                 logger.warning(
                     "[MultiApp] domain switch check failed: %s", _e)
 
-            # R1 + R3 — observe PHYSICAL app and reconcile against
-            # INTENDED. Decoupled from _current_domain (which is
-            # intent). On mismatch: push physical toward intent
-            # best-effort (auto-focus), and after N consecutive
-            # mismatches give up and demote intent to physical so the
-            # planner isn't stuck waiting for a window switch that
-            # never happens (R3 demote rule).
+            # Observe the PHYSICAL app and reconcile against INTENDED (_current_domain).
+            # On mismatch: push physical toward intent (auto-focus); after N consecutive
+            # mismatches give up and demote intent to physical so the planner isn't stuck
+            # waiting for a window switch that never happens.
             try:
                 from mm_agents.structagent.actions.app.active_app import observe_active_app
                 _a11y_raw = (obs.get("accessibility_tree")
                              if isinstance(obs, dict) else None)
                 _phys_new = observe_active_app(_a11y_raw)
-                # Every-step status — even when unchanged. Cheap (one log
-                # line) and gives us a clear signal whether R1 is firing
-                # at all. Includes a11y size so we can spot empty
-                # observations.
+                # Per-step status (even unchanged); a11y size flags empty observations.
                 logger.info(
                     "[MultiApp] physical=%s intended=%s "
                     "(a11y_xml_chars=%d, mismatch_run=%d)",
@@ -1644,20 +1330,15 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                         self._current_domain, _phys_new,
                         self._domain_mismatch_steps,
                     )
-                    # Best-effort: try to bring intended app forward.
-                    # _activate_app_for_domain is idempotent + silent
-                    # on failure; the next turn's observation tells us
-                    # if it worked.
+                    # Try to bring the intended app forward (idempotent, silent on failure).
                     self._activate_app_for_domain(env, self._current_domain)
                     from mm_agents.structagent.actions.app.active_app import (
                         app_switch_verify_enabled, switch_failure_message,
                     )
                     if app_switch_verify_enabled():
-                        # Closed loop (§8): NEVER silently rewrite the agent's
-                        # intent to match reality. After 2 mismatch turns with
-                        # a verified-failed switch, SURFACE the failure to the
-                        # planner (force_replan next turn) so the decision-
-                        # maker replans around the real cause.
+                        # Closed loop: never silently rewrite intent to match reality.
+                        # After 2 mismatch turns with a verified-failed switch, surface the
+                        # failure to the planner (force_replan next turn).
                         parsed = getattr(self, "_last_app_switch", None) or {}
                         if (self._domain_mismatch_steps >= 2
                                 and parsed.get("domain") == self._current_domain
@@ -1668,9 +1349,8 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                             logger.warning("[MultiApp] %s", reason)
                             self._domain_mismatch_steps = 0
                     elif self._domain_mismatch_steps >= 5:
-                        # Legacy behaviour (flag off): after N=5 turns of failed
-                        # reconciliation, accept reality: planner should work
-                        # with what's actually focused rather than spinning.
+                        # Legacy (flag off): after 5 failed reconcile turns, accept reality —
+                        # let the planner work with what's actually focused.
                         logger.info(
                             "[MultiApp] demote intended %s -> physical %s "
                             "after %d mismatch turns",
@@ -1686,12 +1366,10 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                 logger.warning(
                     "[MultiApp] physical observe failed: %s", _e)
 
-        # Pre-upload the per-domain ops library to the VM as a module
-        # (libreoffice_calc / libreoffice_impress). Once uploaded, every
-        # downstream structured-action + verify-shell dispatch becomes a tiny
-        # `from <mod> import *` shim instead of inlining ~120KB. Safe
-        # no-op for non-LO domains, envs without run_python_script, or
-        # repeated calls (cached by content hash).
+        # Pre-upload the per-domain ops library to the VM as a module, so downstream
+        # structured-action / verify-shell dispatch becomes a tiny `from <mod> import *`
+        # shim instead of inlining ~120KB. No-op for non-LO domains, no-runner envs, or
+        # repeat calls (cached by content hash).
         if env is not None and self._current_domain:
             try:
                 from mm_agents.structagent.actions.uno._ops_lib_remote import maybe_upload_ops_lib
@@ -1699,12 +1377,9 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
             except Exception as _e:
                 logger.warning("[ops_lib_remote] pre-upload failed: %s", _e)
 
-        # Initial-file registry (multi-app only): observe which document
-        # files are open at task start, via ONE wmctrl/lsof probe of the
-        # running env (a legitimate environment observation — it does NOT
-        # read the task spec). Lets open_app re-open the right file by
-        # path when later called without one. Runs once; gated on
-        # _is_multi_app() so single-app tasks stay byte-identical.
+        # Initial-file registry (multi-app only): one wmctrl/lsof env probe of which docs
+        # are open at task start (env observation, NOT the task spec). Lets open_app re-open
+        # the right file by path. Runs once; single-app tasks stay byte-identical.
         if (env is not None and self._is_multi_app()
                 and not self._initial_files_probed):
             self._initial_files_probed = True
@@ -1726,11 +1401,9 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
             except Exception as _e:
                 logger.warning("[InitialFiles] probe failed: %s", _e)
 
-        # Augment instruction once per task so the ledger initializer sees
-        # date-resolved + task-template-extracted fields (e.g. "destination:
-        # NYC") rather than only the raw place name ("New York"). The same
-        # enriched string is cached in `self.instruction` and reused by the
-        # initial planner prompt downstream.
+        # Augment the instruction once per task so the ledger initializer sees date-resolved
+        # + template-extracted fields (e.g. "destination: NYC") not just the raw place name.
+        # Cached in self.instruction and reused by the initial planner prompt.
         if getattr(self, "instruction", None) is None:
             self._raw_instruction = instruction
             instruction = self._pa_augment_instruction(instruction)
@@ -1738,33 +1411,19 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         else:
             instruction = self.instruction
 
-        # DocPerceiver / SheetPerceiver: re-probe the open document via
-        # UNO if the cache is dirty (task start OR a cli_run_uno mutated
-        # the doc on the previous turn). Only fires when domain is in the
-        # doc-route allowlist (libreoffice_writer / libreoffice_calc).
-        # Read-only — uses env.controller.run_python_script, separate
-        # channel from the actor's cli_run stream so it can't corrupt
-        # state.
-        # Runs BEFORE `_ledger_init_if_needed` so the resulting
-        # `self._doc_inspect_block` can be plumbed into init_ledger's
-        # prompt for office domains (replaces the noisy linearized a11y
-        # tree with the SP/DP structured block — a11y can't
-        # distinguish FORMULA vs VALUE vs EMPTY cells, which is exactly
-        # the signal init_ledger needs to pick the right answer cell).
+        # DocPerceiver / SheetPerceiver: re-probe the open doc via UNO when the cache is
+        # dirty (task start or a prior-turn mutation). Read-only, separate channel from the
+        # actor's cli_run. Runs BEFORE _ledger_init_if_needed so _doc_inspect_block feeds
+        # init_ledger's prompt — a11y can't tell FORMULA vs VALUE vs EMPTY cells, which is
+        # exactly what init_ledger needs to pick the right answer cell.
         if env is not None and self._doc_inspect_dirty:
             try:
                 from mm_agents.structagent.perception import doc_perceiver, sheet_perceiver, slide_perceiver
-                # Pick the right probe for the current domain. Writer →
-                # DocPerceiver (paragraphs/tables/cursor). Calc →
-                # SheetPerceiver (sheets/cells/formulas/charts). Impress
-                # → SlidePerceiver (slides/shapes/font properties). All
-                # three write artifacts under <results_dir>/<probe_name>/.
+                # Pick the probe by domain: Writer → DocPerceiver, Calc → SheetPerceiver,
+                # Impress → SlidePerceiver. All write under <results_dir>/<probe_name>/.
                 results_dir = getattr(self, "_results_dir", None)
-                # Fall back to the local ``step_idx`` (= len(self.actions))
-                # when the caller didn't pass ``wall_step_idx`` through
-                # ``predict()``. Without this, the SP/DP-block writer's
-                # ``step_idx:03d`` formatter crashes AND every downstream
-                # ``step_idx > 0`` comparison raises TypeError.
+                # Fall back to local step_idx when wall_step_idx wasn't passed through
+                # predict(); else the :03d formatter crashes and step_idx>0 raises TypeError.
                 step_idx = getattr(self, "_wall_step_idx", None) or step_idx
                 blk = None
                 if doc_perceiver.should_probe(self._current_domain):
@@ -1778,20 +1437,15 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                         results_dir=results_dir, step_idx=step_idx,
                     )
                 elif slide_perceiver.should_probe(self._current_domain):
-                    # Impress: split probe + render so focus_slides
-                    # (the set of slide indices the task targets) can
-                    # be extracted ONCE per task via a lightweight
-                    # LLM call and reused on every subsequent probe.
-                    # Off-focus slides collapse to a one-line summary,
-                    # keeping multi-slide deck SP blocks small.
+                    # Impress: split probe + render so focus_slides (the targeted slide
+                    # indices) are extracted once per task via a lightweight LLM call and
+                    # reused. Off-focus slides collapse to one line, keeping the block small.
                     parsed = slide_perceiver.probe(env, logger=logger)
                     if parsed is not None:
                         if self._impress_focus_slides is None:
                             try:
-                                # Adapter: slide_perceiver expects a
-                                # call_llm(messages=, model=, temperature=,
-                                # max_tokens=) callable; self.call_llm uses
-                                # a payload dict.
+                                # Adapter: slide_perceiver wants a call_llm(messages=, model=,
+                                # ...) callable; self.call_llm takes a payload dict.
                                 def _focus_llm(messages, model, temperature=0.0,
                                                max_tokens=64):
                                     return self.call_llm(
@@ -1823,7 +1477,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                             parsed,
                             focus_slides=self._impress_focus_slides,
                         )
-                        # Persist the block to disk for offline review.
+                        # Persist the block for offline review.
                         if results_dir is not None and step_idx is not None:
                             try:
                                 import os as _os_local
@@ -1843,13 +1497,10 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                     logger.info("[Perceiver] probe call raised: %s", e)
                 self._doc_inspect_dirty = False      # don't retry-loop on permanent failures
 
-        # Progress Ledger: initialize on the first call of this task.
-        # Pass env so init_ledger can run a one-shot probe of the VM
-        # (binaries, config files, GSettings schemas, processes) and
-        # ground the ledger in actual environment state. For office
-        # domains, also pass the SP/DP block produced above so the
-        # init author has the same structured cell/paragraph data the
-        # planner sees on every step.
+        # Progress Ledger: init on the first call. Pass env so init_ledger can probe the VM
+        # (binaries, config files, GSettings, processes) and ground the ledger in real state.
+        # Office domains also get the SP/DP block so the init author sees the same structured
+        # cell/paragraph data the planner does.
         self._ledger_init_if_needed(instruction, obs, env=env)
         ctx.step_idx = step_idx
         ctx.screenshot_bytes = screenshot_bytes
@@ -1859,11 +1510,10 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
 
     def _pa_advance_or_finish(self, ctx, plan, planner_decision,
                               last_subgoal_done):
-        """Subgoal-queue maintenance + terminal decisions: install/advance the
-        queue, run the DONE-acceptance gate (+ Done-Auditor) and re-plan on
-        reject, emit DONE / INFEASIBLE, and the post-REPLAN feasibility verdict.
-        Returns a (response, [actions]) tuple to TERMINATE the step (DONE /
-        INFEASIBLE / feasibility / DONE-rejected-defer), or None to continue."""
+        """Subgoal-queue maintenance + terminal decisions: install/advance the queue,
+        run the DONE-acceptance gate (+ Done-Auditor) and replan on reject, emit
+        DONE / INFEASIBLE, and the post-REPLAN feasibility verdict. Returns a
+        (response, [actions]) tuple to terminate the step, or None to continue."""
         instruction, obs, env, step_idx = (
             ctx.instruction, ctx.obs, ctx.env, ctx.step_idx)
         # --- subgoal queue maintenance ---
@@ -1880,9 +1530,8 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                 self._commit_strategy_change(step_idx)
             popped, _ = self._pop_next_subgoal(step_idx=step_idx)
             self._pa_reset_actor_burst_state()
-            # T4: snapshot disk plan after initial plan install +
-            # first subgoal pop (so plan.md reflects the focus on disk
-            # before the actor runs). See Part I.3.
+            # Snapshot plan.md after install + first pop, so disk reflects the focus
+            # before the actor runs.
             self._write_plan_snapshot(step_idx)
             if not popped:
                 self.current_subgoal = "Complete the task."
@@ -1890,28 +1539,20 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                 self.current_subgoal_app = None
                 self.current_subgoal_targets = []
         else:
-            # NOTE: subgoal-step-budget stuck detection is now handled
-            # UPFRONT by ``_decide_planner_mode_and_reason`` rule #4 —
-            # if the budget is burned, this turn's mode is already
-            # "force_replan" and the planner call above produced the
-            # recovery plan in a single call (no more same-turn 2nd
-            # planner call here).
+            # Subgoal-step-budget stuck detection is handled upfront by
+            # _decide_planner_mode_and_reason rule #4 (the planner call above already
+            # produced the recovery plan when the budget was burned).
 
-            # DONE-acceptance gate (audit + cache). The ONLY trigger
-            # that needs the planner's output as input — fires here,
-            # AFTER the planner returned DONE. On rejection we re-call
-            # the planner ONCE in force_replan mode within the same
-            # turn (the only path that produces a 2nd planner call).
+            # DONE-acceptance gate (audit + cache) — fires here, after the planner
+            # returned DONE. On rejection we re-call the planner once in force_replan
+            # mode this turn (the only path that produces a 2nd planner call).
             if planner_decision == "DONE":
                 accepted, reject_reason = self._check_done_acceptance(
                     env, obs, step_idx)
-                # T3 Done-Auditor — adversarial second opinion on the
-                # accepted DONE. Only fires when the structured gate
-                # already passed AND the flag is on AND per-task
-                # budget is non-zero. Explicit FAIL flips accepted to
-                # False and stages "done_audit_failed"; PARTIAL means
-                # the auditor lacked enough evidence to overturn the
-                # structured gate. See plan Part I.2.
+                # Done-Auditor — adversarial second opinion on the accepted DONE. Fires
+                # only when the gate passed, the flag is on, and budget remains. Explicit
+                # FAIL flips accepted=False and stages "done_audit_failed"; PARTIAL means
+                # not enough evidence to overturn the gate.
                 if (accepted
                         and self.enable_done_auditor
                         and self._done_audit_budget_remaining > 0):
@@ -1923,8 +1564,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                             "[DoneAuditor] step=%d verdict=%s reason=%s",
                             step_idx, audit_verdict,
                             (audit_reason or "")[:200])
-                    # Persist full reasoning to <results_dir>/audit_debug/
-                    # for offline triage. Best-effort.
+                    # Persist full reasoning to <results_dir>/audit_debug/ (best-effort).
                     try:
                         results_dir = getattr(self, "_results_dir", None)
                         if results_dir:
@@ -1947,14 +1587,11 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                         if logger:
                             logger.warning(
                                 "[DoneAuditor] audit_debug dump failed: %s", e)
-                    # Auditor UNAVAILABLE ≠ refutation. ``error`` set means the
-                    # call itself failed (timeout / connection / exception);
-                    # ``verdict is None`` means the response carried no parseable
-                    # PASS/FAIL/PARTIAL. Either way there is NO second opinion —
-                    # keep the structured gate's acceptance (fail-open, same as
-                    # the phase-handoff audit) instead of converting an infra
-                    # blip into a forced replan of a finished task. (One run had
-                    # 27 tasks' accepted DONEs refuted purely by API timeouts.)
+                    # Auditor UNAVAILABLE ≠ refutation. error = the call failed
+                    # (timeout/connection); verdict is None = no parseable PASS/FAIL/PARTIAL.
+                    # Either way there's no second opinion — keep the gate's acceptance
+                    # (fail-open) rather than turning an infra blip into a forced replan of a
+                    # finished task. (One run had 27 accepted DONEs refuted by API timeouts.)
                     _auditor_unavailable = bool(
                         getattr(audit_result, "error", None)
                         or getattr(audit_result, "verdict", None) is None)
@@ -1974,9 +1611,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                         self._force_replan_category_pending = (
                             "done_audit_failed")
                         self._done_audit_reject_count += 1
-                        # Mirror into the legacy counter that
-                        # _decide_planner_mode_and_reason's downstream
-                        # consumers may already be reading.
+                        # Mirror into the legacy counter some downstream consumers read.
                         self._done_rejected_count = (
                             getattr(self, "_done_rejected_count", 0) + 1)
                     elif audit_verdict == "PARTIAL" and logger:
@@ -1995,13 +1630,10 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                         plan = plan2
                         planner_decision = "REPLAN"
                     else:
-                        # Planner gave no <plan> on the rejection retry.
-                        # Re-stage the reason and defer one turn so the
-                        # next turn's mode-decision rule #3 fires
-                        # force_replan again (avoids re-running the
-                        # actor on the now-stale current_subgoal which
-                        # would silently undo work — e.g. uncheck a
-                        # filter that was already toggled correctly).
+                        # No <plan> on the rejection retry. Re-stage the reason and defer
+                        # one turn so rule #3 fires force_replan again — avoids re-running
+                        # the actor on the stale current_subgoal, which would silently undo
+                        # work (e.g. uncheck a filter that was already correct).
                         if logger:
                             logger.info(
                                 "[Planner] DONE rejected with no new "
@@ -2016,10 +1648,8 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
 
             if planner_decision == "DONE":
                 self.all_done_after_step = True
-                # Fallback: planner emits DONE without the actor ever
-                # routing through the sentinel detection above. Scan
-                # planner_response for the answer so the runner still
-                # has something to score.
+                # Fallback: planner emits DONE without the actor hitting the sentinel
+                # above — scan planner_response so the runner still has an answer to score.
                 if ((self._is_text_answer_task or self._is_mmina_task)
                         and not self._text_answer
                         and self.planner_response):
@@ -2027,21 +1657,18 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                     _ta = extract_text_answer(self.planner_response)
                     if _ta:
                         self._text_answer = _ta
-                        self._mmina_answer = _ta    # legacy mirror
+                        self._mmina_answer = _ta
                 if logger:
                     logger.info("[PA-Planner] DONE — task complete, returning terminate action.")
                 self.actions.append("DONE (planner)")
                 return "Planner decided DONE — task is complete.", ["pyautogui.hotkey('Escape')"]
 
             elif planner_decision == "INFEASIBLE":
-                # Agent's own task-level infeasibility verdict (only offered by
-                # the stuck/force-replan contract after ≥2 abandoned approaches).
-                # Emit a terminal FAIL action so env.action_history ends with
-                # FAIL — exactly what OSWorld's "infeasible" evaluator scores 1.0.
-                # Crucially we do NOT set all_done_after_step: that path ends the
-                # episode WITHOUT executing any action (see lib_run_single), which
-                # would drop the FAIL. Returning ["FAIL"] makes the loop run
-                # env.step("FAIL"), which itself sets done=True and stops.
+                # Agent's own infeasibility verdict (only offered after ≥2 abandoned
+                # approaches). Emit a terminal FAIL so action_history ends with FAIL —
+                # what OSWorld's "infeasible" evaluator scores 1.0. Do NOT set
+                # all_done_after_step: that ends the episode WITHOUT an action, dropping the
+                # FAIL. Returning ["FAIL"] runs env.step("FAIL"), which sets done and stops.
                 if logger:
                     logger.info("[PA-Planner] INFEASIBLE — task judged impossible, emitting FAIL.")
                 self.actions.append("FAIL (planner: infeasible)")
@@ -2049,34 +1676,25 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
 
             elif planner_decision == "CONTINUE":
                 if last_subgoal_done is True:
-                    # Advance queue: current subgoal verified done, move to next.
-                    # (Ledger summarizer is now fired periodically every N
-                    # actor turns + at DONE, not at every CONTINUE boundary.)
-                    # Reset the "stuck on self-REPLAN without progress"
-                    # counter — a freshly-completed subgoal is the signal
-                    # that the task is advancing again.
+                    # Current subgoal done → advance the queue. A freshly-completed subgoal
+                    # means the task is advancing, so reset the self-REPLAN stuck counter.
                     self._replans_since_last_progress = 0
                     if self.current_subgoal:
                         self.completed_subgoals.append(self.current_subgoal)
                     popped, _skipped = self._pop_next_subgoal(step_idx=step_idx)
                     self._pa_reset_actor_burst_state()
                     if not popped:
-                        # Queue empty mid-task — install end-state
-                        # placeholder. The next turn's mode-decision
-                        # rule #5 will fire force_replan if it's still
-                        # active (i.e. this turn's actor didn't push
-                        # the task to DONE).
+                        # Queue empty mid-task — install an end-state placeholder. Rule #5
+                        # fires force_replan next turn if the actor didn't reach DONE.
                         self.current_subgoal = "All planned subgoals completed. Please confirm task is done or add missing steps."
                         self.current_subgoal_expected_post_state = None
                         self.current_subgoal_app = None
                         self.current_subgoal_targets = []
                     self._ledger_subgoal_plan_step = self.current_subgoal or ""
-                # else: stay on the same subgoal; actor will retry with
-                # the planner's feedback_to_actor hint piped in below.
+                # else: stay on the same subgoal; actor retries with feedback_to_actor.
 
             elif planner_decision == "REPLAN" and plan is not None:
-                # Ledger summarizer is now fired periodically + at DONE;
-                # this branch only swaps the queue.
+                # Just swap the queue (the summarizer fires periodically + at DONE).
                 parsed_steps = self._pa_parse_plan_into_subgoals(plan)
                 self.subgoal_queue = [s["text"] for s in parsed_steps]
                 self.subgoal_expected_post_states = [
@@ -2088,67 +1706,47 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                 self._pop_next_subgoal(step_idx=step_idx)
                 self._pa_reset_actor_burst_state()
                 self._ledger_subgoal_plan_step = self.current_subgoal or ""
-                # T4: snapshot disk plan after REPLAN swap. See Part I.3.
-                self._write_plan_snapshot(step_idx)
+                self._write_plan_snapshot(step_idx)  # snapshot plan.md after the swap
 
-                # REPLAN cadence counters — track "planner self-REPLANs
-                # without committing any subgoal." The actor-side
-                # subgoal-step-cap can't catch this because each REPLAN
-                # resets current_subgoal_step to 0. The threshold check
-                # itself + side effects (abandon + ledger.add_failed_path
-                # + reason composition) live in
-                # _decide_planner_mode_and_reason rule #6, fired at the
-                # START of the next turn. Here we just bump the counters.
+                # REPLAN cadence counters: track "planner self-REPLANs without committing
+                # a subgoal" — the actor-side step-cap can't catch it (each REPLAN resets
+                # current_subgoal_step). The threshold check + side effects live in
+                # _decide_planner_mode_and_reason rule #6 next turn; here we just bump.
                 self._total_replan_count += 1
                 self._replans_since_last_progress += 1
-                # Two-layer FailedPath: detect strategy switch + log
-                # an event into ``self._strategy_history``. The curator
-                # below decides whether/how this becomes a recorded
-                # FailedPath.
+                # Detect a strategy switch + log it; the curator decides if it becomes a
+                # recorded FailedPath.
                 self._commit_strategy_change(step_idx)
-                # LLM dead-end curator: re-derive ledger.failed_paths
-                # from the FULL strategy + action-stuck history. Runs
-                # once per REPLAN commit. The curator can drop /
-                # merge / revise entries it previously wrote — so a
-                # "different-looking" strategy that's actually the
-                # same approach as one already in the list won't
-                # produce a fuzzy duplicate.
+                # LLM dead-end curator: re-derive ledger.failed_paths from the full strategy
+                # + action-stuck history (can drop/merge/revise its own prior entries so a
+                # relabeled-but-same approach doesn't become a fuzzy duplicate).
                 self._curate_failed_paths(step_idx)
-                # Fix 1 — evidence-driven feasibility verdict. After K
-                # cumulative force-replans, ask the verifier model whether the
-                # task is genuinely INFEASIBLE (emit FAIL) rather than worth
-                # another replan. Conservative: only a DIRECT "feature/resource
-                # absent" verdict returns FAIL; everything else falls through
-                # and the freshly-installed plan runs as normal.
+                # Feasibility verdict: after K cumulative replans, ask the verifier whether
+                # the task is genuinely INFEASIBLE. Conservative — only a direct
+                # "feature/resource absent" returns FAIL; else the new plan runs as normal.
                 _fv = self._maybe_feasibility_verdict(step_idx)
                 if _fv is not None:
                     return _fv
         return None
 
     def _pa_run_planner(self, ctx):
-        """Planner phase: decide the mode (initial / force_replan /
-        progress_check), run the failure-attribution v2 pre-replan hook (which
-        may skip the planner call via actor_redo / verifier_override / env_
-        intervention), otherwise call the planner once. Sets self.planner_parsed
-        / self.feedback_to_actor and returns
+        """Planner phase: decide the mode (initial / force_replan / progress_check),
+        run the failure-attribution v2 pre-replan hook (which may skip the planner call
+        via actor_redo / verifier_override / env_intervention), else call the planner once.
+        Sets self.planner_parsed / self.feedback_to_actor; returns
         (plan, planner_decision, parsed, last_subgoal_done)."""
         instruction, obs, env, step_idx = (
             ctx.instruction, ctx.obs, ctx.env, ctx.step_idx)
-        # === PLANNER: mode-driven, one call per step ====================
-        # Decide UPFRONT which prompt branch this turn needs (initial /
-        # force_replan / progress_check). Side effects of force_replan
-        # (abandoned_subgoals append, ledger.add_failed_path, counter
-        # resets) happen inside the helper so the caller doesn't need
-        # to re-derive them. See _decide_planner_mode_and_reason for
-        # the full rule list.
+        # PLANNER: mode-driven, one call per step. Decide upfront which prompt branch
+        # this turn needs; force_replan side effects (abandoned_subgoals,
+        # ledger.add_failed_path, counter resets) happen inside the helper. See
+        # _decide_planner_mode_and_reason for the rule list.
         mode, mode_reason = self._decide_planner_mode_and_reason(
             env, obs, step_idx)
         if mode == "force_replan" and mode_reason:
             # Stage for _pa_build_subgoal_check_prompt → <stuck_reason>.
             self._force_replan_reason = mode_reason
-        # T1: snapshot current counters + transition receipt onto
-        # ``self._recovery_state`` for tests + future T3 escalation reads.
-        # Read-only mirror — does not change dispatcher behavior.
+        # Read-only mirror of counters + transition receipt for tests / future escalation.
         self._finalize_recovery_state(mode, step_idx)
         if logger:
             logger.info(
@@ -2156,31 +1754,21 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                 step_idx, mode,
                 (mode_reason[:160] if mode_reason else ""))
 
-        # ── Failure-attribution v2 pre-replan hook ────────────────────
-        # When ``USE_FAILURE_ATTRIBUTION=1`` and we're about to enter
-        # the planner's force_replan path, run diagnose+router FIRST.
-        # If the router decides ``actor_redo``, we:
-        #   • stash the prose-level recovery payload for the actor
-        #   • synthesize a CONTINUE decision so the existing
-        #     subgoal_queue is kept
-        #   • consume the force_replan state flags
-        #   • SKIP the planner LLM call entirely (one fewer LLM call,
-        #     and the planner can't accidentally re-plan around an
-        #     actor-side glitch)
-        # Otherwise we just cache the router decision on self so the
-        # planner's force_replan prompt builder reuses it instead of
-        # re-calling diagnose_failure (preventing duplicate LLM calls).
+        # Failure-attribution v2 pre-replan hook. With USE_FAILURE_ATTRIBUTION=1 and about
+        # to enter force_replan, run diagnose+router first. On actor_redo: stash the prose
+        # recovery payload, synthesize CONTINUE (keep the queue), consume force_replan flags,
+        # and SKIP the planner call (one fewer call; the planner can't re-plan around an
+        # actor glitch). Otherwise cache the router decision so the force_replan prompt
+        # builder reuses it instead of re-calling diagnose_failure.
         _skipped_planner = False
-        # USE_FAILURE_ATTRIBUTION: off/unset = v1 (production default);
-        # on = v2 LIVE — verifier_override actually flips the focus
-        # outcome to VERIFIED via a synthetic KeyNode. The dry-run middle
-        # tier is gone; safety gates inside the router still apply.
+        # USE_FAILURE_ATTRIBUTION off = v1 (production default); on = v2 LIVE
+        # (verifier_override flips the focus outcome to VERIFIED via a synthetic KeyNode;
+        # router safety gates still apply).
         _attribution_active = self.cfg.failure_attribution
         _verifier_override_live = _attribution_active
-        # IMPOSSIBLE is a definitive actor verdict — skip the diagnose+route hook
-        # (which would mislabel it role=actor → actor_redo, retry the impossible,
-        # and never bump _total_replan_count). Consume the flag each planner turn;
-        # falling through runs a normal planner force_replan (REPLAN → count++).
+        # IMPOSSIBLE is definitive — skip the diagnose+route hook (it would mislabel it
+        # actor_redo, retry the impossible, never bump _total_replan_count). Consume the
+        # flag; falling through runs a normal force_replan (count++).
         _impossible_skip = getattr(self, "_actor_emitted_impossible", False)
         self._actor_emitted_impossible = False
         if (mode == "force_replan"
@@ -2233,18 +1821,14 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                                 _decision.reason[:200],
                             )
                         if _decision.kind == "actor_redo":
-                            # Pure skip — no planner LLM call this turn.
+                            # Pure skip — no planner call this turn.
                             self._pending_actor_recovery_payload = (
                                 _decision.params)
-                            # Consume force_replan state so next turn's
-                            # dispatcher doesn't re-trigger force_replan
-                            # for the same situation.
+                            # Consume force_replan state so next turn doesn't re-trigger it.
                             self._force_replan_reason = None
                             self._force_replan_category = None
                             self._force_replan_category_pending = None
-                            # Synthesize a no-op planner result so the
-                            # downstream control flow sees CONTINUE +
-                            # the existing subgoal_queue untouched.
+                            # Synthesize a no-op planner result → CONTINUE, queue untouched.
                             plan = None
                             planner_decision = "CONTINUE"
                             self.planner_parsed = {
@@ -2256,10 +1840,8 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                             self._dump_stuck_reason = _decision.reason
                             _skipped_planner = True
                         elif _decision.kind == "verifier_override":
-                            # Side-effect: synthesize KN_OUTCOME_SATISFIED
-                            # on the focus outcome. Always LIVE when v2
-                            # is on (USE_FAILURE_ATTRIBUTION=1); router
-                            # safety gates remain the only guard.
+                            # Synthesize KN_OUTCOME_SATISFIED on the focus outcome. LIVE when
+                            # v2 is on; router safety gates are the only guard.
                             from mm_agents.structagent.attribution.failure_attribution_executor import (
                                 apply_verifier_override,
                             )
@@ -2271,10 +1853,8 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                                 dry_run=not _verifier_override_live,
                             )
                             self._last_verifier_override_audit = _vo_audit
-                            # Consume force_replan flags regardless of
-                            # apply status — even a dry-run logged event
-                            # should not re-trigger force_replan next
-                            # turn.
+                            # Consume force_replan flags regardless of apply status (even a
+                            # dry-run event must not re-trigger force_replan next turn).
                             self._force_replan_reason = None
                             self._force_replan_category = None
                             self._force_replan_category_pending = None
@@ -2292,8 +1872,8 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                                 f"{_vo_audit.get('status')}")
                             _skipped_planner = True
                         elif _decision.kind == "env_intervention":
-                            # Side-effect: only ``wait`` is auto-executed
-                            # today; other kinds fall back to planner.
+                            # Only ``wait`` is auto-executed today; other kinds fall back to
+                            # the planner.
                             from mm_agents.structagent.attribution.failure_attribution_executor import (
                                 apply_env_intervention,
                             )
@@ -2322,8 +1902,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                                     f"{_ei_audit.get('recovery_kind')}")
                                 _skipped_planner = True
                             else:
-                                # Cache as planner_replan fallback for
-                                # the v2 branch in planner.py.
+                                # Cache as planner_replan fallback for planner.py's v2 branch.
                                 if logger:
                                     logger.info(
                                         "[FailureAttribution v2] env_"
@@ -2333,8 +1912,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                                 self._cached_failure_attribution_decision = (
                                     _decision)
                         else:
-                            # planner_replan / fallback_planner — cache
-                            # the decision so planner's existing v2 hook
+                            # planner_replan / fallback_planner — cache so planner's v2 hook
                             # reuses it (no duplicate LLM call).
                             self._cached_failure_attribution_decision = (
                                 _decision)
@@ -2359,19 +1937,14 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
 
     def _pa_post_planner(self, ctx, parsed, plan, planner_decision,
                          last_subgoal_done):
-        """Post-planner bookkeeping: dispatch <notebook_audit> note_write calls,
-        log the Bottleneck, reset coord counters on a completed subgoal, clear
-        legacy actor flags, install current_plan on step0/REPLAN, and default a
-        missing decision to REPLAN. Returns the (possibly updated) planner_decision."""
+        """Post-planner bookkeeping: dispatch <notebook_audit> note_write calls, log the
+        Bottleneck, clear legacy actor flags, install current_plan on step0/REPLAN, and
+        default a missing decision to REPLAN. Returns the (possibly updated) decision."""
         step_idx = ctx.step_idx
-        # Execute <notebook_audit><writes> note_write calls BEFORE the
-        # actor runs this turn's first <step>. These are NOT subgoals
-        # — they're host-side Notebook updates the planner declared in
-        # its plan header. Running them now means the very next
-        # decomposer / actor call sees them in the [Notebook] block on
-        # the SAME turn (no round-trip needed). Idempotent: re-running
-        # on a 2nd planner call (e.g. DONE-rejection retry) just
-        # overwrites the same keys.
+        # Execute <notebook_audit><writes> note_write calls before the actor runs this
+        # turn's first <step>. These are host-side Notebook updates (not subgoals);
+        # running them now lets the next decomposer/actor call see them in [Notebook] the
+        # SAME turn. Idempotent — a 2nd planner call just overwrites the same keys.
         _nb_writes = parsed.get("notebook_writes") or []
         if _nb_writes:
             from mm_agents.structagent.actions.handlers.notebook import handle_note_write
@@ -2382,9 +1955,8 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                     if (ast_call
                             and ast_call.get("function") == "note_write"
                             and isinstance(ast_call.get("args"), dict)):
-                        # A7: Facts-only persistence (notebook deleted).
-                        # owning_outcome defaults to current focus; routes
-                        # to global_facts when no focus is set.
+                        # Facts-only persistence: owning_outcome defaults to current focus,
+                        # routes to global_facts when no focus is set.
                         _focus = None
                         try:
                             _f = self.ledger.next_focus_outcome() if self.ledger else None
@@ -2416,21 +1988,17 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                             "call(s) before actor (failures=%d)",
                             step_idx, n_ok, n_fail)
 
-        # Visibility log: surface the planner's <Bottleneck> (its
-        # one-sentence synthesis of the current blocker) in runtime.log.
-        # The cadence trigger reuses this same string as the strategy
-        # abstract for its failed_paths writes, so seeing it logged here
-        # explains what shows up later in the ledger.
+        # Log the planner's <Bottleneck> (its one-sentence blocker synthesis). The cadence
+        # trigger reuses this string as the strategy abstract for failed_paths writes.
         if logger:
             bn = parsed.get("bottleneck")
             if bn:
                 logger.info("[PA-Planner] Bottleneck: %s", bn[:240])
 
-        # Consume stale legacy flags (not used by the new planner-every-step flow)
+        # Consume stale legacy flags (unused by the planner-every-step flow).
         self.actor_subgoal_done_for_planner = False
         self.actor_exhausted_for_planner = False
 
-        # Update current_plan when step 0 or REPLAN
         if plan is not None and (step_idx == 0 or planner_decision == "REPLAN"):
             self.current_plan = plan
 
@@ -2439,16 +2007,10 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         return planner_decision
 
     def _pa_reset_progress_counter(self):
-        """Reset the REPLAN-cadence counter when the KeyNode detector saw a
-        fresh outcome-satisfied / value-committed this turn (real progress)."""
-        # Progress-detection: if the KeyNode detector saw a fresh
-        # outcome satisfied or value committed THIS turn, reset the
-        # REPLAN-cadence counter. Without this, a turn whose actor
-        # actually broke through (e.g. clicked the right button and
-        # the resulting outcome got verified) can still trigger
-        # rule #6 force_replan because the counter is bumped on
-        # planner_decision == "REPLAN" regardless of whether the
-        # underlying state actually advanced.
+        """Reset the REPLAN-cadence counter when the KeyNode detector saw a fresh
+        outcome-satisfied / value-committed this turn (real progress). Without it, a
+        breakthrough turn could still trip rule #6 since the counter is bumped on every
+        REPLAN regardless of whether state actually advanced."""
         try:
             cand = getattr(self, "_candidate_step", None)
             if cand is not None and getattr(cand, "key_nodes", None):
@@ -2476,29 +2038,23 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
 
     def _pa_predict(self, instruction: str, obs: dict, env=None,
                     wall_step_idx: Optional[int] = None) -> Tuple[str, List[str]]:
-        """Planner-actor predict: planner decides subgoal, actor executes it.
+        """Planner-actor predict: planner decides the subgoal, actor executes it.
         Returns (response_text, [pyautogui_code_strings]).
 
-        Planner runs every turn (Phase-2 unified contract — folds the
-        old _pa_check_subgoal_done + _correct_plan calls into a single
-        prompt). The mode (initial / force_replan / progress_check) is
-        chosen UPFRONT by ``_decide_planner_mode_and_reason`` and routed
-        through the right prompt builder. ~95% of turns are 1 planner
-        call; the only path that produces 2 is when the planner emits
-        DONE and the audit + cache-gate combination rejects it.
+        The planner runs every turn (unified contract — one prompt folds the old
+        _pa_check_subgoal_done + _correct_plan). Mode (initial / force_replan /
+        progress_check) is chosen upfront by _decide_planner_mode_and_reason. ~95% of
+        turns are 1 planner call; the only 2-call path is a DONE rejected by the gate.
         """
-        # 0) Per-step setup → planner-ready state (see _pa_begin_step).
+        # Per-step setup → planner-ready state.
         ctx = _StepContext(instruction=instruction, obs=obs, env=env,
                            wall_step_idx=wall_step_idx)
         self._pa_begin_step(ctx)
 
-        # working memory — build candidate StepRecord and run KeyNode
-        # detector BEFORE the planner sees its prompt, so the ledger's
-        # to_prompt_block() reflects fresh outcome state ([verified] /
-        # [REVERTED] / [pending]). No-op when MEMORY_VERSION=v1.
+        # working memory — build the candidate StepRecord before the planner's prompt so
+        # ledger.to_prompt_block() reflects fresh outcome state. No-op when MEMORY_VERSION=v1.
         self._pre_planner(ctx.obs, ctx.step_idx, env=ctx.env)
 
-        # Reset REPLAN cadence when the KeyNode detector saw progress this turn.
         self._pa_reset_progress_counter()
 
         burst_decision = self._pa_actor_burst_precheck(ctx)
@@ -2521,40 +2077,34 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
             self.actor_subgoal_done_for_planner = False
             self.actor_exhausted_for_planner = False
 
-        # === PLANNER phase — mode + failure-attribution + one planner call.
+        # PLANNER phase — mode + failure-attribution + one planner call.
         plan, planner_decision, parsed, last_subgoal_done = \
             self._pa_run_planner(ctx)
 
-        # Post-planner bookkeeping (notebook writes, current_plan, etc.).
         planner_decision = self._pa_post_planner(
             ctx, parsed, plan, planner_decision, last_subgoal_done)
 
-        # 1) Advance the subgoal queue / handle terminal decisions. Returns a
-        #    (response, actions) tuple to end the step, else None to run the actor.
+        # Advance the queue / handle terminal decisions; a tuple ends the step.
         finish = self._pa_advance_or_finish(
             ctx, plan, planner_decision, last_subgoal_done)
         if finish is not None:
             return finish
 
-        # 2) ACTOR phase — subgoal execution; always returns (response, actions).
+        # ACTOR phase — subgoal execution.
         return self._pa_run_actor(ctx)
 
     def _maybe_feasibility_verdict(self, step_idx):
-        """Fix 1 — at >= K cumulative force-replans, ask the verifier model
-        whether the task is genuinely INFEASIBLE. Returns the ``_pa_predict``
-        ``(reason, ["FAIL"])`` tuple to emit a terminal FAIL, or ``None`` to
-        keep replanning.
+        """At >= K cumulative force-replans, ask the verifier whether the task is
+        genuinely INFEASIBLE. Returns the (reason, ["FAIL"]) tuple to emit a terminal
+        FAIL, or None to keep replanning.
 
-        Gated behind ENABLE_FEASIBILITY_VERDICT. Conservative by construction:
-        any non-INFEASIBLE verdict (incl. parse-fail / error) → None. Re-checks
-        every FEASIBILITY_RECHECK_EVERY replans so a task that accumulates more
-        evidence later still gets judged, while bounding the call count.
+        Gated behind ENABLE_FEASIBILITY_VERDICT. Conservative: any non-INFEASIBLE
+        verdict (incl. parse-fail/error) → None. Re-checks every FEASIBILITY_RECHECK_EVERY
+        replans so later evidence still gets judged while bounding the call count.
 
-        The brief is built from the live runtime.log via the SAME extractor the
-        replay validation used — see attribution/feasibility_verdict.py's
-        CONSISTENCY CONTRACT. Emitting ["FAIL"] mirrors the planner-INFEASIBLE
-        dispatch: env.step("FAIL") sets done and makes action_history end with
-        FAIL, which is exactly what OSWorld's infeasible evaluator scores 1.0.
+        The brief comes from runtime.log via the same extractor the replay validation used
+        (see attribution/feasibility_verdict.py). Emitting ["FAIL"] mirrors the
+        planner-INFEASIBLE dispatch (env.step("FAIL") → OSWorld infeasible evaluator = 1.0).
         """
         if not self.cfg.feasibility_verdict:
             return None
@@ -2565,8 +2115,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
             recheck_every = self.cfg.feasibility_recheck_every
         except ValueError:
             K, recheck_every = 8, 6
-        # Trigger at K cumulative replans OR N consecutive actor-IMPOSSIBLEs
-        # (early-out for tasks the actor keeps declaring undoable).
+        # Trigger at K cumulative replans OR 3 consecutive actor-IMPOSSIBLEs.
         if (self._total_replan_count < K
                 and self._consecutive_impossible_count < 3):
             return None
@@ -2581,7 +2130,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                             errors="replace").read()
         except OSError:
             return None
-        # Mark BEFORE the call so a judge crash still advances the cadence.
+        # Mark before the call so a judge crash still advances the cadence.
         self._last_feasibility_check_at_replan = self._total_replan_count
         import logging
         _log = logging.getLogger("desktopenv.qwen25vl_agent")
@@ -2604,14 +2153,9 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
 
     def predict(self, instruction: str, obs: Dict, env=None,
                 wall_step_idx: Optional[int] = None) -> List:
-        """Predict the next action(s) based on the current observation.
-
-        Thin entry point — delegates to ``_pa_predict``. ``wall_step_idx``
-        is the OUTER step counter from lib_run_single (env.step calls so
-        far). Currently unused inside ``_pa_predict`` — kept on the
-        signature for callers in lib_run_single and for any future
-        wall-step-keyed logic.
-        """
+        """Predict the next action(s). Thin entry point — delegates to ``_pa_predict``.
+        ``wall_step_idx`` is the outer step counter from lib_run_single; currently
+        unused inside _pa_predict but kept on the signature for callers + future use."""
         return self._pa_predict(instruction, obs, env=env,
                                 wall_step_idx=wall_step_idx)
 

@@ -1,40 +1,21 @@
 """Phase 3 — L3c domain-rule polish: per-domain meta-aggregation over L2 skills.
 
-For each domain, gather all L2 skills whose dominant member-domain is
-that domain, and meta-polish them into a single "domain rule sheet" —
-invariants, common widgets/dialogs, shortcuts, and pitfalls that hold
-ACROSS that domain's tasks regardless of specific plan.
+For each domain, gather its L2 skills (by dominant member-domain) and
+meta-polish them into one "domain rule sheet": invariants, common
+widgets/dialogs, shortcuts, and pitfalls that hold across the domain
+regardless of the specific plan.
 
-Examples:
-  libreoffice_calc → invariant "All formulas start with =;  cell refs
-                                 are case-insensitive in display but
-                                 stored upper-case"
-                  → widget "Format > Cells dialog" used for number /
-                            alignment / border formatting across most
-                            calc tasks
-                  → shortcut "F2 enters edit mode of selected cell"
-
-vs L2 (specific plan: "Create bar chart from financial data...")
-vs L3a (cluster-level: "When inserting images, file dialog opens
-        regardless of which office app...")
-
-L3c is the most aggregated / coarsest tier. One emit per domain. We
-truncate per-skill text aggressively because Sonnet sees 30-150 skill
-summaries in one prompt; the LLM extracts the invariants that recur.
-
-Workflow:
-  1. ``--render-only --domain libreoffice_calc``  dump prompt only
-  2. ``--domain libreoffice_calc``                polish ONE domain
-  3. ``--all``                                    polish every domain
-                                                  with >= MIN_DOMAIN_SKILLS
+Coarsest tier (one emit per domain), above L2 (per-plan) and L3a
+(per-cluster). Per-skill text is truncated hard since Sonnet sees
+30-150 skill summaries in one prompt.
 
 Run:
   PYTHONPATH=. python -m mm_agents.structagent.memory.offline.polish.polish_l3c \\
-      --render-only --domain libreoffice_calc
+      --render-only --domain libreoffice_calc   # dump prompt only
   PYTHONPATH=. python -m mm_agents.structagent.memory.offline.polish.polish_l3c \\
-      --domain libreoffice_calc
+      --domain libreoffice_calc                 # one domain
   PYTHONPATH=. python -m mm_agents.structagent.memory.offline.polish.polish_l3c \\
-      --all --workers 4
+      --all --workers 4                         # all domains >= MIN_DOMAIN_SKILLS
 """
 from __future__ import annotations
 
@@ -158,8 +139,8 @@ weak entries.
 
 
 def collect_l2_skills_by_domain() -> Dict[str, List[Dict[str, Any]]]:
-    """Group all L2 skills by their dominant domain (via supporting
-    task_hashes → UnifiedRecord.domain). Returns dict[domain → list[skill]]."""
+    """Group L2 skills by dominant domain (via task_hashes → record.domain).
+    Returns dict[domain -> list[skill]]."""
     logger.info("Loading unified pool for hash→domain lookup...")
     hash_idx = {r.task_hash: r for r in pool_all_sources()}
 

@@ -1,26 +1,19 @@
 """Pre-built LibreOffice Writer operations exposed to the actor.
 
-The string :data:`WRITER_OPS_LIBRARY` is concatenated into every
-``cli_run_uno`` script whose domain is ``libreoffice_writer``, right
-after the connect + domain setup blocks (see
-``cli_run_uno_helpers._ops_library_for``). It defines ``op_*(...)``
-mutation operations the actor invokes through ``writer_*`` structured
-JSON actions — the actor never writes UNO Python itself.
+:data:`WRITER_OPS_LIBRARY` is concatenated into every ``cli_run_uno`` script
+for ``libreoffice_writer`` (after the connect + setup blocks; see
+``cli_run_uno_helpers._ops_library_for``). It defines ``op_*`` mutation ops
+the actor invokes through ``writer_*`` structured JSON actions, so the actor
+never writes UNO Python itself. Calc/Impress equivalents live in
+``calc_ops_lib`` / ``impress_ops_lib``.
 
-This module is the first piece of the Writer structured-action
-subsystem (the Calc / Impress equivalents already exist as
-``calc_ops_lib`` / ``impress_ops_lib``). It currently exposes one op:
-``op_paste_at`` — paste the clipboard at a precise document location.
-
-Design contract (same as calc_ops_lib):
-  * Every op is keyword-only (``*,``) so the actor cannot get arg
-    order wrong.
-  * Ops rely on the wrapper-bound globals — for Writer:
-    ``doc``, ``text``, ``view_cursor``, ``remote_ctx`` — and do NOT
-    re-connect to UNO.
+Contract (same as calc_ops_lib):
+  * Ops are keyword-only (``*,``) so arg order can't be wrong.
+  * Ops use the wrapper-bound globals (``doc``, ``text``, ``view_cursor``,
+    ``remote_ctx``) and do NOT re-connect to UNO.
   * Mutating ops end with ``doc.store()``.
-  * Ops raise ``ValueError`` for input that cannot succeed; the
-    wrapper catches it and surfaces the traceback to the planner.
+  * Ops raise ``ValueError`` on input that can't succeed; the wrapper
+    surfaces the traceback to the planner.
 """
 
 WRITER_OPS_LIBRARY = '''

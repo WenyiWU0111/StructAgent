@@ -1,31 +1,18 @@
 """Helpers for the ``edit_json`` actor action.
 
-The actor (decomposer) emits a step like
-    {"action": "edit_json",
-     "path": "~/.config/Code/User/keybindings.json",
-     "op": "append_entry",
-     "data": {"key":"ctrl+j", ...}}
-
-Upstream this becomes a string ``edit_json(path=..., op=..., data=...)``,
-which ``_pa_to_pyautogui`` converts into a Python script. The script
-runs **on the VM** via ``execute_python_command`` and:
-
-  1. Reads the current file (if it exists), strips JSONC comments,
-     parses to a Python value (default container based on op when
-     parse fails or file empty / missing).
-  2. Applies the op transformation deterministically.
-  3. Writes back via json.dump (always emits valid JSON).
-  4. VS Code (if running) auto-reloads via inotify; we never pkill.
+The actor emits a step like
+    {"action": "edit_json", "path": "~/.config/Code/User/keybindings.json",
+     "op": "append_entry", "data": {"key":"ctrl+j", ...}}
+which ``_pa_to_pyautogui`` turns into a Python script run on the VM: read +
+strip JSONC + parse (default container per op on failure), apply the op,
+json.dump back (always valid JSON; VS Code auto-reloads via inotify, no pkill).
 
 Three ops, no merge:
-
   set_key             — cur is dict; cur.update(data)
-  append_entry        — cur is list; append data (or extend if data is list)
-  remove_entry_by_key — cur is list; remove entries where ALL fields in
-                         data match (matcher dict)
+  append_entry        — cur is list; append/extend data
+  remove_entry_by_key — cur is list; drop entries matching ALL fields in data
 
-This module is pure-Python with no VM-only deps so the unit tests can
-exercise it directly.
+Pure-Python with no VM-only deps so unit tests can exercise it directly.
 """
 from __future__ import annotations
 import json
@@ -38,29 +25,22 @@ from typing import Any, Dict, List
 # --------------------------------------------------------------------------- #
 
 def strip_jsonc_comments(text: str) -> str:
-    """Strip ``//`` line comments and ``/* */`` block comments.
+    """Strip ``//`` line and ``/* */`` block comments.
 
-    VS Code's settings.json/keybindings.json are JSONC (JSON with
-    Comments). The default stub VS Code creates contains lines like
-    ``// Place your key bindings in this file...``. ``json.loads``
-    chokes on these — we strip them before parsing.
-
-    Naive: doesn't try to preserve comments inside string literals.
-    For OSWorld config files this is fine — they don't contain ``//``
-    inside string values."""
+    VS Code's settings.json/keybindings.json are JSONC; ``json.loads`` chokes
+    on the default stub's ``// Place your key bindings...``. Naive — doesn't
+    spare ``//`` inside string literals, but OSWorld config files don't have
+    any."""
     if not text:
         return ""
-    # Remove block comments first
     text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
-    # Remove line comments
     text = re.sub(r'//[^\n]*', '', text)
     return text.strip()
 
 
 def parse_jsonc_or_default(raw_text: str, default: Any) -> Any:
-    """Parse JSONC text; on failure return ``default``. ``default``
-    determines the empty container shape (e.g. ``[]`` for array tasks
-    and ``{}`` for object tasks)."""
+    """Parse JSONC text; on failure return ``default`` (which also fixes the
+    empty-container shape: ``[]`` for array ops, ``{}`` for object ops)."""
     s = strip_jsonc_comments(raw_text)
     if not s:
         return default
@@ -75,10 +55,9 @@ def parse_jsonc_or_default(raw_text: str, default: Any) -> Any:
 # --------------------------------------------------------------------------- #
 
 def op_set_key(cur: Any, data: Dict[str, Any]) -> Dict[str, Any]:
-    """Set each top-level key in data on cur. ``cur`` must be a dict
-    (forced to {} when not). VS Code accepts both flat dot-keys
-    ('python.analysis.x' as a single string key) AND nested objects;
-    we mirror whatever the caller passes in data — no auto-nesting."""
+    """Set each top-level key from data on cur (forced to {} if not a dict).
+    No auto-nesting — VS Code accepts both flat dot-keys and nested objects,
+    so we mirror whatever data passes."""
     if not isinstance(cur, dict):
         cur = {}
     for k, v in (data or {}).items():
@@ -87,9 +66,8 @@ def op_set_key(cur: Any, data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def op_append_entry(cur: Any, data: Any) -> List[Any]:
-    """Append data to a JSON array. ``data`` may be a single dict (one
-    entry) or a list of dicts (multiple). ``cur`` must be a list (forced
-    to [] when not)."""
+    """Append data to a JSON array (forced to [] if not a list). ``data`` may
+    be a single entry or a list (extended)."""
     if not isinstance(cur, list):
         cur = []
     if isinstance(data, list):
@@ -100,8 +78,8 @@ def op_append_entry(cur: Any, data: Any) -> List[Any]:
 
 
 def op_remove_entry_by_key(cur: Any, matcher: Dict[str, Any]) -> List[Any]:
-    """Remove array entries where ALL keys in ``matcher`` equal the
-    matching keys in the entry. ``cur`` must be a list (forced to [])."""
+    """Remove array entries where ALL ``matcher`` keys equal the entry's
+    (cur forced to [] if not a list)."""
     if not isinstance(cur, list):
         return []
     if not isinstance(matcher, dict) or not matcher:
@@ -125,10 +103,8 @@ _DEFAULTS = {
 
 
 def apply_edit_json(raw_text: str, op: str, data: Any) -> Any:
-    """Run a single edit_json transform end-to-end.
-
-    Returns the new container. Caller serializes via json.dumps and
-    writes to file. Raises ValueError on unknown op."""
+    """Run a single edit_json transform; return the new container (caller
+    serializes + writes). Raises ValueError on unknown op."""
     if op not in _DEFAULTS:
         raise ValueError(f"unknown op: {op!r}; expected one of {list(_DEFAULTS)}")
     default = _DEFAULTS[op]()
@@ -143,15 +119,15 @@ def apply_edit_json(raw_text: str, op: str, data: Any) -> Any:
 
 
 # --------------------------------------------------------------------------- #
-# Runtime script builder — used by ``_pa_to_pyautogui`` to convert an
-# edit_json action into the Python the VM will execute.
+# Runtime script builder — ``_pa_to_pyautogui`` uses this to turn an edit_json
+# action into the Python the VM executes.
 # --------------------------------------------------------------------------- #
 
 def build_runtime_script(path: str, op: str, data: Any) -> str:
-    """Build the Python script that runs on the VM. The script is
-    self-contained (no helpers imported from this module — VM may not
-    have it on PYTHONPATH). All logic is duplicated inline. Returns
-    valid Python that prints a one-line status on completion."""
+    """Build the self-contained Python script that runs on the VM.
+
+    No imports from this module (the VM may not have it on PYTHONPATH) — logic
+    is duplicated inline. Prints a one-line status on completion."""
     if op not in _DEFAULTS:
         raise ValueError(f"unknown op: {op!r}")
     data_repr = json.dumps(data)

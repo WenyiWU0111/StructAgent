@@ -1,8 +1,7 @@
-"""
-Situation-specific prompt builders for the planner-actor agent.
+"""Per-situation prompt builders for the planner-actor agent.
 
-Each function builds a focused prompt for one specific planner decision situation,
-rather than mixing all cases into a single monolithic prompt.
+One focused builder per planner decision situation instead of one
+monolithic prompt.
 """
 
 from typing import List, Optional
@@ -18,21 +17,15 @@ def _build_common_context(
     subgoal_queue: List[str],
     domain: Optional[str] = None,
 ) -> str:
-    """LAYER 5 prompt context: task instruction + current plan (read-only).
+    """LAYER 5 prompt context: task instruction + read-only current plan.
 
-    Subgoal Progress (completed / current / remaining / abandoned),
-    Recent actor actions, and the Facts working-memory block are NOT
-    rendered here — they belong to LAYER 3 (subgoal state). LAYER 5
-    is the decision contract, which references the LAYER 3 facts
-    rather than restating them.
-
-    ``completed_subgoals`` / ``current_subgoal`` / ``current_subgoal_step``
-    / ``subgoal_queue`` remain in the function signature so the 5
-    existing builders can keep their kwargs; they are intentionally
-    unused here.
+    Subgoal progress, recent actions, and the Facts block belong to
+    LAYER 3 and are rendered upstream; LAYER 5 references them, not
+    restates them. The subgoal kwargs are unused here, kept only so the
+    5 builders share one signature.
     """
     _ = (completed_subgoals, current_subgoal,
-         current_subgoal_step, subgoal_queue)  # owned by LAYER 3
+         current_subgoal_step, subgoal_queue)  # LAYER 3 owns these
     return f"""Task: {instruction}
 
 Current Plan (read-only — already committed to the runtime):
@@ -44,23 +37,12 @@ Current Plan (read-only — already committed to the runtime):
 # --------------------------------------------------------------------------- #
 
 def _plan_format_block(domain: Optional[str] = None) -> str:
-    """How a <plan> must be emitted: a single <strategy> declaration
-    (the high-level approach this plan represents) + one or more <step>s.
+    """<plan> format: one <strategy> + one or more <step>s.
 
-    The <strategy> declaration is critical for dead-end tracking. When
-    you REPLAN with a DIFFERENT strategy than your previous plan, the
-    runtime records the OLD strategy as a failed path automatically —
-    so subsequent turns know not to propose it again. When you REPLAN
-    with the SAME strategy (just different steps), the runtime knows
-    it's tactical refinement, not strategic abandonment.
-
-    Strategy ≠ subgoal. Strategy is the ROUTE / METHOD class:
-      ✓ "Use the catalog site's main-page search box to query 'lamp' and
-         view results"
-      ✓ "Navigate via top nav 'Products' link → search input → submit"
-      ✓ "Use direct URL navigation to catalog.example/products/lamp"
-      ✗ "Click the magnifying glass icon" (this is a tactic, NOT a strategy)
-      ✗ "The lamp listing is on the page" (this is a state, NOT a strategy)
+    The <strategy> drives dead-end tracking: REPLANning with a different
+    strategy auto-records the old one as a failed path; same strategy is
+    treated as tactical refinement, not abandonment. Strategy is the
+    route/method class, not a tactic or a state.
     """
     calc_data_layout_tag = ""
     calc_step_qs = ""
@@ -141,18 +123,14 @@ def _plan_format_block(domain: Optional[str] = None) -> str:
 
 
 def _plan_quality_rules(domain: Optional[str] = None) -> str:
-    """Corrector rules merged into every plan-generating prompt so the
-    planner produces an already-corrected plan on the first shot (removes
-    the need for a separate `_correct_plan` VLM call).
+    """Corrector rules merged into every plan-generating prompt, so the
+    plan comes out pre-corrected and no separate `_correct_plan` VLM
+    call is needed.
 
-    ``domain`` selects the action-menu vocabulary in rule #4:
-      * libreoffice_calc / libreoffice_impress / libreoffice_writer →
-        the matching structured-action set (calc_* / impress_* /
-        writer_*). That layer is the canonical path; raw UNO Python is
-        not available, so the planner must phrase document-edit
-        subgoals in the structured-action vocabulary.
-      * other / None → GUI + cli_run only (no structured-action
-        bullet — non-LibreOffice domains have no UNO action set).
+    ``domain`` picks the rule-#4 action vocabulary: LibreOffice domains
+    get the matching structured-action set (calc_* / impress_* /
+    writer_*, the canonical path since raw UNO Python isn't available);
+    everything else gets GUI + cli_run only.
     """
     if (domain or "").lower() == "libreoffice_calc":
         rule_4 = ('4. Each step must be ONE of: (a) a concrete action a '
@@ -227,13 +205,12 @@ def _plan_quality_rules(domain: Optional[str] = None) -> str:
 
 
 def _assessment_block(domain: Optional[str] = None) -> str:
-    """The ``<last_subgoal_assessment>`` block — a domain-AGNOSTIC skeleton.
+    """Domain-agnostic ``<last_subgoal_assessment>`` skeleton.
 
-    The per-domain "which evidence channel is authoritative, and how to
-    read it" rules are pulled from ``domain_knowledge.get_evidence_guide``
-    and embedded inside ``<evidence>``. This block is emitted on EVERY
-    planner turn, so the per-domain rules must travel with it (they
-    cannot live in the step-0-only ``<domain>.md``).
+    Per-domain evidence-channel rules come from
+    ``get_evidence_guide`` and are embedded in ``<evidence>``. This
+    block is emitted every planner turn, so those rules must ride along
+    here — they can't live in the step-0-only ``<domain>.md``.
     """
     try:
         from mm_agents.structagent.domain import get_evidence_guide
@@ -262,46 +239,14 @@ def _output_contract(
     require_plan_on_replan: bool = True,
     domain: Optional[str] = None,
 ) -> str:
-    """Unified output format block appended to every planner prompt.
+    """Unified output-format block appended to every planner prompt.
 
-    Ordering principle: description → assessment → synthesis-of-blocker
-    → decision → action. Each block consumes the output of the prior
-    blocks, never the reverse — this lets the planner reason from
-    observation to plan without pre-committing to a strategy that the
-    subsequent reasoning would later contradict.
-
-    Block semantics:
-      <observations>      — describe the current screen ONLY,
-                            no judgment about subgoal completion.
-      <last_subgoal_assessment>
-                          — judge whether the previous subgoal's
-                            expected_post_state is now satisfied.
-                            done=YES/NO + evidence + contradiction_check.
-                            DOES NOT include actor instructions —
-                            those belong AFTER the full reasoning chain
-                            (the old <feedback_to_actor> field caused
-                            premature commitment to a strategy that the
-                            later reasoning would contradict, locking
-                            the actor into failing scroll-loops).
-      <Bottleneck>        — ONE sentence synthesizing <observations> +
-                            the [Failed paths] block in the context into
-                            the current single concrete blocker. Drives
-                            <decision>: blocked → REPLAN; not blocked →
-                            CONTINUE/DONE. (The older <dead_end_review>
-                            block was removed: planner-driven dead-end
-                            review confused "I'm proposing X" with "X
-                            failed"; failed_paths is now written
-                            exclusively by the cadence trigger which
-                            uses THIS Bottleneck as input.)
-      <decision>          — DONE | CONTINUE | REPLAN.
-      <plan>              — only on REPLAN; must be CONSISTENT with
-                            <Bottleneck>.
-      <actor_hint>        — only on done=NO (actor failed to make the
-                            subgoal visible-progress). Replaces the old
-                            <feedback_to_actor> field. Hint MUST NOT
-                            repeat a strategy already listed in
-                            [Failed paths]; if you cannot give a fresh
-                            hint, switch decision to REPLAN.
+    Block order is observation → assessment → blocker → decision →
+    action, each consuming the prior blocks. This keeps the planner from
+    committing to a strategy that its own later reasoning contradicts —
+    the failure mode of the removed <feedback_to_actor> / <dead_end_review>
+    fields. <plan> is REPLAN-only; <actor_hint> is done=NO-only and must
+    not repeat a [Failed paths] strategy.
     """
     decisions = []
     if allow_done:       decisions.append("DONE")
@@ -327,19 +272,11 @@ output a <strategy>, do NOT output any <step>. The runtime ignores any
 confuses trajectory rendering. The current plan is already committed
 in your read-only context — DO NOT re-emit it."""
 
-    # Note: <dead_end_review> was removed from the contract.
-    # Empirically the planner conflated "I'm proposing X" with "X
-    # failed" when writing reviews — same neural representation,
-    # opposite intent — producing wrong ref:new claims (a strategy
-    # not yet tried being logged as a dead-end) and inflated
-    # observation_count via retrospective ref:N mentions of entries
-    # that were no longer being attempted. failed_paths is now
-    # written exclusively by the cadence trigger (rule #6) which
-    # uses the prior turn's <Bottleneck> as the strategy abstract.
-    # The planner still synthesizes <Bottleneck> below, which feeds
-    # subsequent cadence-trigger writes — so the data flow is
-    # planner→Bottleneck→cadence→failed_paths instead of the buggy
-    # planner→dead_end_review→failed_paths path.
+    # <dead_end_review> was removed: the planner conflated "I'm
+    # proposing X" with "X failed" (same representation, opposite
+    # intent), logging untried strategies as dead-ends and inflating
+    # observation_count. failed_paths now flows planner→Bottleneck→
+    # cadence trigger (rule #6)→failed_paths instead.
     dead_end_block = """<Bottleneck>ONE sentence. Synthesize <observations> +
 the [Failed paths] block in your context (if any) into the SINGLE
 concrete blocker right now. Examples: "Color filter is not surfaced
@@ -367,12 +304,10 @@ DONE or CONTINUE-with-done=YES, write "none — task progressing".
   AND omit this tag — the new <plan> is the recovery, not a hint.
 </actor_hint>"""
 
-    # Build the decision-semantics bullet list dynamically so disallowed
-    # decisions don't even appear. Historically the planner would still
-    # see the full DONE bullet (with its 4-condition checklist) even
-    # when `allow_done=False`, then emit DONE anyway — producing endless
-    # DONE → rejected → defer → DONE loops when the ledger gate had
-    # already rejected the task as not complete.
+    # Build the decision-semantics bullets dynamically so disallowed
+    # decisions don't appear at all. Previously the DONE bullet showed
+    # even with allow_done=False and the planner emitted DONE anyway,
+    # causing DONE→rejected→defer→DONE loops past the ledger gate.
     decision_semantics_lines = ["Decision semantics — pick exactly one:"]
     if allow_done:
         decision_semantics_lines.append(
@@ -432,8 +367,8 @@ CRITICAL tag-emission rules — violations break the runtime:
 
 
 # ---------------------------------------------------------------------------
-# Situation 1: Actor confirmed subgoal done (finished()) — already verified
-#   by _pa_check_subgoal_done. Focus: is the NEXT subgoal still valid?
+# Situation 1: Actor reported subgoal done (finished()). Focus: verify the
+#   claim, then check whether the NEXT subgoal is still valid.
 # ---------------------------------------------------------------------------
 
 def build_prompt_subgoal_done(
@@ -447,8 +382,8 @@ def build_prompt_subgoal_done(
 ) -> str:
     """LAYER 5 decision contract for the subgoal-done turn.
 
-    LAYER 3 carries the current/next/remaining subgoals. This builder
-    emits the evaluation rubric + output contract only.
+    Subgoals live in LAYER 3; this just emits the eval rubric + output
+    contract.
     """
     _ = (completed_subgoals, current_subgoal, current_subgoal_step,
          subgoal_queue)
@@ -500,8 +435,8 @@ def build_prompt_actor_exhausted(
 ) -> str:
     """LAYER 5 decision contract for the actor-exhausted turn.
 
-    The failed subgoal text, completed subgoals list, recent actions,
-    and stuck signal are in LAYER 3 / LAYER 4 (rendered upstream).
+    Failed subgoal, completed list, recent actions, and stuck signal
+    are rendered upstream in LAYER 3 / LAYER 4.
     """
     _ = (completed_subgoals, current_subgoal, current_subgoal_step,
          subgoal_queue, actor_actions)
@@ -557,9 +492,8 @@ def build_prompt_all_subgoals_done(
 ) -> str:
     """LAYER 5 decision contract for the all-subgoals-done turn.
 
-    LAYER 3 carries the Completed subgoals list; the task instruction
-    is in LAYER 1. This builder just emits the verification rubric +
-    output contract.
+    Completed list is in LAYER 3, instruction in LAYER 1; this just
+    emits the verification rubric + output contract.
     """
     _ = (completed_subgoals, current_subgoal, current_subgoal_step,
          subgoal_queue, current_plan)
@@ -679,34 +613,24 @@ def build_prompt_force_replan(
     l2_alternatives_block: Optional[str] = None,
     l1_alternatives_block: Optional[str] = None,
 ) -> str:
-    """Force a REPLAN with rich failure context. Triggered when the agent
-    is stuck — actor returned <Impossible>, DONE rejected by the ledger
-    gate, subgoal budget exhausted with no progress, or consecutive
-    empty-delta actions / same-theme REPLANs.
+    """Force a REPLAN with rich failure context. Triggered when stuck:
+    actor <Impossible>, DONE rejected by the ledger gate, subgoal budget
+    exhausted, or repeated empty-delta actions / same-theme REPLANs.
 
-    Design note: we only ask for ONE new plan here (not K candidates).
-    What we DO do is dump rich failure context (recent actions tried,
-    abandoned subgoals, failed_paths already in the ledger, the specific
-    stuck signal) and force a structured <stuck_analysis> reasoning
-    block BEFORE the plan, so the model sees all evidence before
-    committing to the next approach.
+    Asks for ONE new plan (not K candidates) but dumps the full failure
+    context and forces a <stuck_analysis> block before the plan, so the
+    model sees all evidence before picking the next approach.
     """
-    # LAYER 5 — decision contract only. LAYER 3 (planner.py) renders the
-    # canonical subgoal queue / completed / abandoned list + recent actor
-    # actions. LAYER 4 renders this turn's stuck signal (category + reason)
-    # plus retrieved_knowledge alongside the screenshots / SCREEN SNAPSHOT.
-    # The args below stay in the signature for caller-API stability.
+    # LAYER 5 (decision contract) only. LAYER 3/4 (planner.py) render the
+    # subgoal lists, recent actions, and this turn's stuck signal +
+    # retrieved_knowledge. The unused args stay for caller-API stability.
     #
-    # ``verifier_feedback`` IS injected when non-None / non-empty: it
-    # carries the per-outcome verifier-trace render + the framework
-    # stuck root-cause LLM output, bundled in planner.py at the
-    # force_replan dispatch site. Gated by the agent kwarg
-    # ``enable_stuck_diagnosis_injection`` (default OFF) so the caller
-    # passes None when the switch is off, preserving baseline behaviour
-    # byte-for-byte. When the caller passes a non-empty string, it
-    # appears here as a dedicated section before the standard analysis
-    # block so the planner sees the framework's hypothesis BEFORE
-    # drafting <stuck_analysis>.
+    # ``verifier_feedback``: per-outcome verifier traces + framework
+    # root-cause hypothesis, bundled at the force_replan dispatch site.
+    # Gated by ``enable_stuck_diagnosis_injection`` (default OFF) — caller
+    # passes None when off, keeping baseline behaviour byte-for-byte.
+    # When non-empty it renders before <stuck_analysis> so the planner
+    # sees the framework's hypothesis first.
     _ = (completed_subgoals, current_subgoal, current_subgoal_step,
          subgoal_queue, recent_actions, abandoned_subgoals,
          retrieved_knowledge)
@@ -728,15 +652,12 @@ def build_prompt_force_replan(
             "==========================================================\n"
         )
 
-    # B2.A: corpus-retrieved alternatives. Sibling to the diagnosis
-    # block. L1 = action variants for the failing subgoal; L2 =
-    # alternative strategies for the task class. Both are passed in
-    # already-rendered by planner.py (env-gated by
-    # ENABLE_PLANNER_EXPERIENCE_MEMORY) — empty string when retrieval
-    # was OOD or the flag is off. We splice them right after the
-    # diagnosis block so the planner reads them in narrative order:
-    # diagnose (what's wrong + one suggestion) → L1 menu (tactical
-    # alternatives) → L2 menu (strategic alternatives).
+    # B2.A: corpus-retrieved alternatives (L1 = action variants for the
+    # failing subgoal, L2 = alternative strategies for the task class).
+    # Rendered upstream by planner.py, env-gated by
+    # ENABLE_PLANNER_EXPERIENCE_MEMORY; empty on OOD retrieval or flag
+    # off. Spliced after the diagnosis block to read in narrative order:
+    # diagnose → L1 tactical alternatives → L2 strategic alternatives.
     memory_alternatives_section = ""
     _mem_parts: List[str] = []
     if l1_alternatives_block and l1_alternatives_block.strip():
@@ -761,11 +682,11 @@ def build_prompt_force_replan(
         "execute in 1-3 low-level actions."
     )
 
-    # Conservative gate for the agent's own INFEASIBLE verdict: only offer it
-    # once ≥2 distinct approaches have already been abandoned (real effort
-    # spent), and never when we are here because a DONE was just rejected (that
-    # is a completion dispute, not an impossibility claim). When not offered the
-    # contract omits INFEASIBLE entirely, so the planner cannot fail-early.
+    # Gate INFEASIBLE conservatively: offer it only after ≥2 distinct
+    # approaches were abandoned (real effort spent), and never on a
+    # done_rejected (that's a completion dispute, not impossibility).
+    # When not offered, the contract omits INFEASIBLE so the planner
+    # can't fail-early.
     allow_infeasible = (stuck_category != "done_rejected"
                         and len(abandoned_subgoals or []) >= 2)
 
@@ -813,10 +734,9 @@ def build_prompt_progress_check(
 ) -> str:
     """Normal mid-subgoal evaluation — LAYER 5 decision contract only.
 
-    The CURRENT subgoal text, subgoal_queue, completed/abandoned lists,
-    and the step counter (``current_subgoal_step``) all live in LAYER 3
-    (rendered by planner.py upstream). This builder just emits the
-    decision rules + output contract.
+    Current subgoal, queue, completed/abandoned lists, and step counter
+    live in LAYER 3 (rendered upstream); this just emits the decision
+    rules + output contract.
     """
     _ = (completed_subgoals, current_subgoal, current_subgoal_step,
          subgoal_queue)

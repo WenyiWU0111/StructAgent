@@ -1,14 +1,13 @@
 """Action compile: parse actor responses & emit pyautogui code.
 
 Pure helpers (``_parse_action_ast``, ``_escape_single_quotes``,
-``_fix_click_output``, ``_fix_drag_output``, ``_to_pyautogui``) sit at
-module top. The instance method ``_pa_parse_actor_response`` is the
-glue: it dispatches host-side actions (extract_info, note_write,
-open_app) and delegates everything else to ``_to_pyautogui``.
+``_fix_click_output``, ``_fix_drag_output``, ``_to_pyautogui``) live at
+module top. ``_pa_parse_actor_response`` is the glue: dispatches
+host-side actions (extract_info, note_write, open_app) and delegates the
+rest to ``_to_pyautogui``.
 
-``ActionCompile`` is folded into ``StructAgent`` via inheritance. Names
-with the legacy ``_pa_`` prefix are preserved here so callers inside
-``agent.py`` don't move; a follow-up commit can rename in bulk.
+``ActionCompile`` is mixed into ``StructAgent`` via inheritance. The
+legacy ``_pa_`` prefix is kept so callers in ``agent.py`` don't move.
 """
 
 import ast
@@ -24,10 +23,9 @@ _logger = logging.getLogger("desktopenv.qwen25vl_agent_planner")
 def _parse_action_ast(action_str):
     """Parse ``click(start_box='(x,y)')`` style strings into func + kwargs.
 
-    Kwarg values are evaluated via ``ast.literal_eval`` so list / dict /
-    tuple kwargs (e.g. ``row_fields=['Promotion']``) survive. Falls back
-    to ``ast.Constant`` / ``ast.Str`` for non-literal nodes (preserves
-    the legacy contract for click/type/drag).
+    Kwargs are ``ast.literal_eval``'d so list/dict/tuple values (e.g.
+    ``row_fields=['Promotion']``) survive; falls back to
+    ``ast.Constant`` / ``ast.Str`` for non-literal nodes.
     """
     try:
         node = ast.parse(action_str, mode="eval")
@@ -159,10 +157,8 @@ def _to_pyautogui(action_type: str, action_inputs: dict,
         return code
 
     elif action_type == "cli_run":
-        # ``background``/``wait_seconds`` arrived as Python primitives via
-        # ``_parse_action_ast`` but the param normalizer in
-        # ``_pa_parse_actor_response`` stringifies scalar kwargs ("False"
-        # → bool truthy). Recover the bool explicitly.
+        # _pa_parse_actor_response stringifies scalar kwargs, so "False"
+        # arrives truthy. Recover the bool explicitly.
         from mm_agents.structagent.actions.handlers.cli_run_helpers import build_runtime_script as _bcli
         cmd = action_inputs.get("command", "")
         bg_raw = action_inputs.get("background", False)
@@ -188,12 +184,10 @@ def _to_pyautogui(action_type: str, action_inputs: dict,
         return build_open_app_script(app, file_path, logger=_logger)
 
     elif action_type == "navigate":
-        # Chrome page navigation via the DevTools HTTP endpoint exposed
-        # on port 1337 inside the VM (socat'd to 9222 outside). Single
-        # action, no grounding model needed — the alternative would be
-        # to mimic ctrl+L → type → enter (3 actions, error-prone).
-        # Useful for cross-site multi-hop tasks (MMInA compare /
-        # multi567 / multipro / normal).
+        # Chrome navigation via the DevTools HTTP endpoint on port 1337 in
+        # the VM (socat'd to 9222 outside). One action, no grounding —
+        # beats mimicking ctrl+L → type → enter. Used by cross-site
+        # multi-hop tasks (MMInA compare / multi567 / multipro / normal).
         from mm_agents.structagent.actions.handlers.navigate_helpers import (
             build_navigate_script,
         )
@@ -286,9 +280,8 @@ def _to_pyautogui(action_type: str, action_inputs: dict,
 class ActionCompile:
     """Actor response → list of pyautogui code strings."""
 
-    # Expose the pure helpers as static methods so existing call sites
-    # (``self._pa_parse_action_ast(...)``, ``self._pa_to_pyautogui(...)``)
-    # keep working unchanged.
+    # Expose the pure helpers as static methods so existing
+    # ``self._pa_*`` call sites keep working.
     _pa_parse_action_ast = staticmethod(_parse_action_ast)
     _pa_escape_single_quotes = staticmethod(_escape_single_quotes)
     _pa_fix_click_output = staticmethod(_fix_click_output)
@@ -298,11 +291,11 @@ class ActionCompile:
     def _pa_parse_actor_response(self, response: str, model_image_width: int, model_image_height: int,
                                   screen_width: int, screen_height: int,
                                   env=None) -> List[str]:
-        """Parse actor response into list of pyautogui code strings.
+        """Parse actor response into pyautogui code strings.
 
-        Returns ``["import pyautogui\\n..."]`` for runnable actions,
-        ``["DONE"]`` / ``["WAIT"]`` / ``["IMPOSSIBLE"]`` for sentinels,
-        or ``[]`` for malformed responses.
+        ``["import pyautogui\\n..."]`` for runnable actions, sentinels
+        ``["DONE"]`` / ``["WAIT"]`` / ``["IMPOSSIBLE"]``, or ``[]`` when
+        malformed.
         """
         response = response.strip()
         if "<impossible>" in response.lower():
@@ -358,20 +351,17 @@ class ActionCompile:
             if action_type == "finished":
                 return ["DONE"]
             if action_type == "wait":
-                # Treat wait() as a queued no-op step, not a mid-batch
-                # early return. Old behavior (``return ["WAIT"]``)
-                # discarded every real action processed earlier in this
-                # same batch — observed: e1e75309 steps 4-6 emitted
-                # ``click(...)\n\nwait()`` and the click coords silently
-                # vanished. ``env.step("WAIT")`` is a valid runtime
-                # action (lib_run_single iterates final_actions one by
-                # one), so we just append and continue.
+                # Queue wait() as a no-op step, not a mid-batch early
+                # return. Old ``return ["WAIT"]`` dropped every real action
+                # earlier in the batch — e1e75309 steps 4-6 emitted
+                # ``click(...)\n\nwait()`` and the click coords vanished.
+                # env.step("WAIT") is a valid runtime action, so append.
                 pyautogui_codes.append("WAIT")
                 continue
 
-            # Normalize box coordinates. Only stringify scalar params;
-            # container kwargs (list / dict / tuple) must round-trip
-            # natively to ``_build_*`` validators.
+            # Normalize box coords. Only stringify scalars; container
+            # kwargs (list/dict/tuple) must round-trip natively to the
+            # ``_build_*`` validators.
             action_inputs = {}
             for param_name, param in params.items():
                 if param == "" or param is None:
@@ -398,10 +388,9 @@ class ActionCompile:
                         float_numbers = [float_numbers[0], float_numbers[1], float_numbers[0], float_numbers[1]]
                     action_inputs[param_name.strip()] = str(float_numbers)
 
-            # ``type`` action — Ctrl+A and Enter are now EXPLICIT params.
-            # Defaults: wipe_then_type=False (do NOT wipe), submit=False
-            # (do NOT press Enter). Old auto-Ctrl+A heuristics caused
-            # catastrophic data loss in code editors.
+            # ``type``: Ctrl+A and Enter are explicit params, both
+            # defaulting off. The old auto-Ctrl+A heuristic caused data
+            # loss in code editors.
             skip_select = (action_type == "type"
                            and not bool(action_inputs.get("wipe_then_type", False)))
             _c = action_inputs.get("content", "") or ""
@@ -410,9 +399,8 @@ class ActionCompile:
                 or _c.endswith(("\n", "\\n"))
             )
             skip_enter = action_type == "type" and not _wants_submit
-            # ``_to_pyautogui`` is a static helper — smuggle current
-            # domain via reserved ``__current_domain`` key so the
-            # structured-action runtime boilerplate can read it.
+            # _to_pyautogui is static — smuggle current domain via the
+            # reserved ``__current_domain`` key for the runtime boilerplate.
             action_inputs.setdefault("__current_domain",
                                       getattr(self, "_current_domain", None))
 
@@ -425,9 +413,8 @@ class ActionCompile:
                     logger=_logger,
                 )
                 if _ei_batch:
-                    # A7: Facts-only persistence. owning_outcome defaults
-                    # to current focus; routes to ledger.global_facts when
-                    # no focus is set.
+                    # owning_outcome defaults to current focus; routes to
+                    # ledger.global_facts when no focus is set.
                     _focus = None
                     try:
                         _f = self.ledger.next_focus_outcome() if self.ledger else None
@@ -464,7 +451,7 @@ class ActionCompile:
                 continue
 
             # open_app with no file_path: fall back to the initial-file
-            # registry observed at task start.
+            # registry from task start.
             if action_type == "open_app" and not action_inputs.get("file_path"):
                 try:
                     from mm_agents.structagent.actions.app.open_app import normalize_app

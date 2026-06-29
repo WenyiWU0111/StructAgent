@@ -1,20 +1,16 @@
-"""Deterministic verifiers consumed by the KeyNode dispatcher.
+"""Deterministic verifiers for the KeyNode dispatcher.
 
-Each ``run_*`` returns one of:
-    True   — outcome SATISFIED. Trust deterministically; no LLM call needed.
-    False  — outcome NOT-SATISFIED. The control / file / URL was observable
-             AND the spec did not match. Trust this verdict (don't fall
-             back to LLM), so the planner correctly stays in pending.
-    None   — UNCERTAIN. The spec couldn't be evaluated (path unresolved,
-             file unreadable, URL not extractable, a11y row not visible
-             in current frame). Caller should fall back to the legacy
-             LLM KeyNode path so we don't false-negative on transient
-             observation gaps.
+Each ``run_*`` returns:
+    True   — SATISFIED. Trust it; skip the LLM.
+    False  — NOT-SATISFIED. Control/file/URL was observable and didn't match;
+             trust it (outcome stays pending → planner replans).
+    None   — UNCERTAIN. Spec couldn't be evaluated (path unresolved, file
+             unreadable, URL not extractable, a11y row not in frame). Caller
+             falls back to the LLM KeyNode path to avoid false-negatives on
+             transient observation gaps.
 
-The dispatcher (key_node_detector._build_messages caller) treats:
-    True  → emit outcome_satisfied  (skip LLM)
-    False → emit nothing  (outcome stays pending; planner will replan)
-    None  → run the original LLM KeyNode call for this outcome
+The dispatcher maps True → outcome_satisfied, False → nothing (stays pending),
+None → the original LLM KeyNode call.
 """
 from __future__ import annotations
 import hashlib
@@ -35,9 +31,8 @@ logger = logging.getLogger(__name__)
 # Slot resolution (substitute ${name} placeholders before deterministic verify)
 # --------------------------------------------------------------------------- #
 
-# Which VerifySpec fields are themselves regex (so substituted values must
-# be ``re.escape``'d) vs plain text (substituted verbatim). Fields not in
-# either set are not slot-substituted.
+# Regex-bearing fields need ``re.escape`` on substituted values; text fields
+# are substituted verbatim. Fields in neither set aren't slot-substituted.
 _SPEC_REGEX_FIELDS = ("url_pattern",)                       # str fields
 _SPEC_REGEX_LIST_FIELDS = ("patterns",)                     # List[str] fields
 _SPEC_TEXT_FIELDS = ("file_path", "tag")                    # str
@@ -48,18 +43,11 @@ _SPEC_TEXT_LIST_FIELDS = (
 )                                                            # List[str]
 
 
-# Bracket-style placeholders the init LLM sometimes emits when it
-# doesn't actually know a verify value (a sibling failure mode to the
-# slot system). These get literally grepped by the verifier and never
-# match, so the outcome stays pending forever. Detected at spec
-# load / verify time and treated as "spec authoring failure → fall back
-# to LLM judge".
-#
-# Patterns (kept conservative to avoid eating legit content):
-#   [Capital Words inside square brackets]       (≥1 word, ≥2 letters)
-#   <camelCase or snake_case in angle brackets>  (excluding HTML-ish "</...>")
-#   {{ template-style }} double-curly placeholders
-#   [TODO] / [FIXME] / [Placeholder] / etc. — common author markers
+# Bracket-style placeholders the init LLM emits when it doesn't know a verify
+# value (sibling failure mode to the slot system). These get grepped literally
+# and never match → outcome pending forever. Caught at verify time and treated
+# as a spec-authoring failure → fall back to LLM judge.
+# Patterns kept conservative to avoid eating legit content.
 _PLACEHOLDER_RES = [
     re.compile(r"\[[A-Z][\w\- ]{1,80}\]"),        # [Planned remarks for Slide 1]
     re.compile(r"<[a-zA-Z_][\w\- ]{1,40}>"),       # <value>, <slide_text>
@@ -70,20 +58,18 @@ _PLACEHOLDER_RES = [
 
 
 def _has_bracket_placeholder(s: Optional[str]) -> bool:
-    """True if `s` contains a bracket-style placeholder the init LLM
-    forgot to instantiate (vs a proper ``${slot}`` slot reference,
-    which is the supported way to express 'I don't know this yet')."""
+    """True if `s` has a bracket-style placeholder the init LLM forgot to
+    instantiate (vs a proper ``${slot}`` ref, the supported way to say
+    'I don't know this yet')."""
     if not s or not isinstance(s, str):
         return False
     return any(p.search(s) for p in _PLACEHOLDER_RES)
 
 
 def _scan_placeholders_anywhere(spec: VerifySpec) -> List[Tuple[str, str]]:
-    """Walk every string-valued field of a VerifySpec (including nested
-    *_checks list-of-dicts) and report any bracket-placeholder strings
-    found. Returns a list of ``(field_path, value)`` tuples for log /
-    trace; empty list means the spec is clean.
-    """
+    """Scan every string field (including nested *_checks dicts) for
+    bracket placeholders. Returns ``(field_path, value)`` tuples; empty
+    means clean."""
     findings: List[Tuple[str, str]] = []
 
     def _walk_str(path: str, v: str):
@@ -113,25 +99,16 @@ def _scan_placeholders_anywhere(spec: VerifySpec) -> List[Tuple[str, str]]:
 def _resolve_spec_slots(
     spec: VerifySpec, slots: Optional[Dict[str, VerifySpecSlot]]
 ) -> Tuple[VerifySpec, List[str]]:
-    """Return a (possibly new) VerifySpec with all bound ``${name}``
-    references replaced by their values, plus the list of unresolved
-    slot names found anywhere in the spec.
+    """Substitute bound ``${name}`` refs in the spec; return the (possibly
+    new) spec plus any unresolved slot names found anywhere in it.
 
-    Regex-bearing fields use ``re.escape`` on substituted values so a
-    bound URL like ``https://aws.amazon.com/agreement?id=1`` doesn't get
-    re-interpreted as regex metacharacters.
+    Regex-bearing fields get ``re.escape`` on substituted values so a bound
+    URL doesn't get re-read as regex metacharacters.
 
-    When ``slots`` is empty or None: scans for ``${...}`` refs (in case
-    init emitted placeholders without registering the slot — that's a
-    spec-author bug and we surface it as ``unresolved``) but performs
-    no substitution. Returns spec unchanged in that case.
-
-    Recurses into ``calc_checks`` / ``impress_checks`` / ``writer_checks``
-    (each a list of nested-dict ops). All string values inside those
-    dicts get slot-substituted; non-string values pass through. This
-    lets the init LLM write ``${slide_1_notes_content}`` inside e.g.
-    ``{"op": "slide_notes", "slide": 1, "expected_substring":
-    "${slide_1_notes_content}"}`` and have it resolved at verify time.
+    With empty/None ``slots``: still scans for ``${...}`` refs (an unregistered
+    ref is a spec-author bug, surfaced as ``unresolved``) but substitutes
+    nothing. Recurses into calc/impress/writer_checks (lists of op dicts):
+    string values get substituted, non-strings pass through.
     """
     if not spec:
         return spec, []
@@ -152,10 +129,8 @@ def _resolve_spec_slots(
         return [_take(x, regex) for x in xs]
 
     def _take_check_dict(d: Dict[str, Any]) -> Dict[str, Any]:
-        """Substitute ``${slot}`` refs in every string value of a
-        check-op dict. Recurses into nested lists/dicts for forms like
-        ``{"row_fields": ["${col_name}"]}``. Numbers / bools / None
-        pass through unchanged."""
+        """Substitute ``${slot}`` refs in every string value of a check-op
+        dict; recurse into nested lists/dicts. Non-strings pass through."""
         out: Dict[str, Any] = {}
         for k, v in d.items():
             if isinstance(v, str):
@@ -193,9 +168,8 @@ def _resolve_spec_slots(
         new = _take_list(old, regex=False)
         if new != old:
             changed[fname] = new
-    # Recurse into the structured-check lists. Each item is a dict
-    # authored by the init LLM (op + kwargs); strings inside may carry
-    # ${slot} refs the same way top-level fields do.
+    # Structured-check lists: each item is an init-LLM op dict (op + kwargs)
+    # whose strings may carry ${slot} refs like top-level fields.
     for fname in ("calc_checks", "impress_checks", "writer_checks"):
         old = getattr(spec, fname, None)
         if old is None:
@@ -217,9 +191,9 @@ def _resolve_spec_slots(
 # Path resolution
 # --------------------------------------------------------------------------- #
 
-# When init_ledger writes a wrong path (e.g. typo in /home/<user>/), try
-# the app's canonical paths instead. Keys are detected from the literal
-# path the spec gave OR from the [bracket-prefix] of the instruction.
+# Canonical paths to try when init_ledger writes a wrong path (e.g. typo in
+# /home/<user>/). App is detected from the spec path or the instruction's
+# [bracket-prefix].
 APP_PATH_FALLBACKS = {
     "vs_code": [
         "~/.config/Code/User/settings.json",
@@ -242,7 +216,7 @@ APP_PATH_FALLBACKS = {
 
 
 def _detect_app(spec_path: str, instruction: str) -> Optional[str]:
-    """Heuristic: which app does this verify belong to?"""
+    """Heuristic: which app does this verify belong to."""
     p = (spec_path or "").lower()
     i = (instruction or "").lower()
     if "/code/" in p or "/.config/code" in p or "[vscode]" in i or "vs code" in i or "vscode" in i:
@@ -257,13 +231,12 @@ def _detect_app(spec_path: str, instruction: str) -> Optional[str]:
 
 
 def _glob_first(env: Any, pattern: str) -> Optional[str]:
-    """Use VM-side bash to expand a glob; return first match or None.
+    """Expand a glob VM-side via bash; return first match or None.
 
-    The pattern is forwarded to /bin/bash -lc which performs both ``~``
-    expansion and globbing on the VM. We must NOT expanduser on the
-    host — host ``$HOME`` is the developer machine, but the VM user is
-    always ``user`` (OSWorld convention). Host-side expansion would
-    yield e.g. ``/home/user/.config/...`` which doesn't exist on the VM.
+    bash does ``~`` expansion and globbing on the VM. NEVER expanduser on
+    the host — host $HOME is the dev machine, but the VM user is always
+    ``user`` (OSWorld convention), so host expansion points at a path that
+    doesn't exist on the VM.
     """
     if not env or not getattr(env, "controller", None):
         return None
@@ -285,14 +258,11 @@ def _glob_first(env: Any, pattern: str) -> Optional[str]:
 def _last_resort_find(env: Any, basename: str) -> Optional[str]:
     """Final fallback: ``find /home/user -name <basename>`` on the VM.
 
-    Used when the spec_path and the curated APP_PATH_FALLBACKS all miss.
-    Catches cases where init_ledger wrote a near-correct path (e.g.
-    a typo or a profile-randomized subdir not in our fallback list)
-    and the file actually lives somewhere else under /home/user.
-
-    We restrict to /home/user (not /) to keep the find cheap and avoid
-    accidentally matching files under /usr/share/code or
-    /opt/google/chrome that happen to share the basename.
+    For when spec_path and APP_PATH_FALLBACKS all miss — e.g. init_ledger
+    wrote a near-correct path (typo or profile-randomized subdir) and the
+    file lives elsewhere under /home/user. Restricted to /home/user (not /)
+    to keep find cheap and avoid matching same-named files under
+    /usr/share/code or /opt/google/chrome.
     """
     if not env or not getattr(env, "controller", None):
         return None
@@ -320,22 +290,18 @@ def resolve_file_path(
 ) -> Optional[str]:
     """Find the actual file on the VM. Returns absolute path or None.
 
-    Path strings are passed through to the VM ``~`` and untouched —
-    the VM's HTTP server expands ``~`` (its $HOME = /home/user). NEVER
-    call ``os.path.expanduser`` on the host: host $HOME points to the
-    developer's home, not the VM's, so host expansion produces
-    /home/<dev>/... which is invalid on the VM.
+    Paths pass through with ``~`` intact — the VM HTTP server expands it
+    ($HOME = /home/user). NEVER expanduser on the host (host $HOME is the
+    dev's, producing /home/<dev>/... invalid on the VM).
 
     Resolution order:
-      1. Literal spec path — VM /file endpoint expands ~ then probes.
-      2. If spec contains glob (*), VM-side bash glob.
-      3. APP_PATH_FALLBACKS list — try each candidate path on the VM,
-         pick one whose basename matches the spec's.
-      4. Last-resort find /home/user -name <basename> on the VM.
+      1. Literal spec path (VM /file endpoint expands ~ then probes).
+      2. Glob in spec (*) → VM-side bash glob.
+      3. APP_PATH_FALLBACKS — pick a candidate whose basename matches spec's.
+      4. Last-resort find /home/user -name <basename>.
 
-    ``trace_attempts`` (when provided) is appended-to with one entry per
-    attempt: {"strategy", "path", "result"}. Used by the dispatcher to
-    surface verifier reasoning in keynode_debug for offline inspection.
+    ``trace_attempts``, if given, gets one {"strategy","path","result"} entry
+    per attempt for keynode_debug inspection.
     """
     if not spec_path:
         return None
@@ -424,8 +390,7 @@ def resolve_file_path(
 
 def _check_patterns(text: str, patterns: List[str], all_must_match: bool,
                      proximity_lines: Optional[int]) -> bool:
-    """Apply a list of regex patterns to text under AND/OR + optional
-    proximity constraint."""
+    """Apply regex patterns to text under AND/OR + optional proximity."""
     try:
         compiled = [re.compile(p, re.MULTILINE) for p in patterns]
     except re.error:
@@ -434,10 +399,9 @@ def _check_patterns(text: str, patterns: List[str], all_must_match: bool,
         if all_must_match:
             return all(c.search(text) for c in compiled)
         return any(c.search(text) for c in compiled)
-    # proximity: all patterns must co-occur within a sliding window of
-    # exactly ``proximity_lines`` consecutive lines (1-indexed count, so
-    # proximity_lines=3 means a 3-line window — typical for same-entry
-    # "key" + "command" co-occurrence in keybindings.json).
+    # Proximity: all patterns must co-occur within a sliding window of
+    # ``proximity_lines`` consecutive lines (e.g. 3 = same keybindings.json
+    # entry's "key" + "command").
     lines = text.split("\n")
     n = len(lines)
     win = max(1, proximity_lines)
@@ -449,8 +413,7 @@ def _check_patterns(text: str, patterns: List[str], all_must_match: bool,
 
 
 def run_file_grep(spec: VerifySpec, env: Any, instruction: str = "") -> Optional[bool]:
-    """Thin wrapper around the traced version — kept for unit tests +
-    callers that don't need the trace dict."""
+    """Wrapper around the traced version for callers that don't need the trace."""
     verdict, _ = _run_file_grep_traced(spec, env, instruction)
     return verdict
 
@@ -459,22 +422,17 @@ def run_file_grep(spec: VerifySpec, env: Any, instruction: str = "") -> Optional
 # url_match
 # --------------------------------------------------------------------------- #
 
-# Browser address-bar a11y rows. Chrome / Chromium expose the active URL
-# in a single, identifiable row, e.g.:
-#
+# Browser address-bar a11y rows. Chrome/Chromium expose the active URL in one
+# identifiable row, e.g.:
 #   entry\tAddress and search bar (https://...)\tfocused,enabled
 #   combo-box\tAddress and search bar (chrome://settings/...)\tfocused
-#   entry\tURL (https://...)\tfocused,enabled     ← Firefox / chrome variants
+#   entry\tURL (https://...)\tfocused,enabled     ← Firefox/chrome variants
 #
-# We require BOTH conditions:
-#   (1) tag is one of the editable-text-control kinds, AND
-#   (2) text contains a URL-bearing-control label ("Address...bar" /
-#       "URL" / "Location") plus a parenthesized URL.
-#
-# Older heuristic ("first https? row in the dump") false-positives any
-# time another app is active (e.g. Thunderbird email body shows literal
-# URL strings inside <link> rows) — see 58565672 regression where the
-# url_match verifier matched an email-body URL against itself.
+# Require BOTH: tag is an editable-text-control kind, AND text has a
+# URL-bearing label ("Address...bar"/"URL"/"Location") plus a parenthesized
+# URL. The older "first https? row in the dump" heuristic false-positives
+# when another app is active (Thunderbird email-body <link> rows) — see the
+# 58565672 regression where url_match matched an email-body URL against itself.
 _ADDRESS_BAR_TAGS = ("entry", "combo-box", "text-field", "textbox")
 _ADDRESS_BAR_LABEL_RE = re.compile(
     r"(?:Address(?:\s+and\s+search)?\s+bar|^URL\b|^Location\b|Location bar)",
@@ -485,14 +443,12 @@ _BROWSER_PROTOCOL_PREFIXES = ("http://", "https://", "chrome://", "about:", "fil
 
 
 def _extract_active_url(a11y_text: str) -> Optional[str]:
-    """Pull the active tab URL from a11y. Strict address-bar scope only.
+    """Pull the active tab URL from a11y, strict address-bar scope only.
 
-    Returns the URL string when a browser address-bar row is present, or
-    None otherwise (NEVER falls back to "any http row in the dump" —
-    that's the bug that lets Thunderbird email-body links satisfy a
-    Chrome url_match verify). Returning None routes the outcome to the
-    LLM judge path, which is far less likely to false-positive across
-    apps.
+    Returns the URL only when a browser address-bar row is present, else None
+    (NEVER falls back to "any http row" — that's the bug that lets Thunderbird
+    email-body links satisfy a Chrome url_match). None routes to the LLM judge,
+    which is far less likely to false-positive across apps.
     """
     if not a11y_text:
         return None
@@ -506,7 +462,7 @@ def _extract_active_url(a11y_text: str) -> Optional[str]:
             continue
         if not _ADDRESS_BAR_LABEL_RE.search(text):
             continue
-        # First check parenthesized form: 'Address... (https://...)'
+        # Parenthesized form: 'Address... (https://...)'
         m = _ADDRESS_BAR_URL_RE.search(text)
         if m:
             return m.group("url")
@@ -527,8 +483,7 @@ def run_url_match(spec: VerifySpec, a11y_text: str) -> Optional[bool]:
 # --------------------------------------------------------------------------- #
 
 def run_a11y_match(spec: VerifySpec, a11y_text: str) -> Optional[bool]:
-    """Thin wrapper around the traced version. See ``_run_a11y_match_traced``
-    for semantics."""
+    """Wrapper around the traced version. See ``_run_a11y_match_traced``."""
     verdict, _ = _run_a11y_match_traced(spec, a11y_text)
     return verdict
 
@@ -551,26 +506,20 @@ def verify_with_trace(
     *,
     slots: Optional[Dict[str, VerifySpecSlot]] = None,
 ) -> tuple:
-    """Like ``run_verify`` but also returns a debug trace dict describing
-    what the verifier did:
+    """Like ``run_verify`` but also returns a debug trace dict:
 
       file_grep: {kind, spec_path, resolved_path, file_size_bytes,
-                   patterns_compiled_ok, per_pattern_matches:[{pattern,
-                   matched_lines:[(line_no, snippet)]}], proximity_used,
-                   verdict_reason}
+                   per_pattern_matches, proximity_used, verdict_reason}
       url_match: {kind, url_extracted, regex, verdict_reason}
-      a11y_match: {kind, matched_row:str|null, candidate_count,
-                    verdict_reason}
+      a11y_match: {kind, matched_row, candidate_count, verdict_reason}
 
-    Used by ``key_node_debug`` to persist per-step KeyNode dispatcher
-    decisions for offline inspection. Returns ``(verdict, trace_dict)``."""
+    Used by ``key_node_debug`` to persist per-step dispatcher decisions.
+    Returns ``(verdict, trace_dict)``."""
     if spec is None or not spec.is_valid():
         return None, {"kind": "invalid", "verdict_reason": "spec is None or invalid"}
 
-    # Slot resolution — substitute ``${name}`` references with bound values
-    # (or short-circuit to UNCERTAIN if anything is unbound). Outcomes that
-    # don't use slots are unaffected: _resolve_spec_slots returns the spec
-    # unchanged when no ``${...}`` refs are present.
+    # Substitute ``${name}`` refs with bound values, or short-circuit to
+    # UNCERTAIN if any are unbound. No-op when the spec has no ``${...}`` refs.
     spec, unresolved = _resolve_spec_slots(spec, slots)
     if unresolved:
         return None, {
@@ -581,13 +530,10 @@ def verify_with_trace(
             ),
             "unresolved_slots": unresolved,
         }
-    # Bracket-style placeholder sweep — catches init-LLM authoring
-    # failures where the model wrote ``[Planned remarks for Slide 1]`` /
-    # ``<value>`` / ``{{TODO}}`` in a verify value, expecting the
-    # framework to fill it in (but only ``${slot}`` is supported). Without
-    # this check, the verifier literally greps for that string forever
-    # and never matches. We short-circuit to None (uncertain) so the
-    # outcome routes to LLM judge instead of staying pending in a loop.
+    # Bracket-placeholder sweep — catches init-LLM specs like
+    # ``[Planned remarks for Slide 1]`` / ``<value>`` / ``{{TODO}}`` that
+    # expect framework fill-in (only ``${slot}`` is supported). Otherwise the
+    # verifier greps that literal forever. Short-circuit to None → LLM judge.
     bracket_finds = _scan_placeholders_anywhere(spec)
     if bracket_finds:
         return None, {
@@ -621,9 +567,8 @@ def verify_with_trace(
 
 
 def _run_impress_verify_traced(spec, env):
-    """Impress counterpart of _run_calc_verify_traced. Builds the
-    python3 -c body from spec.impress_checks via build_impress_verify_python_body,
-    then dispatches through the shared shell-command runner."""
+    """Impress counterpart of _run_calc_verify_traced: build the python3 -c
+    body from spec.impress_checks, then run via the shell-command runner."""
     from mm_agents.structagent.actions.impress.actions import build_impress_verify_python_body
     body = build_impress_verify_python_body(spec.impress_checks or [])
     synth = VerifySpec(
@@ -637,24 +582,19 @@ def _run_impress_verify_traced(spec, env):
 
 
 def _wrap_verify_body(body: str, domain: str, env: Any = None) -> str:
-    """Wrap a structured-verify python body with the cli_run_uno
-    runtime for ``domain`` (connect + setup + ops library). The domain
-    is KNOWN here — no function-name scanning, so it never drifts when
-    a new verify op is added. The wrapped script carries the sentinel
-    so ``_maybe_wrap_calc_verify_command`` won't re-wrap it.
+    """Wrap a structured-verify python body with the cli_run_uno runtime for
+    ``domain`` (connect + setup + ops library). Domain is KNOWN here (no
+    function-name scanning), and the wrapped script carries the sentinel so
+    ``_maybe_wrap_calc_verify_command`` won't re-wrap it.
 
-    Before building, ensure the domain's ops-library module is present
-    on the VM. ``build_runtime_script`` emits a tiny
-    ``from _<domain>_ops_lib_<hash> import *`` shim when the process
-    cache says the module was uploaded — but an OSWorld snapshot reset
-    between tasks wipes ``/tmp``, so that cached module can be gone.
-    The actor path re-checks + re-uploads at every predict() entry;
-    the verify path did NOT, so its shim imported a missing module →
-    ``ModuleNotFoundError`` → EVERY structured verify of that domain
-    hard-failed. ``maybe_upload_ops_lib`` re-verifies the /tmp file and
-    re-uploads under the current content hash when missing; if it
-    can't (no runner), ``get_uploaded_module`` returns None and the
-    wrapper safely inlines the full library instead."""
+    First re-upload the domain's ops-lib module if missing: build_runtime_script
+    emits a ``from _<domain>_ops_lib_<hash> import *`` shim when the process
+    cache says it was uploaded, but an OSWorld snapshot reset wipes /tmp between
+    tasks. The actor re-checks every predict(); the verify path used not to, so
+    its shim imported a gone module → ModuleNotFoundError → every structured
+    verify hard-failed. maybe_upload_ops_lib re-verifies + re-uploads; if it
+    can't (no runner), get_uploaded_module returns None and the wrapper inlines
+    the full library instead."""
     if env is not None:
         try:
             from mm_agents.structagent.actions.uno._ops_lib_remote import maybe_upload_ops_lib
@@ -666,10 +606,9 @@ def _wrap_verify_body(body: str, domain: str, env: Any = None) -> str:
 
 
 def _run_writer_verify_traced(spec, env):
-    """Writer counterpart of _run_calc_verify_traced. Builds the
-    python3 -c body from spec.writer_checks, wraps it with the Writer
-    cli_run_uno boilerplate (connect + setup + WRITER_OPS_LIBRARY) for
-    the KNOWN domain, then dispatches through the shell-command runner."""
+    """Writer counterpart of _run_calc_verify_traced: build the python3 -c body
+    from spec.writer_checks, wrap with the Writer cli_run_uno boilerplate, then
+    run via the shell-command runner."""
     from mm_agents.structagent.actions.writer.actions import build_writer_verify_python_body
     body = build_writer_verify_python_body(spec.writer_checks or [])
     synth = VerifySpec(
@@ -683,16 +622,13 @@ def _run_writer_verify_traced(spec, env):
 
 
 def _run_calc_verify_traced(spec: VerifySpec, env: Any):
-    """Build the python3 -c command from ``spec.calc_checks`` and
-    dispatch to the shared shell_command runner.
+    """Build the python3 -c command from ``spec.calc_checks`` and run via the
+    shell_command runner.
 
-    The structured ``calc_checks`` list lets the init_ledger LLM avoid
-    writing Python source for verify bodies — the framework deterministically
-    constructs the function calls + the PASS/FAIL print. Boilerplate
-    (UNO connect + helper definitions) is the same as for the legacy
-    python3 -c Calc path: ``_maybe_wrap_calc_verify_command`` triggers
-    on the ``verify_*`` references in the body and prepends the
-    runtime.
+    The structured calc_checks list lets the init_ledger LLM skip writing
+    Python verify bodies — the framework builds the function calls + PASS/FAIL
+    print deterministically. _maybe_wrap_calc_verify_command then sees the
+    ``verify_*`` refs and prepends the UNO runtime boilerplate.
     """
     from mm_agents.structagent.actions.calc.actions import build_calc_verify_python_body
     body = build_calc_verify_python_body(spec.calc_checks or [])
@@ -707,8 +643,8 @@ def _run_calc_verify_traced(spec: VerifySpec, env: Any):
 
 
 def _run_file_grep_traced(spec: VerifySpec, env: Any, instruction: str):
-    """Match patterns in a VM file. Deterministic text/regex match with
-    optional proximity + per-app path fallbacks; no LLM involvement."""
+    """Match patterns in a VM file. Deterministic text/regex with optional
+    proximity + per-app path fallbacks; no LLM."""
     trace: dict = {
         "kind": "file_grep",
         "spec_path": spec.file_path,
@@ -730,13 +666,11 @@ def _run_file_grep_traced(spec: VerifySpec, env: Any, instruction: str):
     )
     trace["resolved_path"] = real_path
     if real_path is None:
-        # File does not exist anywhere on the VM (literal + curated fallbacks
-        # + last-resort find all missed). For "task: write to file" outcomes
-        # this is a CONFIRMED NOT-SATISFIED — a non-existent file cannot
-        # contain the patterns. We return False (not None) so the dispatcher
-        # trusts the verdict and does not fall back to the LLM, which would
-        # otherwise be tricked by transient UI cues (search-box echoes,
-        # record-mode keystroke previews) into a false-positive satisfaction.
+        # File missing everywhere on the VM. For "write to file" outcomes this
+        # is a CONFIRMED NOT-SATISFIED — a non-existent file can't hold the
+        # patterns. Return False (not None) so the dispatcher trusts it and
+        # doesn't fall back to the LLM, which transient UI cues (search-box
+        # echoes, record-mode keystroke previews) can trick into a false PASS.
         trace["verdict_reason"] = (
             "file does not exist on VM (after literal + app fallback + "
             "last-resort find); treating as NOT-SATISFIED"
@@ -751,14 +685,11 @@ def _run_file_grep_traced(spec: VerifySpec, env: Any, instruction: str):
         trace["verdict_reason"] = "get_file returned None despite resolved path"
         return None, trace
     trace["file_size_bytes"] = len(content_bytes)
-    # Cheap content hash so OutcomeStateCache can detect whether the
-    # file changed since the first verifier observation. Used to feed
-    # the planner's force_replan prompt with a "file modified since
-    # task start: yes/no" diagnostic line.
+    # Content hash so OutcomeStateCache can tell if the file changed since the
+    # first observation (feeds the planner's "file modified since start?" line).
     trace["file_content_hash"] = hashlib.sha256(content_bytes).hexdigest()[:16]
-    # File content preview — first 800 chars after decode. Lets the
-    # LLM-driven diagnoser (and the planner) see what the actor
-    # actually wrote vs what the verifier expects.
+    # Content preview (first 800 chars) so the LLM diagnoser/planner can see
+    # what the actor wrote vs what the verifier expects.
     try:
         _head = content_bytes[:1500].decode("utf-8", errors="replace")
         trace["file_content_head"] = _head[:800]
@@ -769,7 +700,7 @@ def _run_file_grep_traced(spec: VerifySpec, env: Any, instruction: str):
     except Exception as e:
         trace["verdict_reason"] = f"decode failed: {e}"
         return None, trace
-    # Per-pattern match record (which lines hit) — for debug visibility.
+    # Per-pattern match record (which lines hit) for debug visibility.
     lines = text.split("\n")
     per_pat = []
     for p in spec.patterns:
@@ -882,7 +813,7 @@ _CALC_LIB_FUNC_NAMES = (
 
 
 def _references_calc_ops_lib(code: str) -> bool:
-    """True iff the verify code uses any Calc-library function name."""
+    """True iff the verify code references a Calc-library function."""
     if not code:
         return False
     return any(fn in code for fn in _CALC_LIB_FUNC_NAMES)
@@ -914,7 +845,7 @@ _IMPRESS_LIB_FUNC_NAMES = (
 
 
 def _references_impress_ops_lib(code: str) -> bool:
-    """True iff the verify code uses any Impress-library function name."""
+    """True iff the verify code references an Impress-library function."""
     if not code:
         return False
     return any(fn in code for fn in _IMPRESS_LIB_FUNC_NAMES)
@@ -928,21 +859,19 @@ _WRITER_LIB_FUNC_NAMES = (
 
 
 def _references_writer_ops_lib(code: str) -> bool:
-    """True iff the verify code uses any Writer-library function name."""
+    """True iff the verify code references a Writer-library function."""
     if not code:
         return False
     return any(fn in code for fn in _WRITER_LIB_FUNC_NAMES)
 
 
 def _maybe_wrap_calc_verify_command(cmd):
-    """When the argv looks like ``['python3', '-c', '<code>']`` AND the
-    code references a Calc or Impress library function, replace the
-    code with the full wrapped runtime script (connect block + domain
-    setup + ops library + the original code as the body).
+    """If argv is ``['python3', '-c', '<code>']`` and the code references a
+    Calc/Impress/Writer library function, replace the code with the wrapped
+    runtime script (connect + domain setup + ops library + original body).
 
-    Pass-through for non-python3 verifiers, non-LO-lib verifiers
-    (plain bash test commands, file_grep, etc.), and any code that
-    doesn't actually use the library.
+    Pass-through otherwise (non-python3, plain bash, file_grep, code that
+    doesn't use the library).
     """
     if not isinstance(cmd, list) or len(cmd) != 3:
         return cmd
@@ -951,10 +880,9 @@ def _maybe_wrap_calc_verify_command(cmd):
     code = cmd[2]
     if not isinstance(code, str):
         return cmd
-    # Idempotency: a structured verify (_run_calc/writer/impress_verify
-    # _traced) already wraps the body with build_runtime_script for its
-    # KNOWN domain. Re-wrapping would nest the script and break it.
-    # Detect the wrapper's sentinel and pass through.
+    # Idempotency: structured verifies already wrap the body via
+    # build_runtime_script for their known domain. Re-wrapping would nest and
+    # break it — detect the sentinel and pass through.
     try:
         from mm_agents.structagent.actions.uno.cli_run_uno_helpers import WRAPPED_SENTINEL
         if code.lstrip().startswith(WRAPPED_SENTINEL):
@@ -981,53 +909,41 @@ _SCRIPT_EXT_RE = re.compile(r"\.(py|js|rb|sh|pl|ts)$", re.IGNORECASE)
 
 
 def _sanitize_pgrep_self_match(cmd: Any) -> Any:
-    """Fix a ``pgrep -f <name>`` process check that matches non-target
-    processes — chiefly the agent's OWN machinery.
+    """Fix a ``pgrep -f <name>`` check that matches non-target processes,
+    chiefly the agent's own machinery.
 
-    ``pgrep -f`` matches against the FULL command line of every
-    process. That is wrong for an "is application X running" check:
+    ``pgrep -f`` matches the FULL command line, wrong for "is app X running":
+    it self-matches the verifier's own ``bash -c '... pgrep -f X ...'``, and
+    every cli_run_uno script is a ``python3 -c '<...>'`` whose source embeds
+    the UNO connect boilerplate (``soffice --accept=…``,
+    ``StarOffice.ComponentContext``), so ``pgrep -f soffice`` matches every
+    in-flight calc/writer/impress op. (Observed: a "kill LibreOffice" verify
+    reported 152 matches, 151 of them the agent's own scripts, never passing
+    for 15 steps while real LibreOffice died at step 3.)
 
-      * it self-matches the verifier's own wrapper
-        ``bash -c '... pgrep -f X ...'`` (cmdline contains X), and
-      * worse, EVERY ``cli_run_uno`` script the agent runs is a
-        ``python3 -c '<...>'`` whose source embeds the UNO connect
-        boilerplate (``subprocess.Popen(['soffice', '--accept=…'])``,
-        ``StarOffice.ComponentContext``) — so ``pgrep -f soffice``
-        matches every in-flight calc/writer/impress verify or action.
-
-    Observed: a "kill LibreOffice" task whose ``pgrep -f soffice``
-    verify reported 152 matches (151 of them the agent's own
-    ``python3 -c`` UNO scripts) and never passed for 15 steps while
-    real LibreOffice was dead by step 3.
-
-    The bracket trick (``[s]office``) does NOT help — it still matches
-    the literal ``soffice`` inside those script bodies. The only
-    correct check matches the process NAME (``comm``), not the
-    cmdline: drop ``-f`` so ``pgrep`` matches the executable basename.
-    ``pgrep soffice`` → 1 match (the real ``soffice.bin``); the
-    ``python3`` UNO scripts have ``comm=python3`` and no longer match.
-
-    ``-f`` is kept only when the pattern looks like it genuinely needs
-    cmdline matching — a path, a pattern with whitespace, or a script
-    filename (``foo.py``) whose host process ``comm`` is the
-    interpreter, not the script.
+    The ``[s]office`` bracket trick doesn't help — it still matches the literal
+    inside those bodies. Only matching the process NAME works: drop ``-f`` so
+    pgrep matches the executable basename (``python3`` scripts have comm=python3
+    and drop out). Keep ``-f`` when the pattern genuinely needs cmdline matching
+    — a path, whitespace, or a script filename (whose host comm is the
+    interpreter, not the script).
     """
     if not isinstance(cmd, list):
         return cmd
 
     def _needs_f(pat: str) -> bool:
-        # The pattern truly needs full-cmdline matching when it is not
-        # a bare process name: a path, whitespace, or a script file.
+        # Needs full-cmdline matching when not a bare process name:
+        # a path, whitespace, or a script file.
         return ("/" in pat or any(c.isspace() for c in pat)
                 or bool(_SCRIPT_EXT_RE.search(pat)))
 
     out = list(cmd)
-    # argv form: ["pgrep", "-f", PAT, ...]  → drop "-f" for a bare name
+    # argv form: ["pgrep", "-f", PAT, ...] → drop "-f" for a bare name
     for i in range(len(out) - 2):
         if (out[i] == "pgrep" and out[i + 1] == "-f"
                 and isinstance(out[i + 2], str) and out[i + 2]
                 and not _needs_f(out[i + 2])):
-            del out[i + 1]   # remove the "-f" flag
+            del out[i + 1]
             break
     # string form: a `bash -c "... pgrep -f PAT ..."` token
     for i, tok in enumerate(out):
@@ -1041,25 +957,18 @@ def _sanitize_pgrep_self_match(cmd: Any) -> Any:
 
 
 def _run_shell_command_traced(spec: VerifySpec, env: Any):
-    """Execute ``spec.command`` (argv list) on the VM via
-    ``env.controller.run_bash_script`` and check the result.
+    """Run ``spec.command`` (argv) on the VM via run_bash_script and check it.
 
-    Verdict True iff:
-      • the command finished (status="success"), AND
-      • exit code matches ``spec.expected_exit_code`` (default 0), AND
-      • if ``expected_substring`` set, AT LEAST ONE substring (case-
-        insensitive) appears in stdout, AND
-      • if ``forbidden_substring`` set, NONE of them appear in stdout.
+    Verdict True iff: command finished (status="success"), exit code matches
+    ``spec.expected_exit_code`` (default 0), at least one ``expected_substring``
+    (case-insensitive) is in stdout, and no ``forbidden_substring`` is.
 
-    Returns ``(None, trace)`` when the env has no executor (allows the
-    KeyNode dispatcher to fall back to the LLM judge path)."""
-    # If this is a Calc verify that uses our ops library, pre-wrap the
-    # python3 -c body with the Calc cli_run_uno boilerplate so the
-    # library functions become available in the verifier subprocess.
-    # See ``_maybe_wrap_calc_verify_command`` for the trigger rules.
+    Returns ``(None, trace)`` when env has no executor (dispatcher then falls
+    back to the LLM judge)."""
+    # Pre-wrap an LO-lib python3 -c body with the cli_run_uno boilerplate so the
+    # library functions exist in the subprocess (see _maybe_wrap_calc_verify_command).
     wrapped_cmd = _maybe_wrap_calc_verify_command(list(spec.command or []))
-    # Defuse a self-matching ``pgrep -f <name>`` process check (the
-    # verifier's own wrapper shell otherwise matches itself).
+    # Defuse a self-matching ``pgrep -f <name>`` check.
     wrapped_cmd = _sanitize_pgrep_self_match(wrapped_cmd)
     trace: dict = {
         "kind": "shell_command",
@@ -1079,45 +988,25 @@ def _run_shell_command_traced(spec: VerifySpec, env: Any):
         trace["verdict_reason"] = "env has no run_bash_script executor"
         return None, trace
 
-    # shlex-quote each argv element + redirect stderr into stdout, then
-    # echo the trailing ``__EXIT__ $?`` marker so we can recover the
-    # exit code from the runner's combined-stdout return value.
+    # shlex-quote each argv element, redirect stderr→stdout, and echo a
+    # trailing ``__EXIT__ $?`` marker to recover the exit code from the
+    # runner's combined stdout.
     #
-    # Post-failure diagnostic block: when exit != 0, run a tiny read-only
-    # context probe so the verifier trace surfaces enough info for the
-    # downstream LLM diagnoser to identify root cause itself (rather
-    # than us hand-coding every failure-mode heuristic). Probes are
-    # generic — pwd / echo / ls on the last positional argv token —
-    # which produce meaningful stderr ("No such file or directory") for
-    # path-related commands (test / which / similar) and harmless noise
-    # for non-path commands (the LLM will ignore it).
-    # Use the (possibly wrapped) command — `wrapped_cmd` is identical
-    # to spec.command for non-Calc-lib verifiers; for Calc-lib verifiers
-    # it has the python3 -c body replaced with the runtime-wrapped
-    # script.
-    # ─────────────────────────────────────────────────────────────────
-    # [FIX shell_verify_tilde] LLM-authored verify specs frequently use
-    # ``~`` or ``~/path`` in argv (it's "shell-flavored" by reading,
-    # which is how the LLM thinks). But shell_command verifies dispatch
-    # argv ELEMENT-BY-ELEMENT through ``shlex.quote`` → each path lands
-    # inside single-quotes, where bash does NOT perform tilde expansion
-    # — the cmd then asserts on a literal ``~/...`` directory that
-    # doesn't exist, the outcome stays pending forever, and the planner
-    # falls into infinite REPLAN.
+    # Post-failure diagnostic block: on exit != 0, a tiny read-only probe
+    # (pwd/echo/ls on the last positional argv token) gives the downstream LLM
+    # diagnoser enough context to find root cause itself — meaningful stderr
+    # ("No such file or directory") for path commands, harmless noise otherwise.
     #
-    # Worse: when the verify is "file exists?" and reports MISSING,
-    # the planner trusts it and recreates the file from scratch,
-    # OVERWRITING the real downloaded artifact (observed on
-    # 3680a5ee — agent wrote fake text into binary xlsx/ods files).
-    #
-    # Fix: before shlex.quoting, replace a leading ``~`` / ``~/`` with
-    # the absolute home directory. OSWorld VMs always use
-    # ``/home/user``; we hardcode it as a known constant rather than
-    # round-tripping through the controller (would need a synchronous
-    # probe per verify call).
-    #
-    # To roll back: revert this block to the original
-    # ``shlex.quote(str(a))`` one-liner above.
+    # [FIX shell_verify_tilde] LLM verify specs often use ``~``/``~/path`` in
+    # argv, but element-by-element shlex.quote single-quotes each path where
+    # bash does NOT expand tilde → the cmd asserts on a literal ``~/...`` that
+    # doesn't exist → outcome pending forever → infinite REPLAN. Worse, a
+    # "file exists?" verify then reports MISSING, the planner recreates the
+    # file from scratch and OVERWRITES the real artifact (3680a5ee — fake text
+    # into binary xlsx/ods). Fix: expand a leading ``~``/``~/`` to the absolute
+    # home before quoting. OSWorld VMs are always /home/user, hardcoded rather
+    # than a synchronous controller probe per verify call.
+    # To roll back: revert to the plain ``shlex.quote(str(a))`` one-liner.
     _VM_HOME = "/home/user"
     def _expand_argv_tilde(a):
         s = str(a)
@@ -1136,19 +1025,13 @@ def _run_shell_command_traced(spec: VerifySpec, env: Any):
             break
     quoted_last = shlex.quote(last_arg) if last_arg else ""
     # ──── end FIX shell_verify_tilde ────
-    # The DIAG block is a debug helper for path-style argv (e.g.
-    # ``["test","-f","/path"]``): on non-zero exit, it echoes pwd +
-    # ls's the last argv token to surface "no such file or directory"
-    # context. For argv that EMBED CODE in the last token
-    # (``["python3","-c","<36KB UNO wrapper>"]`` — every calc_verify
-    # path), the DIAG block inlines that ~36KB code three more times
-    # (echo + ls + dirname), inflating the bash script to ~4× its
-    # natural size. Empirically this 144KB bash payload correlates
-    # with 110s HTTP-timeouts on the env API's ``/execute`` path —
-    # likely subprocess argv parsing / shell-meta scanning on the
-    # huge ls argument blocks the server for the full timeout window.
-    # Suppress DIAG whenever the last token is code-like (multi-line,
-    # or too large to be a path).
+    # DIAG block: for path-style argv (``["test","-f","/path"]``), on non-zero
+    # exit echo pwd + ls the last token to surface "no such file or directory".
+    # But for argv embedding CODE in the last token (every calc_verify's
+    # ``["python3","-c","<36KB UNO wrapper>"]``) it inlines that code 3 more
+    # times (echo+ls+dirname) → ~144KB bash payload, which empirically triggers
+    # 110s HTTP timeouts on the env /execute path. So suppress DIAG when the
+    # last token is code-like (multi-line or too large to be a path).
     looks_like_code = (
         len(last_arg) > 512
         or "\n" in last_arg
@@ -1169,18 +1052,11 @@ def _run_shell_command_traced(spec: VerifySpec, env: Any):
         diag_block = ""
     script = f'{quoted} 2>&1\n__EC=$?\necho "__EXIT__ $__EC"{diag_block}'
 
-    # ── Verbose trace logging — captures every layer of the verify
-    # subprocess dispatch so a 110s HTTP hang (or any other failure
-    # mode) leaves a self-describing audit trail in runtime.log:
-    #
-    #   • pre-call:  argv head, script head + tail, full script byte
-    #                length, spec kind, the wall-clock start time;
-    #   • on success: exit code + elapsed + stdout/stderr head;
-    #   • on raise:   exception class + elapsed + script dumped to
-    #                 /tmp for offline inspection;
-    #   • on non-success-status: status + error + elapsed + script
-    #                            dumped (helps attribute HTTP
-    #                            timeouts to specific verifies).
+    # Verbose trace logging so a 110s HTTP hang (or any failure) leaves a
+    # self-describing audit trail in runtime.log: pre-call argv/script
+    # head+tail+bytes+kind+start; on success exit/elapsed/stdout; on raise or
+    # non-success status, exception/status + elapsed + script dumped to /tmp
+    # (helps attribute HTTP timeouts to specific verifies).
     import time as _t
     import os as _os
     _t0 = _t.time()
@@ -1195,10 +1071,8 @@ def _run_shell_command_traced(spec: VerifySpec, env: Any):
     )
 
     def _dump_failed_script(reason_tag: str) -> Optional[str]:
-        """Save the failing script under /tmp/_verify_fail_<ts>.sh
-        so the exact bytes sent to bash can be inspected post-hoc.
-        Returns the path (or None if dump itself fails).
-        """
+        """Dump the failing script to /tmp/_verify_fail_<ts>.sh for post-hoc
+        inspection. Returns the path, or None if the dump fails."""
         try:
             path = (f"/tmp/_verify_fail_{int(_t0)}_"
                     f"{reason_tag}_{_os.getpid()}.sh")
@@ -1243,8 +1117,7 @@ def _run_shell_command_traced(spec: VerifySpec, env: Any):
         _elapsed, result.get("returncode"), _stdout_preview,
     )
     raw_out = (result.get("output") or "")
-    # Strip off the trailing ``__EXIT__ <N>`` marker. Treat as exit 0
-    # if the marker is absent (shouldn't happen but be safe).
+    # Strip the trailing ``__EXIT__ <N>`` marker; treat missing as exit 0.
     exit_code: Optional[int] = 0
     stdout = raw_out
     m = re.search(r"^__EXIT__ (\d+)\s*$", raw_out, re.MULTILINE)
@@ -1254,8 +1127,7 @@ def _run_shell_command_traced(spec: VerifySpec, env: Any):
         except Exception:
             exit_code = 0
         stdout = raw_out[:m.start()].rstrip("\n")
-        # Parse the post-failure diagnostic block (only present when
-        # exit != 0 and we asked for it).
+        # Parse the post-failure diagnostic block (present only on exit != 0).
         tail = raw_out[m.end():]
         diag_m = re.search(
             r"__DIAG_START__\n(.*?)\n__DIAG_END__",
@@ -1273,7 +1145,7 @@ def _run_shell_command_traced(spec: VerifySpec, env: Any):
         )
         return False, trace
     stdout_l = stdout.lower()
-    # Forbidden first — any hit is an instant FAIL even if expected also hit.
+    # Forbidden first — any hit is an instant FAIL even if expected also hits.
     for s in (spec.forbidden_substring or []):
         if s and s.lower() in stdout_l:
             trace["verdict_reason"] = f"forbidden substring matched: {s!r}"

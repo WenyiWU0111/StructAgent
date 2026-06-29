@@ -1,29 +1,22 @@
 """Augment a Multimodal-Mind2Web task with synthesised per-step thought /
 observation / reflection text, then hand off to the AgentNet normaliser.
 
-WHY augment first
------------------
-Multimodal-Mind2Web records every action as ``[heading] CAR -> CLICK`` —
-crisp but mute. Our memory bank wants per-step reasoning so the downstream
-normaliser can extract pitfalls / recovery hints (currently empty in raw
-Mind2Web → all pitfalls/recovery would be []). An LLM call reconstructs
-the implicit reasoning chain a thoughtful human would have had at each
-action, given the FULL action sequence as anchor + the task instruction
-as goal. The output mimics AgentNet's ``traj[].value.{observation,
-thought, action, reflection}`` shape so the AgentNet normaliser
-(``agentnet_normalize.normalize_one``) consumes it byte-identical.
+Mind2Web records actions as ``[heading] CAR -> CLICK`` — crisp but mute, so
+the downstream normaliser extracts no pitfalls / recovery hints. An LLM call
+reconstructs the implicit reasoning a thoughtful human would have had at each
+action (full action sequence + task as anchor), shaped as AgentNet's
+``traj[].value.{observation,thought,action,reflection}`` so
+``agentnet_normalize.normalize_one`` consumes it unchanged.
 
-CAVEAT — these reflections are synthesised post-hoc against a *successful*
-trajectory. They will read as "this worked because X" rather than
-"I tried Y first and it failed, then Z". For pitfalls / failure_modes
-mining the signal is weaker than real first-person reflections (AgentNet)
-but still gives the planner / verifier banks per-step rationale.
+CAVEAT: reflections are synthesised post-hoc against a *successful* traj, so
+they read "this worked because X", never "tried Y, failed, then Z" — weaker
+signal for pitfall mining than real AgentNet reflections.
 
 Pipeline:
-  1. Stream Multimodal-Mind2Web rows from HF Hub
+  1. Stream Mind2Web rows from HF Hub
   2. group_rows_into_tasks → {annotation_id: task_dict}
   3. augment_one(task) → AgentNet-shaped task with synth ``traj``
-  4. agentnet_normalize.normalize_one(augmented_task) → final standard JSON
+  4. agentnet_normalize.normalize_one → final standard JSON
 """
 from __future__ import annotations
 
@@ -38,10 +31,9 @@ logger = logging.getLogger(__name__)
 
 # ─── Grouping (action-centric Mind2Web rows → task dicts) ────────────────────
 def group_rows_into_tasks(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """One annotation_id = one task. action_reprs is constant across rows of
-    the same task — we deduplicate by keeping the first row's. Per-row
-    target_action_index + target_action_reprs + operation are retained so a
-    downstream caller could line up screenshots to action indices."""
+    """One annotation_id = one task. action_reprs is constant across a task's
+    rows (keep the first); per-row target_action_index/reprs/operation are
+    retained so a caller could line up screenshots to action indices."""
     by_task: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         aid = r.get("annotation_id")
@@ -117,7 +109,7 @@ Produce the JSON array now."""
 
 def _build_augment_messages(task: Dict[str, Any]) -> List[Dict[str, str]]:
     seq = task.get("action_reprs") or []
-    # Cap long sequences (rare; most ≤25 actions). Keep prefix + tail.
+    # Cap long sequences (rare; most ≤25): keep prefix + tail.
     if len(seq) > 30:
         seq = seq[:15] + [f"[... {len(seq) - 30} actions omitted ...]"] + seq[-15:]
     action_block = "\n".join(f"  {i}. {a}" for i, a in enumerate(seq))
@@ -166,11 +158,11 @@ _JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
 
 
 def _parse_array(text: str) -> List[Dict[str, Any]] | Dict[str, Any]:
-    """Extract the last balanced JSON ARRAY in the response. Returns either
-    a list (success) or a dict with _unparsed=True (failure)."""
+    """Last balanced JSON array in the response → list (success), else a
+    dict with _unparsed=True (failure)."""
     if not text:
         return {"_unparsed": True, "_reason": "<empty>"}
-    # Search backwards for balanced [ ... ]
+    # Search backwards for a balanced [ ... ].
     depth, end = 0, None
     for i in range(len(text) - 1, -1, -1):
         c = text[i]
@@ -188,7 +180,7 @@ def _parse_array(text: str) -> List[Dict[str, Any]] | Dict[str, Any]:
                 except json.JSONDecodeError:
                     end = None
                     depth = 0
-    # Fallback: first [...] found by greedy regex
+    # Fallback: first [...] by greedy regex.
     m = _JSON_ARRAY_RE.search(text)
     if m:
         try:
@@ -204,22 +196,20 @@ def _parse_array(text: str) -> List[Dict[str, Any]] | Dict[str, Any]:
 
 # ─── Domain normalisation (Mind2Web → framework domain) ─────────────────────
 def _mind2web_to_framework_domain(task: Dict[str, Any]) -> str:
-    """The framework only has ``chrome`` for web tasks. Use that for all
-    Mind2Web entries so retrieval lines up. The website / subdomain are
-    preserved as separate fields downstream."""
+    """Framework has only ``chrome`` for web tasks — use it for all Mind2Web
+    entries so retrieval lines up. website/subdomain kept downstream."""
     return "chrome"
 
 
 # ─── Augment to AgentNet-shaped task ─────────────────────────────────────────
 def augment_one(task: Dict[str, Any], model_choice: str = "qwen") -> Dict[str, Any]:
-    """Run the augment LLM call. Returns an AgentNet-shaped task dict ready
-    to hand to ``agentnet_normalize.normalize_one`` — that downstream call
-    is the second of the two-stage pipeline."""
+    """Run the augment LLM call → AgentNet-shaped task dict for
+    ``agentnet_normalize.normalize_one`` (stage 2)."""
     messages = _build_augment_messages(task)
     raw, resolved_model = _call_model(model_choice, messages)
     parsed = _parse_array(raw)
 
-    # Build the per-step `traj` list in AgentNet's expected shape.
+    # Per-step `traj` in AgentNet's expected shape.
     traj: List[Dict[str, Any]] = []
     augment_meta: Dict[str, Any] = {
         "augment_model_choice": model_choice,
@@ -227,21 +217,17 @@ def augment_one(task: Dict[str, Any], model_choice: str = "qwen") -> Dict[str, A
         "augment_raw_response_head": raw[:200] if raw else "",
     }
     if isinstance(parsed, dict) and parsed.get("_unparsed"):
-        # Don't try to keep going — return marker so the bulk runner can
-        # log an error and skip this task without crashing the pool.
+        # Record the marker (bulk runner logs + skips) and fall through with
+        # empty traj; the normalizer then emits an n_steps=0 stub to drop.
         augment_meta["augment_parse_error"] = parsed
-        # Fall through with empty traj; AgentNet normalizer will see
-        # n_steps=0 and produce an empty / explicit-stub summary which
-        # downstream can drop.
     elif isinstance(parsed, list):
         for entry in parsed:
             if not isinstance(entry, dict):
                 continue
             traj.append({
                 "index": entry.get("step"),
-                "image": None,                     # actual screenshot path
-                                                    # available in raw rows
-                                                    # if needed by L_v2 later
+                "image": None,                     # real path is in raw rows
+                                                    # if needed later
                 "value": {
                     "observation": entry.get("observation") or "",
                     "thought":     entry.get("thought") or "",
@@ -259,7 +245,7 @@ def augment_one(task: Dict[str, Any], model_choice: str = "qwen") -> Dict[str, A
         "task_id": task.get("task_id"),
         "instruction": task.get("instruction"),
         "domain": _mind2web_to_framework_domain(task),
-        "task_completed": True,                     # all Mind2Web rows are
+        "task_completed": True,                     # Mind2Web rows are all
                                                      # annotated successes
         "alignment_score": None,
         "efficiency_score": None,
@@ -270,7 +256,7 @@ def augment_one(task: Dict[str, Any], model_choice: str = "qwen") -> Dict[str, A
         "natural_language_task": task.get("instruction"),
         "actual_task": task.get("instruction"),
         "traj": traj,
-        # extra provenance for our pipeline (downstream may keep / drop)
+        # provenance (downstream may keep or drop)
         "source": "multimodal_mind2web",
         "mind2web_website": task.get("website"),
         "mind2web_domain": task.get("domain_label"),

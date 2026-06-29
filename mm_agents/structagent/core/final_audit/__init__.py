@@ -1,22 +1,19 @@
 """Done-Auditor subsystem (T3).
 
-Adversarial second-opinion check on DONE claims (see plan file Part
-I.2). Default on in ``StructAgent``; it can also be enabled explicitly
-via ``ENABLE_DONE_AUDITOR=1`` in env-driven runs.
+Adversarial second-opinion check on DONE claims (see plan file Part I.2).
+On by default in ``StructAgent``; also gated by ``ENABLE_DONE_AUDITOR=1`` in
+env-driven runs.
 
 Public surface:
-
-  - ``DoneAuditSnapshot`` — frozen dataclass of state at the DONE
-    moment (task, screenshots, a11y, outcome proofs, perceiver focus).
-    Same shape whether built offline (from a run dir) or live (from
-    in-flight agent attrs).
-  - ``build_snapshot_from_run_dir(run_dir)`` — offline replay builder.
-  - ``build_snapshot_from_live_state(agent)`` — runtime builder.
-  - ``audit_done(agent)`` — top-level entry from ``agent._pa_predict``.
-    Returns ``(verdict, reason, AuditResult)``; verdict is always one of
-    PASS / FAIL / PARTIAL (errors and parser-fails map to PARTIAL).
-  - ``run_audit(snapshot)`` — lower-level entry that takes any snapshot
-    (used by ``tests/replay_done_audit.py``).
+  - ``DoneAuditSnapshot`` — frozen state at the DONE moment (task, screenshots,
+    a11y, outcome proofs, perceiver focus). Same shape offline or live.
+  - ``build_snapshot_from_run_dir`` / ``build_snapshot_from_live_state`` —
+    offline-replay vs runtime builders.
+  - ``audit_done(agent)`` — entry from ``agent._pa_predict``. Returns
+    ``(verdict, reason, AuditResult)``; verdict is PASS/FAIL/PARTIAL (errors and
+    parse-fails map to PARTIAL).
+  - ``run_audit(snapshot)`` — lower-level entry for any snapshot (used by
+    ``tests/replay_done_audit.py``).
   - ``parse_verdict(text)`` — last-line VERDICT extractor.
 """
 

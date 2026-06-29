@@ -1,68 +1,34 @@
-"""Failure Attribution v2 — causal-flavoured root-cause diagnosis with
-multi-layer-memory critique.
+"""Failure Attribution v2 — causal root-cause diagnosis with memory critique.
 
-WHY a v2 of stuck_diagnosis
----------------------------
-The v1 module (`stuck_diagnosis.py`) does a structurally sound job
-producing one-line root cause + a 4-category tag + a concrete hint.
-Examining real dumps across multiple runs surfaced four recurring
-failure modes:
+A v2 of stuck_diagnosis (v1: `stuck_diagnosis.py`). Real dumps surfaced four
+recurring v1 failure modes this addresses:
 
-1. **Goal vs evidence confusion.** verify spec's `evidence_hint`
-   (e.g. "Layer Properties dialog shows height=512") gets read AS the
-   goal — so the LLM proposes "open the dialog" instead of "resize the
-   layer".
-2. **Zero memory awareness.** The diagnose sees the trajectory but
-   doesn't know the memory bank ALREADY has a canonical approach for
-   this exact subgoal — e.g. an L1 entry "GIMP: Layer > Scale Layer
-   resizes ONE layer; Image > Scale Image resizes the canvas; common
-   conflation" would have pinpointed the failure instantly.
-3. **Category drift without evidence.** The "no-flip-without-evidence"
-   prompt rule mitigates but doesn't eliminate this; the LLM still
-   flips tactical → strategic across replans on the same focus.
-4. **Role attribution is collapsed into category.** v1 has
-   `tactical/strategic/info/unclear` (HOW to fix) but no
-   `planner/actor/verifier/env` (WHO is responsible). The two
-   dimensions are orthogonal and both matter for routing.
+1. Goal-vs-evidence confusion — the verify spec's `evidence_hint` ("Layer
+   Properties shows height=512") gets read AS the goal, so the LLM proposes
+   "open the dialog" instead of "resize the layer".
+2. Zero memory awareness — v1 can't see that the bank already has a canonical
+   approach for this exact subgoal (e.g. an L1 entry on GIMP Layer-vs-Image
+   scaling) that would have pinpointed the failure.
+3. Category drift without evidence — the LLM still flips tactical → strategic
+   across replans on the same focus.
+4. Role collapsed into category — v1 tags HOW to fix (tactical/strategic/...)
+   but not WHO is responsible (planner/actor/verifier/env). The dimensions are
+   orthogonal and both matter for routing.
 
-v2's response shape
--------------------
-Forces the LLM to walk a five-phase reasoning trail with fields
-ordered as RECALL → OBSERVE → CRITIQUE → ATTRIBUTE → ACT, so
-conclusions come AFTER evidence anchoring:
-
-    {
-      "memory_recall": {
-        "canonical_approach": "<1 sentence what memory says>",
-        "memory_referenced": [{"layer","id","score","why_relevant"}]
-      },
-      "observation_summary": "...",
-      "evidence_quotes":   ["...", "..."],
-      "memory_critique":   {"memory_followed", "divergence_description"},
-      "root_cause_summary": "...",
-      "attributed_to_role": "planner|actor|verifier|env|unclear",
-      "category":           "tactical|strategic|info_gap|unclear",
-      "tactical_subkind":   "wrong_target|target_missing|...|null",
-      "missing_or_wrong":   [...],
-      "confidence":         "high|medium|low",
-      "next_action_hint":   "<one concrete action signature>"
-    }
-
+v2 forces a five-phase trail RECALL → OBSERVE → CRITIQUE → ATTRIBUTE → ACT so
+conclusions come after evidence anchoring (see _SYSTEM_PROMPT for the schema).
 The role × category combinations encode where the loop broke:
-  • planner+tactical   — chose subtly wrong subgoal under right plan
-  • planner+strategic  — chose wrong overall plan
-  • actor+tactical     — execution off under correct subgoal
-  • verifier+tactical  — false-rejected a real completion
-  • verifier+strategic — verify spec doesn't match actual goal
-  • env+tactical       — race/dialog/modal interrupted
-  • env+strategic      — environment fundamentally blocks this path
+  planner+tactical   — subtly wrong subgoal under right plan
+  planner+strategic  — wrong overall plan
+  actor+tactical     — execution off under correct subgoal
+  verifier+tactical  — false-rejected a real completion
+  verifier+strategic — verify spec doesn't match actual goal
+  env+tactical       — race/dialog/modal interrupted
+  env+strategic      — environment fundamentally blocks this path
 
-Env-gated rollout
------------------
-Set ``USE_FAILURE_ATTRIBUTION=1`` to route the recovery hook here. v1
-remains live as the default for safe A/B comparison; the replay tool
-in ``scripts/dev_tools/replay_failure_attribution.py`` runs v2 against
-all historic stuck_diagnosis dumps for side-by-side eval.
+Set USE_FAILURE_ATTRIBUTION=1 to route the recovery hook here; v1 stays the
+default for A/B. scripts/dev_tools/replay_failure_attribution.py replays v2
+against historic stuck_diagnosis dumps for side-by-side eval.
 """
 
 from __future__ import annotations
@@ -77,8 +43,8 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
-# Reuse v1's snapshot-building helpers — they're stable and battle-tested.
-# Only the *system prompt* + *output schema* + *memory injection* differ.
+# Reuse v1's snapshot-building helpers; only the system prompt + schema + memory
+# injection differ.
 from mm_agents.structagent.attribution.stuck_diagnosis import (
     _render_goal_section,
     _render_available_actions_section,
@@ -178,20 +144,16 @@ class FailureAttribution:
     confidence: str = "low"
     # ── 5. ACT ──
     next_action_hint: str = ""
-    # ── 6. ROLE-SPECIFIC ROUTING PAYLOAD ──
-    # Only meaningful when role matches; empty/None otherwise.
-    # The router downstream picks the right payload for the chosen route.
+    # ── 6. ROLE-SPECIFIC ROUTING PAYLOAD (empty/None unless role matches) ──
+    # Filled when role == "verifier" + the LLM judges the state already
+    # satisfied. Each entry is a verbatim snapshot quote (window title / a11y
+    # row / CLI stdout) backing the override. Empty = no defensible override.
     verifier_override_evidence: List[str] = field(default_factory=list)
-    # filled when attributed_to_role == "verifier" + the LLM judges
-    # the underlying state IS already satisfied. Each entry is a
-    # verbatim quote from the snapshot (window title / a11y row / CLI
-    # stdout) that supports the override claim. Empty list means the
-    # LLM did not produce a defensible override.
-    env_recovery_kind: Optional[str] = None
     # "wait" | "focus" | "recovery_script" | "retry"
+    env_recovery_kind: Optional[str] = None
+    # kind-specific, e.g. {"ms": 5000} (wait); {"target_widget": "..."} (focus);
+    # {"command": "pkill -f chrome; sleep 2; chrome &"} (recovery_script)
     env_recovery_params: Dict[str, Any] = field(default_factory=dict)
-    # e.g. {"ms": 5000} for wait; {"target_widget": "..."} for focus;
-    # {"command": "pkill -f chrome; sleep 2; chrome &"} for recovery_script
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -220,17 +182,16 @@ class FailureAttribution:
 
 
 def _parse_response(raw: str) -> Optional[FailureAttribution]:
-    """Extract the JSON object from the model response + validate enums.
-    Returns None on hard parse failure."""
+    """Extract the JSON object and validate enums. None on hard parse failure."""
     if not raw:
         return None
     txt = raw.strip()
-    # Strip code-fence if model emitted one despite instructions
+    # Strip a code fence if the model emitted one despite instructions.
     if txt.startswith("```"):
         m = re.search(r"```(?:json)?\s*\n(.*?)\n```", txt, re.DOTALL)
         if m:
             txt = m.group(1)
-    # Otherwise take the first { ... } object (greedy match for braces)
+    # Otherwise take the first { ... } object.
     if not txt.startswith("{"):
         m = re.search(r"\{.*\}", txt, re.DOTALL)
         if not m:
@@ -312,14 +273,11 @@ def _build_retrieved_memory_block(
     k_l1: int = 3,
     k_l3a_rule: int = 4,
 ) -> str:
-    """Pull v3 memory relevant to the current goal/subgoal and render
-    as a prompt block. Returns "" when v3 indexes aren't built or the
-    retriever can't load (caller will see "no relevant memory" in the
-    rendered block).
+    """Render v3 memory relevant to the current goal/subgoal as a prompt block.
+    "" when v3 indexes aren't built or the retriever can't load.
 
-    Query = focus_outcome's description + the most recent subgoal text
-    available on the outcome — concatenated so MiniLM ranks for both
-    the WHAT (description) and the HOW (subgoal phrasing)."""
+    Query = outcome description + latest subgoal text, concatenated so MiniLM
+    ranks for both the WHAT (description) and the HOW (subgoal phrasing)."""
     try:
         from mm_agents.structagent.memory.runtime.retrieval.query_multi_layer_memory \
             import _get_singleton_retriever
@@ -466,11 +424,11 @@ def diagnose_failure(
     last_cli_run_output: Optional[Dict[str, Any]] = None,
 ) -> Optional[FailureAttribution]:
     """v2 failure-attribution analysis. Same input contract as v1's
-    ``diagnose_stuck`` so the planner-side caller switch is a one-liner."""
+    diagnose_stuck so the caller switch is a one-liner."""
     if focus_outcome is None:
         return None
 
-    # ── Build snapshot sections (reuse v1 helpers) ──
+    # Build snapshot sections (reuse v1 helpers).
     goal_section = _render_goal_section(focus_outcome)
     actions_section = _render_available_actions_section(current_domain)
     cli_section = _render_cli_run_section(last_cli_run_output)
@@ -487,7 +445,7 @@ def diagnose_failure(
         stuck_category, stuck_reason,
     )
 
-    # ── NEW: retrieved memory block (v3) ──
+    # Retrieved memory block (v3).
     memory_block = _build_retrieved_memory_block(
         focus_outcome, current_domain,
     ) or ("RETRIEVED MEMORY: <no relevant memory found OR v3 index "
@@ -539,9 +497,8 @@ def diagnose_failure(
         {"role": "user", "content": user_content},
     ]
 
-    # ── Cache by (focus_id, action-digest, obs-digest) — same key as v1
-    #    but in a separate slot on the focus outcome so v1 and v2 caches
-    #    don't collide during A/B comparison.
+    # Cache by (focus_id, action-digest, obs-digest) — same key as v1 but in a
+    # separate slot so v1 and v2 caches don't collide during A/B.
     actions_digest = _digest(rollup_section + attempts_section)
     obs_digest = _digest(obs_section)
     sig = f"{focus_outcome.id}|{actions_digest}|{obs_digest}"
@@ -554,7 +511,7 @@ def diagnose_failure(
     cache_status = "miss"
 
     if cached_sig == sig and cached_dict is not None:
-        # Parse cached dict back into the dataclass.
+        # Rehydrate the cached dict into the dataclass.
         try:
             diag = FailureAttribution(
                 memory_recall_canonical=(cached_dict.get(
@@ -589,18 +546,17 @@ def diagnose_failure(
     raw = ""
     if diag is None:
         try:
-            # call_llm signature is (payload, model) — payload is the request dict
-            # (same shape as stuck_diagnosis.py's call). The old keyword call
-            # call_llm(messages=..., model=...) raised TypeError on EVERY invocation,
-            # silently disabling failure-attribution v2 for whole runs (the warning
-            # below ate it), so the verifier_override/router never fired.
+            # call_llm signature is (payload, model), payload being the request
+            # dict (same shape as stuck_diagnosis). The old keyword call
+            # call_llm(messages=..., model=...) raised TypeError every time,
+            # silently disabling v2 for whole runs (the warning below ate it).
             raw = call_llm({"model": model, "messages": messages}, model) or ""
         except Exception as e:
             logger.warning("failure_attribution LLM call failed: %s", e)
             raw = ""
         diag = _parse_response(raw)
 
-    # ── Persist prompt + response for debug (same dir naming as v1) ──
+    # Persist prompt + response for debug (same dir naming as v1).
     if results_dir:
         try:
             slug = re.sub(r"[^a-z0-9]+", "_",
@@ -622,7 +578,7 @@ def diagnose_failure(
         except Exception as e:
             logger.info("failure_attribution debug-dump failed: %s", e)
 
-    # ── Update focus outcome cache ──
+    # Update focus outcome cache.
     if diag is not None:
         try:
             focus_outcome.last_failure_attribution_signature = sig
@@ -634,9 +590,8 @@ def diagnose_failure(
 
 
 def _redact_image_urls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Replace base64 image_url payloads with a placeholder so dumps
-    stay small + diffable. Lossless for everything except the actual
-    screenshot bytes (which are also dumped separately as PNG)."""
+    """Replace base64 image_url payloads with a placeholder so dumps stay small
+    and diffable (the screenshot bytes are dumped separately as PNG)."""
     out = []
     for m in messages:
         if not isinstance(m, dict):
@@ -665,9 +620,8 @@ def _redact_image_urls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def render_failure_attribution(
     diag: FailureAttribution, *, focus_id: str
 ) -> str:
-    """Render the attribution as a compact block for injection into the
-    next force_replan prompt. Mirrors v1's render_stuck_diagnosis shape
-    so the consuming prompt template sees a familiar block."""
+    """Render the attribution as a compact block for the next force_replan
+    prompt. Mirrors v1's render_stuck_diagnosis shape."""
     lines = [
         f"[Failure attribution for {focus_id}]",
         f"  attributed_to_role: {diag.attributed_to_role}",

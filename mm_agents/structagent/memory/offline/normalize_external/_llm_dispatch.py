@@ -1,14 +1,13 @@
 """LLM dispatch helpers for the offline normalize scripts.
 
-Reconstructed 2026-06-16: these generic helpers previously lived in the (now
-removed) ``memory/runtime/recheck/_common.py``. That recheck package hosted the
-dead L_v2/L_v3 milestone/done-gate exemplar machinery and was deleted, but it also
-held this model resolver, which the external-dataset normalize scripts still use.
+Salvaged 2026-06-16 from the deleted ``memory/runtime/recheck/_common.py``
+(the rest of that package was dead L_v2/L_v3 machinery); the normalize
+scripts still use this model resolver.
 
-Local Qwen via vLLM with thinking OFF (the OpenRouter wire-format does not take the
-chat_template_kwargs flag, so only the vLLM path sets it — otherwise Qwen keeps
-thinking ON and blows past max_tokens before reaching the JSON answer). sonnet/opus
-or a fully-qualified name route to OpenRouter.
+Local Qwen via vLLM with thinking OFF — only the vLLM path sets
+chat_template_kwargs (OpenRouter's wire format rejects it), else Qwen
+keeps thinking and blows past max_tokens before the JSON. sonnet/opus or
+a fully-qualified name route to OpenRouter.
 """
 from __future__ import annotations
 

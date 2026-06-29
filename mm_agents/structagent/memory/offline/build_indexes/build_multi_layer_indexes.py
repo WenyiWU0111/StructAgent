@@ -2,29 +2,17 @@
 
 Produces five retrievable surfaces under ``_indexes_v3/``:
 
-  l1/<domain>/         per-domain L1 typical-actions
-                       embed key: subgoal_pattern
-                       use: per-subgoal retrieval (subgoal-transition)
+  l1/<domain>/   per-domain typical actions; embed subgoal_pattern;
+                 used at subgoal-transition.
+  l2/            plan templates; embed when_to_use; used at task-start.
+  l3a_cluster/   cluster summaries; embed cluster_summary; task-start.
+  l3a_rule/      individual rules; embed "{rule} — {applies_when}";
+                 subgoal-transition.
+  l3c/           per-domain rule sheets — direct dict lookup, no FAISS
+                 (only 7 domain keys).
 
-  l2/                  L2 plan templates
-                       embed key: when_to_use
-                       use: task-start (full plan + pitfalls)
-
-  l3a_cluster/         L3a cluster summaries (cluster-level wisdom)
-                       embed key: cluster_summary
-                       use: task-start (patterns across this task class)
-
-  l3a_rule/            L3a individual rules
-                       embed key: "{rule} — {applies_when}"
-                       use: subgoal-transition (specific gotchas)
-
-  l3c/                 L3c per-domain rule sheets — direct dict lookup,
-                       NO FAISS (only 7 domain keys)
-
-Algorithm: SentenceTransformer all-MiniLM-L6-v2 → L2-normalize →
-FAISS IndexFlatIP (= cosine similarity on unit vectors). Exact search;
-the ~2500-entry corpus is small enough that approximate indexes (HNSW
-etc) would add complexity without speed benefit.
+Embeds with all-MiniLM-L6-v2 → L2-normalize → IndexFlatIP (cosine).
+Exact search; the ~2500-entry corpus is too small for HNSW to pay off.
 
 Run:
   PYTHONPATH=. python -m mm_agents.structagent.memory.offline.build_indexes.build_multi_layer_indexes
@@ -50,8 +38,8 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 UNI = REPO_ROOT / "results" / "unified_memory"
-# Build version: v3 (default) or v4 (cleaned/abstracted L1+L2). L3 rule sheets are
-# shared across versions (not in the abstraction scope) and always read _v3.
+# v3 (default) or v4 (cleaned/abstracted L1+L2). L3 rule sheets are shared
+# across versions and always read from _v3.
 BUILD_VERSION = os.environ.get("BUILD_VERSION", "v3")
 INDEXES_DIR = UNI / f"_indexes_{BUILD_VERSION}"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -61,20 +49,8 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 def load_l1_actions() -> Dict[str, List[Dict[str, Any]]]:
     """Returns dict[domain → list[action_entry]].
 
-    Each cluster file may contain 1-4 actions; we flatten to per-action
-    entries (so each L1 action gets its own index row). Each entry has:
-      - action_id
-      - cluster_id
-      - domain
-      - subgoal_pattern        (embedding key)
-      - approach
-      - when_to_use
-      - typical_actions
-      - tools_or_widgets_seen
-      - common_pitfalls
-      - n_assigned_segments   (full-cluster count)
-      - assigned_sample_task_hashes (this approach's portion of samples)
-      - source_path
+    Each cluster file holds 1-4 actions; flattened to one index row per
+    action. Embedding key is ``subgoal_pattern``.
     """
     base = UNI / f"_l1_actions_{BUILD_VERSION}"
     by_domain: Dict[str, List[Dict[str, Any]]] = {}
@@ -110,10 +86,7 @@ def load_l1_actions() -> Dict[str, List[Dict[str, Any]]]:
 
 
 def load_l2_skills() -> List[Dict[str, Any]]:
-    """Returns list of skill entries.
-
-    Each L2 cluster file contains 1+ skill; we flatten.
-    """
+    """Flatten L2 cluster files (1+ skill each) to a list of skill entries."""
     base = UNI / f"_l2_skills_{BUILD_VERSION}"
     entries: List[Dict[str, Any]] = []
     for fp in sorted(base.glob("cluster_*.json")):

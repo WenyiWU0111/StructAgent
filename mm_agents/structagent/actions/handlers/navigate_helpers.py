@@ -1,25 +1,16 @@
 """Helpers for the ``navigate(url='...')`` action.
 
-The action drives Chrome to a new URL via the DevTools HTTP endpoint
-exposed on port 1337 inside the VM (socat'd to host port 9222). This is
-**one** reliable action instead of the 3-action GUI dance (``hotkey
-ctrl+l`` → ``type(content='url\\n')``) that depends on the address bar
-being correctly grounded by the vision model.
+Drives Chrome to a URL via the DevTools HTTP endpoint on VM port 1337
+(socat'd to host 9222) — one reliable action instead of the GUI
+``ctrl+l`` + type dance that depends on the address bar being grounded
+by the vision model.
 
-Two modes:
-  • new_tab=True  → open the URL in a fresh tab and switch focus to it
-                    (uses ``/json/new?<url>``). Default for safety —
-                    doesn't disturb any tab the agent already cares about.
-  • new_tab=False → navigate the currently focused tab to the URL
-                    (uses CDP ``Page.navigate`` over the websocket of
-                    the focused tab). Same shape the original CLI
-                    ``hotkey ctrl+l + type`` flow produced.
+  new_tab=True   open in a fresh tab and focus it (``/json/new?<url>``).
+                 Default — doesn't disturb the agent's current tab.
+  new_tab=False  navigate the focused tab via CDP ``Page.navigate``.
 
-The generated VM-side script is self-contained — only depends on the
-stdlib (``urllib`` + ``websocket`` is NOT required for new_tab; we
-shell out to ``websocat`` only when present and fall back gracefully
-otherwise). On success the script prints a one-line status; the agent
-sees the navigation outcome on its next screenshot.
+The generated VM-side script is stdlib-only; ``websocat`` is used for
+focused-tab nav when present, with graceful fallback otherwise.
 """
 from __future__ import annotations
 

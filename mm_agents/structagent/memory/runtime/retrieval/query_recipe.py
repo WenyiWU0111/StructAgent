@@ -1,12 +1,8 @@
 """Query the recipe retrieval index with a task instruction.
 
-Loads the FAISS index built by build_recipe_index.py, embeds the input
-task text, finds top-K nearest anchors, aggregates by recipe (max-score
-per recipe), and returns ranked recipes.
-
-Public API:
-  query(task_text: str, top_k: int = 5) -> List[QueryHit]
-  print_hits(hits) — pretty-print to stdout
+Loads the FAISS index from build_recipe_index.py, embeds the task text, finds
+top-K nearest anchors, aggregates by recipe (max score per recipe), returns
+ranked recipes. API: query(task_text, top_k) -> List[QueryHit]; print_hits().
 
 CLI:
   python \\
@@ -26,7 +22,6 @@ import faiss
 from sentence_transformers import SentenceTransformer
 
 
-# REPO_ROOT imported from mm_agents.structagent._paths
 LEDGER_DIR = REPO_ROOT / "results/successful_ledgers"
 INDEX_DIR = LEDGER_DIR / "_retrieval"
 RECIPES_DIR = LEDGER_DIR / "_intent_recipes_v2"
@@ -61,10 +56,9 @@ def _lazy_load() -> None:
         _vector_map = json.loads((INDEX_DIR / "vector_map.json").read_text())
 
 
-# Layered thresholds — different recipe parts have different
-# risk profiles. Dimensions tell the LLM what to verify (risky if wrong);
-# pitfalls are cross-task wisdom (low risk even if recipe doesn't
-# exactly match — LLM can self-filter).
+# Layered thresholds by risk profile: dimensions tell the LLM what to verify
+# (risky if wrong); pitfalls are cross-task wisdom (low risk even on a loose
+# match — LLM can self-filter).
 STRONG_THRESHOLD = 0.7   # full recipe, ≥0.7 hits only
 MID_THRESHOLD    = 0.5   # full recipe, ≥0.5 hits only
 WEAK_THRESHOLD   = 0.35  # pitfalls only, no dimensions, top-1 hit
@@ -76,25 +70,18 @@ def query(task_text: str, top_k: int = 5, candidate_pool: int = 30,
           mid_threshold:    float = MID_THRESHOLD,
           weak_threshold:   float = WEAK_THRESHOLD,
           ) -> Tuple[List[QueryHit], str]:
-    """Embed task_text, get top anchors, aggregate by recipe, apply
-    layered threshold filter, return (hits, mode).
+    """Embed task_text, aggregate top anchors by recipe, apply the layered
+    threshold filter, return (hits, mode).
 
-    ``mode`` is one of:
-      - "STRONG"            — top score ≥ strong_threshold; hits ≥0.7
-                              returned with full recipe content for
-                              injection.
-      - "MID"               — top score in [mid, strong); hits ≥0.5
-                              returned with full content.
-      - "WEAK_PITFALLS_ONLY" — top score in [weak, mid); top-1 hit
-                              returned; CALLER should inject only the
-                              pitfalls field, NOT dimensions (recipe
-                              isn't a strong intent match but pitfalls
-                              are still useful cross-task wisdom).
-      - "OOD"               — top score < weak; empty hits; caller
-                              skips recipe injection entirely.
+    mode (caller honors it when injecting):
+      - "STRONG"             top ≥ strong; keep hits ≥0.7, full recipe
+      - "MID"                top in [mid, strong); keep hits ≥0.5, full recipe
+      - "WEAK_PITFALLS_ONLY" top in [weak, mid); top-1 only — inject pitfalls,
+                             NOT dimensions (weak intent match, but pitfalls
+                             are still useful cross-task wisdom)
+      - "OOD"                top < weak; empty hits, skip injection
 
-    Each QueryHit always carries the full recipe; the injection layer
-    is responsible for honoring ``mode`` and clipping content.
+    Each QueryHit always carries the full recipe; the injection layer clips it.
     """
     _lazy_load()
     q_vec = _model.encode(

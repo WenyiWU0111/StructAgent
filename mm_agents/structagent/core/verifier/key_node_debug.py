@@ -1,28 +1,13 @@
-"""Per-step KeyNode debug dumper.
+"""Per-step KeyNode debug dumper — writes the dispatcher's per-outcome
+reasoning to ``<results_dir>/keynode_debug/`` for offline inspection.
 
-Persists the KeyNode dispatcher's per-outcome reasoning to
-``<results_dir>/keynode_debug/`` for offline inspection. Files written
-per step:
+Files per step: ``_keynode_input.json`` (outcomes + verify specs, state
+cache, a11y stats), ``_keynode_verdicts.json`` (per-outcome dispatch
+path), and ``_keynode_llm_messages.json`` / ``_keynode_llm_raw.txt``
+(only when the LLM path fired; image_url payloads stripped to prefixes).
 
-  step_NNN_keynode_input.json     — required outcomes (with verify
-                                     spec), current state cache, a11y
-                                     length stats, action summary
-  step_NNN_keynode_verdicts.json  — per-outcome dispatch path:
-                                     {outcome_id, current_state,
-                                      verify_kind, deterministic_verdict,
-                                      trace, took_llm_path,
-                                      emitted_keynode}
-  step_NNN_keynode_llm_messages.json — only when an LLM call was made
-                                     (subset of outcomes were uncertain).
-                                     Image_url payloads stripped to
-                                     prefixes; text blocks kept full.
-  step_NNN_keynode_llm_raw.txt    — raw LLM response text (only when
-                                     LLM path was used).
-
-All functions are graceful-fail: if the dump fails for any reason
-(disk full, permission, etc.) they log a warning and return None
-without raising. Disabling the dumper is as simple as not setting
-``self._results_dir`` on the agent.
+All dumps fail gracefully (log + return None, never raise). Leave
+``self._results_dir`` unset to disable.
 """
 from __future__ import annotations
 
@@ -112,18 +97,11 @@ def dump_keynode_verdicts(
     step_idx: Optional[int],
     per_outcome: List[Dict[str, Any]],
 ) -> None:
-    """Save per-outcome dispatcher decision: which path, verdict, evidence.
+    """Save per-outcome dispatcher decision (path, verdict, evidence).
 
-    ``per_outcome`` is a list of dicts assembled by detect_key_nodes:
-        {
-          "outcome_id":            str,
-          "previous_state":        "pending"|"verified"|"reverted",
-          "verify_kind":           str | None,
-          "deterministic_verdict": True | False | None,
-          "deterministic_trace":   dict (from verify_with_trace),
-          "took_llm_path":         bool,
-          "emitted_keynode":       dict | None,   # the KeyNode this turn (or None)
-        }
+    ``per_outcome`` is the list of dicts assembled by detect_key_nodes:
+    {outcome_id, previous_state, verify_kind, deterministic_verdict,
+    deterministic_trace, took_llm_path, emitted_keynode}.
     """
     d = _ensure_dir(results_dir)
     if d is None:
@@ -145,8 +123,8 @@ def dump_keynode_llm(
     messages: Optional[Sequence[Dict[str, Any]]],
     raw_response: Optional[str],
 ) -> None:
-    """Save LLM messages + raw response when the dispatcher fell back to
-    the LLM path. No-op when no LLM call was made (messages is None)."""
+    """Save LLM messages + raw response from the LLM dispatch path.
+    No-op when no LLM call was made (messages is None)."""
     d = _ensure_dir(results_dir)
     if d is None:
         return

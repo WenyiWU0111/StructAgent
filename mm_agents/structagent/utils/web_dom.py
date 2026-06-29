@@ -1,18 +1,16 @@
 """Dump checker-source web DOM (CSS class + ARIA state) via CDP.
 
-The OSWorld chrome checker reads the page's web DOM over CDP (``connect_over_cdp``
--> ``page.content()``) and parses BY CSS CLASS — e.g. an active filter chip is the
-presence of class ``fT28tf`` / ``filter-selector-link``, an active tab is
-``...tab--active``. AT-SPI a11y (the ``accessibility_tree`` we already feed the
-perceiver / done-auditor) carries role + name + state but **no CSS class**, so it
-cannot tell an active chip from a plain link. This module dumps exactly that
-missing layer: every interactive/stateful element's ``class`` + ``aria-*`` state.
+The OSWorld chrome checker reads the page DOM over CDP and parses BY CSS CLASS
+(e.g. an active filter chip = class ``fT28tf`` / ``filter-selector-link``, an
+active tab = ``...tab--active``). AT-SPI a11y carries role/name/state but no CSS
+class, so it can't tell an active chip from a plain link. This module dumps that
+missing layer: each interactive/stateful element's ``class`` + ``aria-*`` state.
 
 Design rules:
-  • DOMAIN-AGNOSTIC — never read a task's evaluator config; that would leak the
-    answer. We surface raw stateful DOM and let the judge reason itself.
-  • COMPLEMENT, don't duplicate — text already lives in a11y; we keep it short and
-    lead with the class/aria-state that a11y lacks.
+  • Domain-agnostic — never read the task's evaluator config (would leak the
+    answer); surface raw stateful DOM and let the judge reason.
+  • Complement, don't duplicate a11y text — keep it short and lead with the
+    class/aria-state a11y lacks.
 """
 from typing import Any, Callable, Dict, List, Optional
 
@@ -70,10 +68,10 @@ def _collect_from_page(page, max_elems: int) -> Dict[str, Any]:
 def dump_tab_doms(host: str, chromium_port: int, *, max_elems: int = 150,
                   all_tabs: bool = False) -> List[Dict[str, Any]]:
     """Connect over CDP (same entry the checker uses) and return per-tab
-    stateful-DOM. Each entry: {url, elements: [{role, text, cls, aria}]}.
+    stateful-DOM: {url, elements: [{role, text, cls, aria}]}.
 
-    all_tabs=False -> just the front/last page (active-tab heuristic);
-    True -> every open page (use when unsure which tab is active)."""
+    all_tabs=False -> front/last page only (active-tab heuristic);
+    True -> every open page (when unsure which tab is active)."""
     from playwright.sync_api import sync_playwright
     url = f"http://{host}:{chromium_port}"
     out: List[Dict[str, Any]] = []
@@ -95,8 +93,8 @@ def dump_tab_doms(host: str, chromium_port: int, *, max_elems: int = 150,
 
 import re
 
-# Tailwind / utility class noise to strip — keeps only semantic / state-bearing
-# / obfuscated class tokens (e.g. tab-active, filter-selector-link, fT28tf).
+# Strip Tailwind/utility-class noise; keep only semantic / state-bearing /
+# obfuscated tokens (e.g. tab-active, filter-selector-link, fT28tf).
 _UTIL = re.compile(
     r'[:\[\]!()/]'                       # tailwind variants / arbitrary values
     r'|^(?:text|bg|w|h|min|max|p[xytrbl]?|m[xytrbl]?|flex|grid|gap|space|'
@@ -133,9 +131,9 @@ def _states(e: Dict[str, Any]) -> List[str]:
 
 
 def render_web_dom(doms: List[Dict[str, Any]], *, max_chars: int = 2200) -> str:
-    """Compact, LLM-friendly view of the page's checker-relevant state — the
-    class + ARIA-state layer AT-SPI a11y lacks. Drops CSS utility noise, dedups,
-    and LEADS with what is currently active/selected (the decisive signal)."""
+    """Compact LLM-friendly view of the page's checker-relevant state (the
+    class + ARIA-state layer a11y lacks). Drops utility noise, dedups, and leads
+    with what's active/selected (the decisive signal)."""
     blocks: List[str] = []
     for tab in doms:
         els = tab.get("elements") or []

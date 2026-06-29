@@ -1,7 +1,7 @@
 """TrajectoryHandle + iterators over internal trajectories.
 
-Used by all Day 2 miners and Day 3+ rollout miners
-to walk trajectory directories with consistent file-loading semantics.
+Walks trajectory directories with consistent file-loading semantics
+(used by the miners).
 
 Internal trajectory layout (per task):
     results/pyautogui/screenshot/<run_tag>/<domain>/<task_id>/
@@ -41,7 +41,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Optional
 
-# REPO_ROOT imported from mm_agents.structagent._paths
 SUCCESSFUL_LEDGERS_DIR = REPO_ROOT / "results/successful_ledgers"
 SUCCESSFUL_INDEX = SUCCESSFUL_LEDGERS_DIR / "_index.jsonl"
 PYAUTOGUI_ROOT = REPO_ROOT / "results/pyautogui/screenshot"
@@ -55,10 +54,10 @@ class TrajectoryHandle:
 
     task_id: str
     domain: str
-    source_run: Path            # results/pyautogui/screenshot/<run_tag>/<domain>/<task_id>/
+    source_run: Path            # screenshot/<run_tag>/<domain>/<task_id>/
     source_model_version: str   # e.g. "vllm_claude-opus_planner_..._v0"
-    ledger_path: Optional[Path] = None   # successful_ledgers/<domain>/<task_id>.json, only for success
-    score: Optional[float] = None        # 1.0 for success, 0.0 for failed
+    ledger_path: Optional[Path] = None   # set only on success
+    score: Optional[float] = None        # 1.0 success, 0.0 fail
 
     # ---------- existence checks ----------
 
@@ -160,10 +159,8 @@ class TrajectoryHandle:
     # ---------- HTML screenshot extraction + alignment ----------
 
     def html_screenshots_b64(self) -> List[str]:
-        """Parse trajectory.html → list of base64 PNG strings, one per HTML <h3>Step N</h3> block.
-        Index 0 = "Step 1" screenshot, index 1 = "Step 2" screenshot, etc.
-        Returns [] if trajectory.html missing.
-        """
+        """trajectory.html → list of base64 PNGs, one per <h3>Step N</h3>
+        block (index 0 = Step 1). [] if the file is missing."""
         if hasattr(self, "_html_screenshots_cache"):
             return self._html_screenshots_cache
         p = self.source_run / "trajectory.html"
@@ -171,26 +168,22 @@ class TrajectoryHandle:
             self._html_screenshots_cache = []
             return self._html_screenshots_cache
         html = p.read_text(encoding="utf-8", errors="replace")
-        # Each <h3>Step N</h3> immediately followed by an <img class='screenshot' src='data:image/png;base64,...'>
+        # <h3>Step N</h3> immediately followed by <img class='screenshot' ...>
         matches = re.findall(
             r"<h3>Step (\d+)</h3>\s*<img class='screenshot' src='data:image/png;base64,([A-Za-z0-9+/=]+)'",
             html,
         )
-        # Sort by step number (numerical), pull base64
         matches_int = sorted(((int(n), b64) for n, b64 in matches), key=lambda x: x[0])
         self._html_screenshots_cache = [b64 for _, b64 in matches_int]
         return self._html_screenshots_cache
 
     def keynode_step_to_html_idx(self, keynode_step_num: int) -> Optional[int]:
-        """Map keynode_debug step_NNN (1-indexed filename) to a 0-indexed HTML
-        screenshot list index showing the state KeyNode observed.
+        """keynode step_NNN (1-indexed filename) → 0-indexed screenshot list
+        index for the state KeyNode observed.
 
-        Rule: state KeyNode observed at step_num=NNN = screenshot at the FIRST
-        traj row with step_num > NNN. That row's HTML position (1-indexed) is
-        (row_idx + 1), so the list index is row_idx.
-
-        Returns None if there's no later row (i.e., last step), in which case
-        the caller can fall back to the very last screenshot.
+        Rule: the state at step_num=NNN is the screenshot at the FIRST traj row
+        with step_num > NNN; that row's list index is row_idx. None if no later
+        row exists (last step) — caller falls back to the last screenshot.
         """
         traj = self.load_traj_jsonl()
         for i, row in enumerate(traj):
@@ -198,13 +191,12 @@ class TrajectoryHandle:
             if sn is None:
                 continue
             if sn > keynode_step_num:
-                return i  # 0-indexed
+                return i
         return None
 
     def get_keynode_observation_screenshot(self, keynode_step_num: int) -> Optional[str]:
-        """Return base64 PNG of the screenshot KeyNode actually observed for
-        step_num=NNN. Falls back to the last screenshot for the final step.
-        Returns None if no screenshots available at all.
+        """Base64 PNG of the screenshot KeyNode observed for step_num=NNN.
+        Falls back to the last screenshot for the final step; None if none.
         """
         screenshots = self.html_screenshots_b64()
         if not screenshots:
@@ -218,7 +210,7 @@ class TrajectoryHandle:
 # ---------- iterators ----------
 
 def iter_successful_trajectories() -> Iterator[TrajectoryHandle]:
-    """Walk results/successful_ledgers/_index.jsonl → yield handles for the 262 successes."""
+    """Yield a handle per row in successful_ledgers/_index.jsonl."""
     if not SUCCESSFUL_INDEX.is_file():
         return
     with SUCCESSFUL_INDEX.open() as f:
@@ -251,11 +243,8 @@ def iter_pyautogui_runs() -> Iterator[Path]:
 
 
 def iter_all_pyautogui_tasks() -> Iterator[TrajectoryHandle]:
-    """Walk every <run_tag>/<domain>/<task_id>/ — yields BOTH success and failure.
-
-    No filtering on score; caller decides. Used by scan_internal_failures and
-    by L_v3 false_done mining.
-    """
+    """Every <run_tag>/<domain>/<task_id>/ — success AND failure, no score
+    filtering (caller decides)."""
     for run_dir in iter_pyautogui_runs():
         run_tag = run_dir.name
         for domain_dir in run_dir.iterdir():
@@ -283,13 +272,9 @@ def _is_uuid_like(s: str) -> bool:
 
 
 def iter_internal_false_done_trajectories() -> Iterator[TrajectoryHandle]:
-    """Walk the 269 internal fail-with-DONE trajectories (from
-    scan_internal_failures.py output).
-
-    Each handle has score=0.0; ledger_path is None (failures aren't in
-    _index.jsonl). Use load_keynode_input(step_idx) to read outcomes
-    instead of load_ledger().
-    """
+    """Internal fail-with-DONE trajectories (from scan_internal_failures.py).
+    Handles have score=0.0 and ledger_path=None (failures aren't in
+    _index.jsonl) — use load_keynode_input, not load_ledger."""
     audit_path = REPO_ROOT / "results/verifier_memory/_audit/internal_failures_audit.json"
     if not audit_path.is_file():
         return
@@ -306,16 +291,14 @@ def iter_internal_false_done_trajectories() -> Iterator[TrajectoryHandle]:
 
 
 def terminal_screenshot_b64(handle: TrajectoryHandle) -> Optional[str]:
-    """Last HTML screenshot — the terminal state the agent ended in.
-    Used by L_v3 done-gate mining where 'observation when DoneAuditor decides'
-    is the final visible state."""
+    """Last HTML screenshot — the terminal state the agent ended in."""
     screenshots = handle.html_screenshots_b64()
     return screenshots[-1] if screenshots else None
 
 
 def latest_outcomes_status(handle: TrajectoryHandle) -> List[dict]:
-    """Pull outcomes status from the LAST keynode_verdict file.
-    Returns list of {outcome_id, state, verify_kind, evidence}."""
+    """Outcomes status from the last keynode_verdict file:
+    list of {outcome_id, verify_kind, evidence, ...}."""
     vps = handle.list_keynode_verdict_paths()
     if not vps:
         return []
@@ -330,7 +313,7 @@ def latest_outcomes_status(handle: TrajectoryHandle) -> List[dict]:
             "outcome_id": po.get("outcome_id"),
             "verify_kind": po.get("verify_kind"),
             "previous_state": po.get("previous_state"),
-            "emitted_kind": emitted.get("kind"),  # outcome_satisfied / outcome_blocked / null
+            "emitted_kind": emitted.get("kind"),  # outcome_satisfied / outcome_blocked / None
             "evidence": emitted.get("evidence"),
             "confidence": emitted.get("confidence"),
         })

@@ -1,12 +1,9 @@
 """Actor decomposer system prompt (the A2 template).
 
-Moved here (2026-06-16) from the legacy ``prompts/v0_human/`` set, which
-held one live template (this one) plus an abandoned prompt-evolution
-scaffold. Filled via ``str.replace`` (NOT ``.format``) because it embeds
-literal JSON examples; ``{subgoal}`` / ``{completed_subgoals}`` /
-``{remaining_subgoals}`` placeholders and the ``{{# FROZEN #}}`` /
-``{{# CODING_ROUTE #}}`` markers are handled by the actor at load/use.
-Raw string: the template contains regex backslashes that must survive verbatim.
+Filled via ``str.replace`` (NOT ``.format``) because it embeds literal JSON
+braces; the ``{subgoal}`` / ``{completed_subgoals}`` / ``{remaining_subgoals}``
+placeholders and the ``{{# FROZEN #}}`` / ``{{# CODING_ROUTE #}}`` markers are
+resolved by the actor at load/use. Raw string so the regex backslashes survive.
 """
 
 DECOMPOSER_SYSTEM_TEMPLATE = r"""You are a UI action decomposer. Given the current screenshot and a subgoal, emit a JSON array of low-level actions to execute in order. You output the on-screen pixel location of each element YOURSELF (see the INLINE GROUNDING MODE section appended below) — the quality of both your "target" descriptions and your coordinates drives click accuracy directly.

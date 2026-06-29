@@ -1,12 +1,10 @@
-"""Recovery: planner mode decision, FailedPath curator, strategy tracking.
+"""Recovery: planner-mode decision, FailedPath curator, strategy tracking.
 
-The cluster of methods that watch for stuck-signals (no progress, DONE
-rejection, action repetition, REPLAN cadence) and decide what to do —
-either pop the next subgoal, force a planner replan with a typed
-stuck_reason, or run the LLM curator that re-derives ``ledger.failed_paths``
-from the strategy + action stuck history.
-
-Folded into ``StructAgent`` via inheritance.
+Watches stuck signals (no progress, DONE rejection, action repetition,
+REPLAN cadence) and decides what to do: pop the next subgoal, force a
+planner replan with a typed stuck_reason, or run the LLM curator that
+re-derives ``ledger.failed_paths`` from strategy + action stuck history.
+Mixed into ``StructAgent`` via inheritance.
 """
 
 import logging
@@ -24,39 +22,34 @@ class Recovery:
     def _decide_planner_mode_and_reason(
         self, env, obs: dict, step_idx: int,
     ) -> Tuple[str, Optional[str]]:
-        """Return ``(mode, reason)`` for THIS turn's planner call.
+        """Return ``(mode, reason)`` for this turn's planner call.
 
         Called once at the top of ``_pa_predict`` after ``_pre_planner``.
-        Reads (and consumes) ``self._pending_actor_failure_reason``,
-        ``self._force_replan_reason``, the REPLAN-cadence counters, and
-        the current subgoal-step budget; performs the rule-#4/#5/#6 side
-        effects inline so the caller doesn't need to re-derive them."""
+        Consumes the pending-failure / staged-reason fields and the
+        cadence counters, and runs the rule-#4/#5/#6 side effects inline.
+        """
         # Rule #1: first turn — no prior state to react to.
         if step_idx == 0:
             return "initial", None
 
-        # Rule #2: actor reported failure on the previous turn
-        # (IMPOSSIBLE / FAIL / no-bash-body). Has highest priority among
-        # the next-turn signals because the actor's own dead-end is the
-        # most concrete "this plan is stuck" evidence we have.
+        # Rule #2: actor reported failure last turn (IMPOSSIBLE / FAIL /
+        # no-bash-body). Highest priority — the actor's own dead-end is
+        # the most concrete "plan is stuck" evidence we have.
         pending = getattr(self, "_pending_actor_failure_reason", None)
         if pending:
             self._pending_actor_failure_reason = None  # consume
             self._force_replan_category = "actor_failure"
             return "force_replan", pending
 
-        # Rule #3: a force_replan reason is pre-staged on
-        # ``self._force_replan_reason``. Source: the DONE-acceptance gate
-        # rejected DONE last turn but the in-turn force_replan retry
-        # returned no <plan>, so the reason was re-staged for the next
-        # turn (the "defer" path).
+        # Rule #3: a force_replan reason was pre-staged on
+        # ``_force_replan_reason`` — the "defer" path, when DONE was
+        # rejected last turn but the in-turn force_replan retry returned
+        # no <plan>.
         #
-        # T3 done-auditor (plan Part I.2) reuses the same staging
-        # channel but writes ``_force_replan_category_pending`` to flip
-        # the category from "done_rejected" to "done_audit_failed" — so
-        # the planner's force_replan prompt knows the rejection came
-        # from the adversarial auditor (different remediation hint)
-        # not from the structured ledger gate.
+        # The T3 done-auditor reuses this channel but sets
+        # ``_force_replan_category_pending`` to flip the category to
+        # "done_audit_failed", so the prompt knows the rejection came
+        # from the adversarial auditor (different hint) not the ledger gate.
         staged_reason = getattr(self, "_force_replan_reason", None)
         if staged_reason:
             self._force_replan_reason = None  # consume
@@ -69,10 +62,9 @@ class Recovery:
                 self._force_replan_category = "done_rejected"
             return "force_replan", staged_reason
 
-        # Rule #4: subgoal step budget exhausted without the planner ever
-        # judging done=YES. Burns through 5 actor attempts on the same
-        # subgoal — the strategy is wrong, not the execution. Abandon
-        # the subgoal so the force_replan prompt sees it in
+        # Rule #4: subgoal step budget burned without the planner ever
+        # judging done=YES — strategy is wrong, not execution. Abandon
+        # the subgoal so the force_replan prompt sees it under
         # <abandoned_subgoals>.
         last_subgoal_done = (self.planner_parsed or {}).get("last_subgoal_done") \
             if hasattr(self, "planner_parsed") else None
@@ -88,10 +80,9 @@ class Recovery:
                 f"subgoal produced no verified progress"
             )
 
-        # Rule #5: subgoal queue is empty BUT the task end-state has not
-        # been verified DONE. Last turn's CONTINUE drained the queue;
-        # this turn the planner needs to either emit DONE (which the
-        # cache gate then validates) or REPLAN with a closing step.
+        # Rule #5: queue drained (last turn's CONTINUE emptied it) but
+        # task end-state not yet verified DONE. Planner must now emit DONE
+        # (cache gate validates) or REPLAN with a closing step.
         if (not self.subgoal_queue
                 and self.current_subgoal
                 and "All planned subgoals completed" in (self.current_subgoal or "")):
@@ -102,24 +93,19 @@ class Recovery:
                 "been verified"
             )
 
-        # Rule #6: ACTION-level cadence trigger — planner has been
-        # REPLAN-ing within the SAME strategy for too long without
-        # progress. The strategy itself is presumed sound (otherwise
-        # the planner would have switched <strategy>, which is already
-        # captured by the strategy-LEVEL FailedPath emitted by
-        # ``_commit_strategy_change`` at REPLAN commit time). This
-        # trigger records the stuck SUBGOAL text as an action-level
-        # dead-end so the planner explores alternative TACTICS within
-        # the same strategy (different element, keyboard shortcut,
-        # alternate coords).
+        # Rule #6: action-level cadence trigger — too many REPLANs within
+        # the SAME strategy without progress. The strategy is presumed
+        # sound (a switch would already show up as a strategy-level
+        # FailedPath from ``_commit_strategy_change``), so this records
+        # the stuck subgoal as an action-level dead-end to push the
+        # planner toward alternative tactics (different element, shortcut,
+        # alt coords).
         #
-        # The two gates that must both fire:
-        #   - replans_within_current_strategy >= threshold
-        #     (planner persisted on the SAME strategy across the stuck
-        #     replans — without this, strategy-switches that happen to
-        #     coincide with no-progress would falsely fire action-level)
-        #   - gap_since_last_fire >= threshold
-        #     (don't re-fire on consecutive turns; need fresh evidence)
+        # Both gates must fire:
+        #   - replans_within_current_strategy >= threshold (planner stayed
+        #     on the SAME strategy; else a coincident switch fires falsely)
+        #   - gap_since_last_fire >= threshold (don't re-fire consecutively;
+        #     need fresh evidence)
         from mm_agents.structagent.ledger.core.ledger import abstract_actor_response
         from mm_agents.structagent.ledger.core.exploration import ActionStuckEvent
         gap_since_last_fire = (self._total_replan_count
@@ -133,11 +119,9 @@ class Recovery:
                 if (not self.abandoned_subgoals
                         or self.abandoned_subgoals[-1] != stuck_subgoal):
                     self.abandoned_subgoals.append(stuck_subgoal)
-                # Append an ActionStuckEvent — the LLM curator decides
-                # whether this becomes an action-level FailedPath
-                # (after seeing it alongside the strategy history +
-                # currently-recorded entries). DO NOT write
-                # ledger.add_failed_path directly anymore.
+                # Append an ActionStuckEvent; the LLM curator later
+                # decides whether it becomes an action-level FailedPath.
+                # Don't write ledger.add_failed_path directly anymore.
                 span_actions = list(
                     self.actions[self.current_strategy_started_at_step:]
                 )
@@ -169,36 +153,31 @@ class Recovery:
                 f"new <plan>) — try a direct URL, top-level menu, etc."
             )
 
-        # Default: normal turn — let the planner do its CONTINUE / REPLAN
-        # / DONE dispatch on the prior subgoal's outcome.
+        # Default: normal turn — planner does CONTINUE / REPLAN / DONE
+        # off the prior subgoal's outcome.
         return "progress_check", None
 
     def _finalize_recovery_state(self, mode: str, step_idx: int) -> None:
-        """Refresh ``self._recovery_state`` to reflect the transition
-        the dispatcher just decided + current counter snapshot.
+        """Snapshot the just-decided transition + counters onto
+        ``self._recovery_state``.
 
-        Called once per turn, immediately after
-        ``_decide_planner_mode_and_reason`` returns. ``mode`` is the
-        mode string the dispatcher returned ("initial" /
-        "force_replan" / "progress_check"); when it's "force_replan"
-        the concrete stuck category was stored on
-        ``self._force_replan_category`` by the matching rule.
+        Called once per turn right after
+        ``_decide_planner_mode_and_reason``. For "force_replan" the
+        concrete category sits on ``self._force_replan_category``.
 
-        T1 scope: read-only mirror. ``self._*`` counters remain source
-        of truth; this method snapshots them onto ``self._recovery_state``
-        so tests and T3 escalation reads can use a single field.
-        See plan file Part I.1.
+        Read-only mirror: the ``self._*`` counters stay source of truth;
+        this just gives tests and T3 escalation reads one field to read.
         """
         if mode == "force_replan":
             category = getattr(self, "_force_replan_category", None)
             if category is None:
-                # Shouldn't happen — the dispatcher always sets the
-                # category before returning "force_replan". Fall back
-                # to keeping the prior receipt rather than crashing.
+                # Shouldn't happen — dispatcher always sets the category
+                # before returning "force_replan". Keep the prior receipt
+                # rather than crash.
                 return
             transition: Transition = category  # type: ignore[assignment]
         else:
-            # "initial" / "progress_check" — both are valid Transition values.
+            # "initial" / "progress_check" are both valid Transition values.
             transition = mode  # type: ignore[assignment]
 
         self._recovery_state = self._recovery_state.with_transition(
@@ -217,19 +196,14 @@ class Recovery:
         )
 
     def _pop_next_subgoal(self, *, step_idx: int) -> Tuple[bool, int]:
-        """Pop the next subgoal from the queue and install it as current.
+        """Pop the next subgoal and install it as current (in place).
 
-        Subgoal advancement is driven SOLELY by the planner's
-        ``<done>YES</done>`` output: the runtime never inspects ledger
-        outcome state to second-guess that decision. The planner sees
-        ledger state in its own prompt and decides accordingly.
+        Advancement is driven SOLELY by the planner's
+        ``<done>YES</done>``; the runtime never second-guesses it from
+        ledger state.
 
-        Returns ``(popped, skipped)`` — ``skipped`` is kept in the
-        signature for caller-API compatibility but is always 0 now
-        (no chain-skip path).
-
-        Updates ``current_subgoal`` / ``current_subgoal_expected_post_state``
-        / ``current_subgoal_app`` / ``current_subgoal_targets`` in place.
+        Returns ``(popped, skipped)``. ``skipped`` is always 0 now (no
+        chain-skip path), kept only for caller-API compatibility.
         """
         if not self.subgoal_queue:
             self.current_subgoal = None
@@ -256,9 +230,9 @@ class Recovery:
         self, prior: str, new: str,
         actions_under_prior: List[str], progress_signal: str,
     ) -> bool:
-        """Thin wrapper: pack an LLM-call lambda + the per-task cache,
-        delegate to ledger module's ``judge_strategy_change`` (which
-        owns the prompt + the SAME/DIFFERENT contract)."""
+        """Wrap the LLM-call lambda + per-task cache and delegate to
+        ledger's ``judge_strategy_change`` (owns the prompt + the
+        SAME/DIFFERENT contract)."""
         from mm_agents.structagent.ledger.core.ledger import judge_strategy_change
 
         def _llm_call(prompt: str) -> str:
@@ -284,10 +258,9 @@ class Recovery:
         )
 
     def _commit_strategy_change(self, step_idx: int) -> None:
-        """Thin wrapper: pack agent state, delegate to ledger module's
-        ``commit_strategy_change`` (with the LLM judge), assign result
-        back. Called from each plan-commit site (step==0 install +
-        REPLAN swap)."""
+        """Delegate to ledger's ``commit_strategy_change`` (with the LLM
+        judge) and assign the result back. Called from each plan-commit
+        site (step==0 install + REPLAN swap)."""
         from mm_agents.structagent.ledger.core.ledger import (
             StrategyState, commit_strategy_change,
         )
@@ -307,8 +280,8 @@ class Recovery:
             judge=self._judge_strategy_similar,
             strategy_history=self._strategy_history,
         )
-        # If commit appended a new event, attach perceiver/screenshot
-        # evidence so the curator can later judge tactical-vs-strategic.
+        # New event appended? Attach perceiver/screenshot evidence for
+        # the curator's later tactical-vs-strategic judgment.
         if len(self._strategy_history) > prior_len:
             self._attach_curator_evidence(self._strategy_history[-1])
         self.current_plan_strategy = result.current_strategy
@@ -316,13 +289,12 @@ class Recovery:
         self.replans_within_current_strategy = result.replans_within_strategy
 
     def _attach_curator_evidence(self, evt) -> None:
-        """Populate the ``_EvidenceFields`` on a freshly-created
-        StrategyEvent / ActionStuckEvent from the agent's current
-        perceiver + screenshot state. Curator uses these to decide
-        whether a failed strategy span was tactical (target was on
-        screen, click missed) or strategic (target never appeared).
+        """Fill the ``_EvidenceFields`` on a fresh StrategyEvent /
+        ActionStuckEvent from current perceiver + screenshot state. The
+        curator uses these to call a failed span tactical (target on
+        screen, click missed) vs strategic (target never appeared).
 
-        Safe no-op when perceiver / candidate step are unavailable.
+        No-op when perceiver / candidate step are unavailable.
         """
         cand = getattr(self, "_candidate_step", None)
         if cand is not None and getattr(cand, "screenshot_b64", None):
@@ -338,10 +310,9 @@ class Recovery:
             blockers = list(getattr(snap, "unexpected_blockers", []) or [])
             evt.last_perceiver_controls_count = len(rc)
             evt.last_perceiver_blockers = len(blockers)
-            # Top-10 relevant controls (perceiver already pre-filtered
-            # to ≤ 8 in normal mode; cap at 10 for safety) — text-form
-            # so curator can grep for the target subgoal element name
-            # without needing the screenshot.
+            # Top-10 relevant controls (perceiver pre-filters to ≤8 in
+            # normal mode; cap 10 for safety) as text, so the curator can
+            # grep for the target element name without the screenshot.
             lines = []
             for c in rc[:10]:
                 role = getattr(c, "role", "?") or "?"
@@ -355,21 +326,18 @@ class Recovery:
             if lines:
                 evt.last_a11y_top_k = "\n".join(lines)
         except Exception:
-            # Non-fatal — curator will fall back to text-only judgment
+            # Non-fatal — curator falls back to text-only judgment.
             pass
 
     def _curate_failed_paths(self, step_idx: int) -> None:
         """Run the LLM dead-end curator and replace
-        ``ledger.failed_paths`` with the curated list.
+        ``ledger.failed_paths`` with its re-derived list.
 
-        Called after every REPLAN commit (and after a rule-#6 cadence
-        fire). The curator sees the FULL strategy + action-stuck
-        history + current outcome state + currently-recorded
-        ``failed_paths``, and re-derives the authoritative list — it
-        can add, drop, merge, or revise entries.
-
-        On any failure (LLM error, JSON parse fail) the existing
-        ``failed_paths`` are preserved unchanged.
+        Called after every REPLAN commit (and rule-#6 cadence fire). The
+        curator sees the full strategy + action-stuck history + outcome
+        state + current failed_paths, and may add/drop/merge/revise
+        entries. On any failure (LLM error, JSON parse) the existing
+        list is preserved.
         """
         if self.ledger is None or not self.ledger.required_outcomes:
             return
@@ -378,10 +346,9 @@ class Recovery:
         )
 
         def _llm_call(arg) -> str:
-            """Accept either a prompt string (legacy) or a list of
-            messages (multimodal). ``curate_failed_paths`` now
-            prefers the messages form so it can attach screenshots
-            as image_url parts for tactical-vs-strategic judgment."""
+            """Accept a prompt string (legacy) or a messages list
+            (multimodal). curate_failed_paths prefers messages so it can
+            attach screenshots for tactical-vs-strategic judgment."""
             if isinstance(arg, list):
                 messages = arg
             else:
@@ -419,18 +386,16 @@ class Recovery:
                     "failed_paths (%d entries)",
                     len(self.ledger.failed_paths))
             return
-        # Cache per-strategy notes for the timeline render. Each entry
-        # is "<verdict> — <rationale>" keyed by strategy_text. Replaces
-        # any prior cache (curator runs after every REPLAN, so stale
-        # notes are simply overwritten with the freshest verdict).
+        # Cache per-strategy notes ("<verdict> — <rationale>" keyed by
+        # strategy_text) for the timeline render. Replaces the prior
+        # cache each REPLAN, so stale notes are just overwritten.
         new_notes: Dict[str, str] = {}
-        # Collect ``strategy_outcome_satisfied`` strategies — the curator
-        # marks these when a strategy's primary outcomes are now [verified]
-        # so the planner doesn't re-propose them on REPLAN. Cross-check
-        # that each claimed satisfied_outcome is actually [verified] in
-        # ``outcome_cache`` before persisting; the LLM curator can
-        # mis-classify, and we don't want a stale "completed" tag to
-        # mask a real pending outcome from the planner.
+        # Collect ``strategy_outcome_satisfied`` strategies (curator marks
+        # these when a strategy's primary outcomes are now [verified], so
+        # the planner won't re-propose them). Cross-check each claimed
+        # outcome is actually [verified] before persisting — the curator
+        # can mis-classify, and a stale "completed" tag would mask a real
+        # pending outcome from the planner.
         new_completed_strategies: List[Dict[str, Any]] = []
         for a in analysis_sink:
             if a.get("kind") == "strategy":
@@ -455,8 +420,8 @@ class Recovery:
                             })
         if new_notes:
             self._last_curator_strategy_notes = new_notes
-        # Replace (not merge): the curator re-derives the authoritative
-        # list every pass, just like failed_paths.
+        # Replace, not merge — curator re-derives the full list each pass,
+        # like failed_paths.
         self.ledger.completed_strategies = new_completed_strategies
 
         if logger:

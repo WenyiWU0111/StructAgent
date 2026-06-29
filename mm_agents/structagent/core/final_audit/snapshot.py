@@ -1,21 +1,15 @@
-"""DoneAuditSnapshot + builders for both offline replay and live agent.
+"""DoneAuditSnapshot + builders for offline replay and live agent.
 
-The snapshot is the **fresh-context input** to the Done-Auditor LLM. It
-contains the task instruction, screenshots, a11y dump, outcome proofs,
-and perceiver focus at the DONE moment — but NEVER the planner's chain
-of thought, message history, current subgoal text, or strategy notes
-(adversarial-purity invariant from plan file Part I.2).
+The snapshot is the fresh-context input to the Done-Auditor LLM: task,
+screenshots, a11y, outcome proofs, and perceiver focus at the DONE moment —
+but NEVER the planner's CoT / messages / subgoal text / strategy
+(adversarial-purity invariant, plan Part I.2).
 
-Two builders:
-
-  - ``build_snapshot_from_run_dir(run_dir)`` — offline replay path. Reads
-    finished trajectory artifacts. Used by ``tests/replay_done_audit.py``
-    for Phase-A validation.
-
-  - ``build_snapshot_from_live_state(agent)`` — runtime path. Pulls from
-    the agent's in-memory state at the moment ``_pa_predict`` is about
-    to accept a DONE. Used by ``done_auditor.audit_done`` from
-    ``agent.py``.
+Builders:
+  - ``build_snapshot_from_run_dir`` — offline replay from finished trajectory
+    artifacts (``tests/replay_done_audit.py``, Phase-A validation).
+  - ``build_snapshot_from_live_state`` — runtime, from agent in-memory state
+    when ``_pa_predict`` is about to accept DONE (via ``done_auditor.audit_done``).
 """
 from __future__ import annotations
 
@@ -33,8 +27,8 @@ from typing import Any, Dict, List, Optional, Tuple
 class DoneAuditSnapshot:
     """What the auditor LLM sees. NO planner CoT / messages / strategy.
 
-    Same shape whether built from offline run-dir or live agent state.
-    The auditor cannot tell the difference — and that's the point.
+    Identical shape from offline run-dir or live state — the auditor can't
+    tell which, by design.
     """
 
     task_instruction: str                       # raw user task text
@@ -50,10 +44,9 @@ class DoneAuditSnapshot:
 
 @dataclass
 class SnapshotSourceMeta:
-    """Diagnostic — where each field came from + sizes. Useful for the
-    offline replay path (lets the validation report explain
-    reconstruction feasibility per run). For live-state builds, only
-    ``label`` / ``task_id`` may be set; the rest is offline-only."""
+    """Diagnostic — field provenance + sizes, mainly for offline replay
+    reports. Live-state builds set only ``label`` / ``task_id``; the rest is
+    offline-only."""
 
     task_id: str = ""
     run_dir: str = ""
@@ -267,9 +260,8 @@ def build_snapshot_from_run_dir(
 ) -> Tuple[Optional[DoneAuditSnapshot], SnapshotSourceMeta]:
     """Reconstruct a snapshot from a finished OSWorld run directory.
 
-    Returns ``(snapshot, meta)``. ``snapshot`` is None when the run
-    never said DONE (label='didnt-DONE') — caller should SKIP these.
-    ``meta`` is always populated.
+    Returns ``(snapshot, meta)``. snapshot is None when the run never said DONE
+    (label='didnt-DONE') — caller should skip those. meta is always populated.
     """
     run_path = Path(run_dir)
     done_step = _read_done_step(run_path)
@@ -326,12 +318,11 @@ def build_snapshot_from_run_dir(
 
 
 def _project_outcome_proofs_from_ledger(ledger: Any) -> List[Dict[str, Any]]:
-    """Render one line per VERIFIED-or-REVERTED outcome from
+    """One proof per VERIFIED-or-REVERTED outcome from
     ``ledger.required_outcomes[*].last_verifier_trace``.
 
-    Outcomes that never reached a verified or reverted state are
-    omitted — the auditor can spot coverage gaps by diffing against
-    ``verifier_specs`` (which lists ALL required outcomes).
+    Pending outcomes are omitted — the auditor spots coverage gaps by diffing
+    against ``verifier_specs`` (which lists ALL required outcomes).
     """
     if ledger is None:
         return []
@@ -412,8 +403,7 @@ def _project_verifier_specs_from_ledger(ledger: Any) -> List[Dict[str, Any]]:
 
 def _project_initial_context_from_ledger(ledger: Any) -> Dict[str, Any]:
     """Pull ``open_tabs / active_url / active_app / window_title`` from
-    ``ledger.initial_context``. Defensive against dict-vs-dataclass shape.
-    """
+    ``ledger.initial_context`` (handles dict or dataclass)."""
     if ledger is None:
         return {}
     ic = getattr(ledger, "initial_context", None)
@@ -426,8 +416,7 @@ def _project_initial_context_from_ledger(ledger: Any) -> Dict[str, Any]:
 
 
 def _project_perceiver_focus_from_agent(agent: Any) -> Dict[str, Any]:
-    """Best-effort dict from ``agent._current_snapshot`` — small set of
-    high-signal fields for the auditor prompt."""
+    """Small set of high-signal fields from ``agent._current_snapshot``."""
     snap = getattr(agent, "_current_snapshot", None)
     if snap is None:
         return {}
@@ -454,15 +443,13 @@ def _project_perceiver_focus_from_agent(agent: Any) -> Dict[str, Any]:
 
 
 def build_snapshot_from_live_state(agent: Any) -> DoneAuditSnapshot:
-    """Build the snapshot from an in-flight ``StructAgent`` instance.
+    """Build the snapshot from an in-flight ``StructAgent``.
 
-    Called from ``agent._pa_predict`` at the DONE-acceptance site (see
-    plan Part I.2). Pulls task text + ledger state + recent screenshots
-    + perceiver focus. Excludes ALL planner CoT / message history /
-    current subgoal text (adversarial purity).
+    Called from ``agent._pa_predict`` at the DONE-acceptance site (plan Part
+    I.2). Pulls task + ledger state + recent screenshots + perceiver focus;
+    excludes ALL planner CoT / messages / subgoal text (adversarial purity).
     """
-    # Task instruction — prefer the raw user task over any augmented
-    # version the planner saw.
+    # Prefer the raw user task over the planner's augmented version.
     task = (
         getattr(agent, "_raw_instruction", None)
         or getattr(agent, "instruction", "")
@@ -474,19 +461,16 @@ def build_snapshot_from_live_state(agent: Any) -> DoneAuditSnapshot:
     verifier_specs = _project_verifier_specs_from_ledger(ledger)
     outcome_proofs = _project_outcome_proofs_from_ledger(ledger)
 
-    # Initial screenshot (task-start anchor)
+    # Initial screenshot (task-start anchor).
     initial_ss: Optional[str] = (
         getattr(ledger, "initial_screenshot_b64", None) if ledger else None
     )
 
-    # Recent screenshots — prefer the last K from agent.timeline; fall
-    # back to the current candidate-step screenshot.
     # Last 5 frames ENDING at the DONE frame, so the auditor sees the workflow
     # leading to DONE (e.g. a save/print flow), not just the terminal screen.
-    # NOTE: ``agent.timeline`` is a list of TimelineEvents — screenshots live on
-    # each event's ``.steps`` (StepRecords), NOT on the event. An earlier
-    # version read ``event.screenshot_b64`` and so always got nothing, leaving
-    # the auditor with a single frame.
+    # Screenshots live on each TimelineEvent's ``.steps`` (StepRecords), NOT on
+    # the event itself — reading ``event.screenshot_b64`` got nothing and left
+    # the auditor with a single frame. Falls back to the candidate-step frame.
     recent_ss: List[str] = []
     timeline = getattr(agent, "timeline", None)
     try:
@@ -505,8 +489,7 @@ def build_snapshot_from_live_state(agent: Any) -> DoneAuditSnapshot:
         if cand_ss:
             recent_ss = [cand_ss]
 
-    # Current a11y + URL from the candidate step (the frame the planner
-    # was looking at when it decided DONE).
+    # a11y + URL from the candidate step (the frame the planner saw at DONE).
     current_a11y = ""
     current_url: Optional[str] = None
     cand = getattr(agent, "_candidate_step", None)

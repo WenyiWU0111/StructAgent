@@ -1,26 +1,20 @@
 """Notebook — agent-side persistent key/value memory.
 
-Motivation: the planner / actor / verifier all suffer from the same root
-problem: once a value is observed (an affiliation, a citation count, an
-extracted PDF field), nothing pins it in place. Verifier-side KeyNode
-flips outcomes back to REVERTED when the app loses focus; planner
-forgets concrete values across replan boundaries; cross-app handoffs
-lose clipboard state. The notebook gives the agent a single shared
-write-once-read-many store that survives all of those.
+Once a value is observed (affiliation, citation count, extracted PDF field),
+nothing otherwise pins it: KeyNode reverts outcomes when the app loses focus,
+the planner forgets values across replans, cross-app handoffs lose the clipboard.
+The notebook is a single shared write-once-read-many store that survives all of
+those.
 
 Design:
-- Plain dict-of-Any on the agent (``self._notebook``). Reset per task.
-- Two write paths:
-    (a) ``note_write(key, value)`` action — explicit, planner asks
-        decomposer to save something observed.
-    (b) ``extract_info`` results auto-mirror in (one entry per file)
-        — replaces the old per-task ``_extract_info_history`` list.
-- Single render block ``[Notebook]`` injected into BOTH the planner
-  prompt and the decomposer prompt every turn. Perceiver does NOT get
-  it (perceiver is intentionally stateless visual-only).
+- Plain dict-of-Any on the agent (``self._notebook``), reset per task.
+- Two write paths: explicit ``note_write(key, value)`` action, and auto-mirrored
+  ``extract_info`` results (one entry per file; replaced the old
+  ``_extract_info_history``).
+- Single ``[Notebook]`` block injected into both planner and decomposer prompts
+  each turn. Not the perceiver (intentionally stateless visual-only).
 
-This module owns ONLY the data shape + rendering. The agent owns the
-dispatch wiring (write on action, read on prompt build).
+This module owns only the data shape + rendering; the agent owns dispatch wiring.
 """
 from __future__ import annotations
 
@@ -28,9 +22,8 @@ import json
 from typing import Any, Dict, List, Optional
 
 
-# Cap notebook render at ~6KB so it doesn't crowd out the planner prompt.
-# Single values truncated to ~400 chars (enough for a long affiliation
-# string or a paragraph of extracted text).
+# Cap render at ~6KB so it doesn't crowd the planner prompt; single values at
+# ~400 chars (a long affiliation string or paragraph of extracted text).
 _MAX_VALUE_CHARS = 400
 _MAX_RENDER_CHARS = 6000
 
@@ -47,20 +40,12 @@ def write_extract_info_batch(
     owning_outcome: Optional[str] = None,
     step_idx: int = 0,
 ) -> int:
-    """Persist one ``extract_info`` batch as Facts on the ledger.
-    Returns the number of file entries actually written. Payload shape
-    (preserved across the A7 cutover so the A6 renderer's extract_info
-    detector still works):
+    """Persist one ``extract_info`` batch as Facts on the ledger; returns the
+    number of file entries written. Only successful extractions become Facts;
+    latest-call-wins on a repeated path. Payload shape kept across the A7 cutover
+    so the A6 renderer's extract_info detector still works:
 
-        Fact.value = {
-            "_kind": "extract_info",
-            "query": "<query>",
-            "extracted": {<field>: <value>, ...},
-        }
-
-    Latest-call-wins on conflict (same path appearing in multiple
-    batches keeps the most recent extraction). Failed files are NOT
-    written — only successful extractions become Facts.
+        Fact.value = {"_kind": "extract_info", "query": ..., "extracted": {...}}
     """
     if not batch or not isinstance(batch, dict):
         return 0
@@ -98,9 +83,8 @@ def write_extract_info_batch(
 
 
 def write_note(notebook: Dict[str, Any], key: str, value: Any) -> None:
-    """Free-form planner/decomposer write. Keeps the value as-is
-    (string / number / dict / list). Tags the entry with ``_kind:
-    note`` so the renderer can distinguish from extract_info entries."""
+    """Free-form planner/decomposer write; value kept as-is. Tagged ``_kind:
+    note`` so the renderer separates it from extract_info entries."""
     key = str(key).strip()
     if not key:
         return
@@ -137,8 +121,7 @@ def render(notebook: Optional[Dict[str, Any]]) -> Optional[str]:
         if isinstance(v, dict) and v.get("_kind") == "extract_info":
             extracts.append((k, v))
         else:
-            # Treat anything else as a note (covers _kind=note and any
-            # legacy bare value left in the dict by older code paths).
+            # Anything else is a note (_kind=note, or legacy bare values).
             notes.append((k, v))
     if not notes and not extracts:
         return None
@@ -181,9 +164,7 @@ def render(notebook: Optional[Dict[str, Any]]) -> Optional[str]:
     return rendered
 
 
-# --------------------------------------------------------------------------- #
-# Action dispatch helpers (called from the agent's _pa_to_pyautogui)
-# --------------------------------------------------------------------------- #
+# Action dispatch helpers (called from the agent's _pa_to_pyautogui).
 
 def handle_note_write(
     action_inputs: Dict[str, Any],
@@ -193,15 +174,13 @@ def handle_note_write(
     owning_outcome: Optional[str] = None,
     step_idx: int = 0,
 ) -> None:
-    """Decode the wire form of a ``note_write`` step and persist as a
-    Fact on the ledger. Wire form (as the decomposer emits it after
-    _step_to_uitars_line round-trip): ``{"key": "<k>", "value": "<v>"}``.
-    ``value`` may be a JSON string for structured data.
+    """Decode a ``note_write`` step and persist as a Fact. Wire form (after the
+    _step_to_uitars_line round-trip): ``{"key": ..., "value": ...}``; value may
+    be a JSON string for structured data.
 
-    A7: ``_notebook`` is gone — the only sink is ``ledger.write_fact``.
-    Fact.value preserves the legacy ``{"_kind": "note", "value": X}``
-    wrap so the A6 renderer's per-bucket split (notes vs extracted
-    files) still works without further changes.
+    A7: ``_notebook`` is gone — only sink is ``ledger.write_fact``. Fact.value
+    keeps the legacy ``{"_kind": "note", "value": X}`` wrap so the A6 renderer's
+    notes-vs-files split still works.
     """
     key = str(action_inputs.get("key") or "").strip()
     raw_value = action_inputs.get("value")
@@ -209,8 +188,8 @@ def handle_note_write(
         if logger:
             logger.warning("[note_write] missing key — dropping")
         return
-    # Try JSON-decode if the wire value looks structured; otherwise
-    # keep as string. This lets the decomposer save dicts/lists.
+    # JSON-decode if the wire value looks structured, so the decomposer can
+    # save dicts/lists; otherwise keep the string.
     value: Any = raw_value
     if isinstance(raw_value, str):
         s = raw_value.strip()

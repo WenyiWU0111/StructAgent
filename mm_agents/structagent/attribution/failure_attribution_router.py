@@ -1,57 +1,39 @@
 """Per-role intervention router — Phase A of the failure-attribution stack.
 
-The diagnose call (`failure_attribution.diagnose_failure`) attributes a
-stuck state to one of five roles (planner / actor / verifier / env /
-unclear). This router consumes that attribution and decides what the
-NEXT action of the agent loop should be — not always a force_replan.
+``failure_attribution.diagnose_failure`` attributes a stuck state to one
+of five roles (planner / actor / verifier / env / unclear). This router
+maps that attribution to the loop's next action — not always a replan.
 
-Five intervention kinds (mapped from role + extra signals):
+Five intervention kinds:
 
-  planner_replan      — inject diagnosis block into next planner call
-                        (current behaviour for v1 stuck_diagnosis).
-                        Used for role=planner and the unclear-fallback.
+  planner_replan      — inject diagnosis into the next planner call.
+                        Used for role=planner and the unclear fallback.
 
-  actor_redo          — keep the current subgoal, skip the planner,
-                        and feed the actor PROSE-LEVEL guidance only
-                        (root_cause summary + memory's canonical
-                        approach + divergence). Crucially: NEVER pass
-                        the diagnose-emitted concrete action hint
-                        (e.g. click(start_box='(570,160)')) — the
-                        actor will copy it verbatim, and the diagnose
-                        model's grounding for those coords isn't
-                        reliable. The actor has its own grounding
-                        (decomposer inline grounding) and must
-                        do the visual lookup itself. We give the actor
-                        WHAT to achieve and WHY the previous tries
-                        failed; HOW (which pixel) is the actor's job.
+  actor_redo          — keep the subgoal, skip the planner, feed the
+                        actor PROSE-ONLY guidance (root_cause + memory
+                        canonical approach + divergence). Never pass the
+                        diagnose-emitted coord hint: the actor copies it
+                        verbatim and the diagnose model's grounding is
+                        unreliable. The actor grounds itself — we give it
+                        WHAT + WHY, not which pixel.
 
-  verifier_override   — programmatically mark the focus outcome as
-                        satisfied, citing the LLM's
-                        verifier_override_evidence quotes. SAFETY:
-                        requires (a) role=verifier, (b) confidence=high,
-                        (c) ≥1 verifier_override_evidence quote,
-                        (d) ≥N prior verifier-attributed rejects on
-                        the same outcome (default 2). Otherwise falls
-                        back to planner_replan.
+  verifier_override   — mark the focus outcome satisfied, citing the LLM's
+                        verifier_override_evidence. Gated on role=verifier,
+                        confidence=high, ≥1 evidence quote, and ≥N prior
+                        verifier-attributed rejects on the outcome
+                        (default 2); else planner_replan.
 
-  env_intervention    — non-LLM environment action (wait / focus
-                        widget / run recovery script / retry last
-                        action). Used for role=env. Falls back to
-                        planner_replan when env_recovery_kind isn't
-                        populated.
+  env_intervention    — non-LLM env action (wait / focus / recovery
+                        script / retry). role=env; falls back to
+                        planner_replan when env_recovery_kind is empty.
 
-  fallback_planner    — any safety-gate failure routes here so the
-                        agent stays on the existing well-understood
-                        path.
+  fallback_planner    — any safety-gate miss lands here so the agent stays
+                        on the well-understood path.
 
-The router is a PURE FUNCTION: it inspects the FailureAttribution + a
-small subset of agent state (timeline for dedup, prior diagnoses count
-for verifier safety gate) and returns the decision. Actual execution
-of the decision lives in the agent loop's recovery dispatcher (see
-``structagent.core.planner.planner`` and ``structagent.core.actor``).
-
-Intentionally LIGHT on imports so the same module can be unit-tested
-and replayed without standing up the full agent.
+PURE FUNCTION: inspects the FailureAttribution + a little agent state
+(timeline for dedup, prior-diagnosis count for the verifier gate) and
+returns a decision. Execution lives in the loop's recovery dispatcher.
+Kept light on imports so it can be unit-tested / replayed standalone.
 """
 from __future__ import annotations
 
@@ -105,8 +87,8 @@ _SIGNATURE_RE = re.compile(r"([a-z_][a-z0-9_]*)\s*\(([^)]{0,200})\)")
 
 
 def _hint_signature(hint: str) -> Optional[str]:
-    """Extract a normalised signature from an arbitrary action snippet
-    (hint OR timeline action_text). Handles "Action: " prefix.
+    """Normalise an action snippet (hint or timeline action_text) into a
+    signature. Handles the "Action: " prefix.
 
     Examples:
       "click(start_box='(394,141)')"               → "click(394,141)"
@@ -118,15 +100,14 @@ def _hint_signature(hint: str) -> Optional[str]:
         return None
     cm = _COORD_RE.search(hint)
     if cm:
-        # Find function name nearest to the coord match (search backward
-        # so we pick "click" not the start-of-string "Action").
-        # Match the LAST function-call signature before the coords.
+        # Last function call before the coords (so we pick "click", not
+        # the leading "Action").
         prefix = hint[: cm.start()]
         sig_m = list(re.finditer(r"([a-z_][a-z0-9_]*)\s*\(", prefix))
         if sig_m:
             return f"{sig_m[-1].group(1)}({cm.group(1)},{cm.group(2)})"
         return f"_({cm.group(1)},{cm.group(2)})"
-    # No coords — extract the last function-call signature in the text.
+    # No coords — last function call in the text.
     matches = list(_SIGNATURE_RE.finditer(hint))
     if matches:
         m = matches[-1]
@@ -139,12 +120,10 @@ def _extract_recent_action_signatures(
     timeline: Optional[List[Any]],
     n_recent: int = 8,
 ) -> List[str]:
-    """Pull the last N action signatures from timeline / rollup.
+    """Last N action signatures from the timeline.
 
-    The router is called from both production (timeline = list of step
-    objects) and replay (timeline = list of dicts). We tolerate both
-    shapes: accept any sequence of objects that either have
-    ``action_text`` attribute or are dicts with an ``action`` key."""
+    Tolerates both production (step objects with ``action_text``) and
+    replay (dicts with an ``action`` key)."""
     if not timeline:
         return []
     sigs: List[str] = []
@@ -163,9 +142,8 @@ def _extract_recent_action_signatures(
 
 
 def _hint_is_repeat(hint: str, recent_sigs: List[str]) -> bool:
-    """True when the proposed hint's signature exactly matches one of
-    the recent action signatures — i.e. we'd be re-trying a tried-
-    and-failed action."""
+    """True when the hint's signature matches a recent one — i.e. we'd be
+    re-trying a tried-and-failed action."""
     h_sig = _hint_signature(hint)
     if not h_sig:
         return False
@@ -174,13 +152,9 @@ def _hint_is_repeat(hint: str, recent_sigs: List[str]) -> bool:
 
 def _count_verifier_attributions(focus_outcome: Any,
                                   current_role: str) -> int:
-    """How many prior failure_attribution calls on this focus outcome
-    have also attributed to 'verifier'? Used as a safety gate so a
-    single false-positive verifier vote cannot override.
-
-    Accepts the cached attribution history we save on
-    focus_outcome.failure_attribution_history (set by
-    diagnose_failure when it appends each result)."""
+    """Count prior verifier-attributed diagnoses on this outcome (from the
+    cached focus_outcome.failure_attribution_history). Safety gate so one
+    false-positive verifier vote can't override."""
     history = getattr(focus_outcome, "failure_attribution_history", None)
     if not history:
         return 0
@@ -191,12 +165,11 @@ def _count_verifier_attributions(focus_outcome: Any,
 # ─── Router safety-gate constants ───────────────────────────────────
 
 
-VERIFIER_OVERRIDE_MIN_PRIOR = 2     # need at least N prior verifier-
-                                     # attributed rejects on this outcome
-                                     # before we trust the override
-# Dry-run control merged into the USE_FAILURE_ATTRIBUTION switch (read
-# by agent.py): =1 → dry-run, =2 → live. The router itself is pure
-# (no env reads); the executor receives ``dry_run`` from the caller.
+VERIFIER_OVERRIDE_MIN_PRIOR = 2     # prior verifier-attributed rejects
+                                     # required before trusting an override
+# Dry-run lives in the USE_FAILURE_ATTRIBUTION switch (agent.py): 1 →
+# dry-run, 2 → live. The router is pure; the executor gets dry_run from
+# the caller.
 
 
 # ─── The router ─────────────────────────────────────────────────────
@@ -210,10 +183,9 @@ def route_failure_attribution(
 ) -> InterventionDecision:
     """Pick an intervention from a single FailureAttribution.
 
-    Safety gates redirect to ``fallback_planner`` whenever a role-
-    specific route can't satisfy its preconditions; the agent never
-    "loses" a force_replan opportunity because of an unreliable
-    diagnosis.
+    Safety gates redirect to ``fallback_planner`` whenever a role-specific
+    route can't meet its preconditions, so an unreliable diagnosis never
+    costs a replan opportunity.
     """
     role = (diag.attributed_to_role or "unclear").lower()
     conf = (diag.confidence or "low").lower()
@@ -227,18 +199,15 @@ def route_failure_attribution(
         )
 
     # ── actor → skip planner, re-call actor with PROSE guidance only ──
-    # The actor has its own grounding (decomposer inline grounding). We
-    # explicitly DO NOT pass the diagnose-emitted coord-level hint —
-    # the actor would copy it verbatim, and the diagnose model's pixel
-    # grounding isn't reliable. We give it WHAT + WHY; HOW is its job.
+    # The actor grounds itself; we deliberately drop the diagnose coord
+    # hint (it'd be copied verbatim and the diagnose model's pixels are
+    # unreliable). Give it WHAT + WHY; HOW is its job.
     if role == "actor":
         rcs = (diag.root_cause_summary or "").strip()
         canonical = (diag.memory_recall_canonical or "").strip()
         divergence = (diag.divergence_description or "").strip()
-        # Gate: actor_redo only fires when the diagnosis has substantive
-        # prose to hand the actor. An empty root_cause + no memory
-        # canonical means we'd be calling the actor with nothing new —
-        # better to fall back to the planner.
+        # actor_redo needs substantive prose to hand over; empty root_cause
+        # + no canonical = nothing new for the actor, so fall back.
         if not rcs and not canonical:
             return InterventionDecision(
                 kind="fallback_planner",
@@ -253,14 +222,13 @@ def route_failure_attribution(
             kind="actor_redo",
             params={
                 "subgoal_id": getattr(focus_outcome, "id", None),
-                # Prose-level guidance handed to the actor's prompt:
+                # Prose guidance for the actor's prompt:
                 "root_cause_summary":      rcs,
                 "memory_canonical_approach": canonical,
                 "divergence_description":  divergence,
                 "missing_or_wrong":        list(diag.missing_or_wrong or []),
-                # Full diagnosis retained for audit dumps — NOT for the
-                # actor's prompt. Caller renders only the four prose
-                # fields above into the actor input.
+                # Full diagnosis kept for audit dumps only; the caller
+                # renders just the four prose fields into the actor input.
                 "diagnosis": diag.to_dict(),
             },
             reason=(f"role=actor with prose guidance "
@@ -305,9 +273,7 @@ def route_failure_attribution(
                 "outcome_id": getattr(focus_outcome, "id", None),
                 "evidence_quotes": evidence,
                 "rationale": diag.root_cause_summary,
-                # dry_run decision lives at the caller (agent.py reads
-                # USE_FAILURE_ATTRIBUTION and passes dry_run to the
-                # executor). The router stays pure.
+                # dry_run decided by the caller (agent.py); router stays pure.
             },
             reason=(f"role=verifier confidence=high with {len(evidence)} "
                     f"override evidence quote(s); "
@@ -351,12 +317,9 @@ def vote_attributions(diags: List[FailureAttribution]
                       ) -> Tuple[FailureAttribution, Dict[str, Any]]:
     """Majority-vote across N FailureAttribution samples.
 
-    Tie-break order: (1) confidence high > medium > low; (2) presence
-    of verifier_override_evidence or env_recovery_kind (more committed
-    diagnosis wins); (3) first sample.
-
-    Returns (winning_diag, voting_meta) so the caller can log e.g.
-    "voting: planner=2/3 actor=1/3 → planner won, low_agreement=False".
+    Tie-break: (1) confidence high > medium > low; (2) more committed
+    diagnosis (has verifier_override_evidence / env_recovery_kind);
+    (3) first sample. Returns (winner, voting_meta) for logging.
     """
     if not diags:
         raise ValueError("vote_attributions: no inputs")
@@ -371,7 +334,7 @@ def vote_attributions(diags: List[FailureAttribution]
     top_cat, top_cat_n = cat_counts.most_common(1)[0]
     candidates = [d for d in diags if d.attributed_to_role == top_role]
 
-    # Tie-break within candidates by confidence then commitment
+    # Tie-break candidates by confidence then commitment.
     _conf_rank = {"high": 3, "medium": 2, "low": 1}
 
     def commit_score(d: FailureAttribution) -> int:

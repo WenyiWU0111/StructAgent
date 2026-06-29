@@ -1,33 +1,19 @@
-"""Disk-content probe for files surfaced in
-``[Possibly useful files]``.
+"""Disk-content probe for files surfaced in ``[Possibly useful files]``.
 
-Goal: give init_ledger / the verify-author a structural view of the
-target document BEFORE the agent has opened anything. Without this,
-the verify-author guesses cell addresses (writes placeholders like
-``a1_ref: "new_day_cell"`` that no verifier can match), and the
-planner guesses the task shape ("insert a new row" on a fixed-grid
-timetable whose target was simply an empty cell).
+Gives init_ledger / the verify-author a structural view of the target
+document BEFORE anything is opened. Without it the verify-author guesses
+cell addresses (unmatchable placeholders like ``a1_ref: "new_day_cell"``)
+and the planner guesses the task shape ("insert a new row" on a fixed-grid
+timetable whose target was just an empty cell).
 
-Why disk-based: init_ledger runs once at task start, BEFORE the file
-is opened in LibreOffice. ``openpyxl`` / ``python-docx`` / ``python-
-pptx`` are already installed on the OSWorld VM (the env probe enumerates
-their versions) — we read the file directly. The live UNO perceivers
-(``sheet_perceiver`` / ``doc_perceiver`` / ``slide_perceiver``) cover
-later turns once the document is open. Two acquisition paths feeding
-the same view; both produce a parsed dict in the SAME schema so the
-SAME ``render_block`` function turns it into text.
+Why disk-based: init_ledger runs once at task start, before the file opens
+in LibreOffice; we read it directly via the VM's soffice/libs. The live UNO
+perceivers (sheet/doc/slide) take over once the document is open. Both paths
+produce a parsed dict in the SAME schema, so the SAME ``render_block`` turns
+either into text — init-time and per-turn blocks look identical.
 
-Schema compatibility — by design, the VM-side script here produces a
-parsed dict that matches the UNO INSPECT_SCRIPT output schema field-
-for-field where the disk equivalent exists (name, n_cols, n_rows,
-header_row, col_types, rows_head/tail, merged_regions for sheets;
-paragraphs[]/tables[] for docs; slides[].shapes[] for impress). The
-host side then calls the existing renderer — init-time and per-turn
-blocks look identical, planner sees ONE format.
-
-Block consumed by init_ledger ONLY, not the per-turn planner (live
-perceivers take over). Attached to
-:class:`InitialContext.useful_file_contents` so replay parity holds.
+Consumed by init_ledger ONLY. Attached to
+:class:`InitialContext.useful_file_contents` for replay parity.
 """
 from __future__ import annotations
 import json
@@ -39,8 +25,8 @@ logger = logging.getLogger(__name__)
 # Sentinel printed by the VM-side script; host parses by it.
 _SENTINEL = "USEFUL_FILES_RESULT:"
 
-# Caps. Per-file output budget governs how aggressively each format's
-# preview truncates; total file count caps the per-task budget.
+# Caps: per-file output budget drives preview truncation; file count caps
+# the per-task budget.
 _MAX_FILES = 6
 _PER_FILE_BUDGET_DEFAULT = 1500
 
@@ -50,15 +36,12 @@ _PER_FILE_BUDGET_DEFAULT = 1500
 # --------------------------------------------------------------------------- #
 
 def extract_useful_paths(environment_probe_text: Optional[str]) -> List[str]:
-    """Pull absolute paths from the ``[Possibly useful files]`` section
-    of the env-perceiver's digested output. Returns up to ``_MAX_FILES``
-    paths in source order. Returns ``[]`` when the section is missing,
-    empty, or the digest is None.
+    """Pull absolute paths from the ``[Possibly useful files]`` section of
+    the env-perceiver digest. Up to ``_MAX_FILES`` in source order; ``[]``
+    if the section/digest is missing or empty.
 
-    Hard rule: the perceiver never invents paths, so anything in this
-    section that starts with ``/`` is genuinely on disk. We ignore the
-    ``▸`` open_app hint line, any ``──`` rule echoes, and "(none)"
-    placeholders.
+    The perceiver never invents paths, so anything here starting with ``/``
+    is real on disk. Skip the ``▸`` open_app hint, ``──`` rules, "(none)".
     """
     if not environment_probe_text:
         return []
@@ -73,9 +56,8 @@ def extract_useful_paths(environment_probe_text: Optional[str]) -> List[str]:
             continue
         if not stripped.startswith("/"):
             continue
-        # Whole line is the path; paths legitimately contain spaces
-        # ("Course Timetable.xlsx"). Strip a trailing parenthesized
-        # note if the perceiver appended one, e.g. " (existed: yes)".
+        # Whole line is the path; paths can contain spaces ("Course
+        # Timetable.xlsx"). Strip a trailing perceiver note, e.g. " (existed: yes)".
         path = stripped
         if path.endswith(")") and " (" in path:
             path = path.rsplit(" (", 1)[0].rstrip()
@@ -92,17 +74,13 @@ def extract_useful_paths(environment_probe_text: Optional[str]) -> List[str]:
 def _build_script(path: str) -> str:
     """Build the self-contained Python script the VM runs for ONE file.
 
-    One ``/run_python`` call = one file. Mirrors the chunked-upload
-    pattern in ``_ops_lib_remote._chunked_upload``: small per-call
-    payloads keep the controller responsive instead of one long call
-    blocking screenshot / perceiver traffic on a busy VM.
+    One ``/run_python`` call per file — small payloads keep the controller
+    responsive instead of one long call blocking screenshot/perceiver traffic
+    (mirrors ``_ops_lib_remote._chunked_upload``).
 
-    The script dispatches on extension and emits, under ``"parsed"``,
-    a dict whose shape matches the corresponding live perceiver's
-    INSPECT_SCRIPT output. The host then calls the existing
-    ``render_block`` on it — identical text format to the per-turn
-    perceiver block. Finishes on a single ``USEFUL_FILES_RESULT:<json>``
-    sentinel line containing ``{<path>: <entry>}``.
+    Dispatches on extension and emits a parsed dict matching the matching
+    live perceiver's schema, on a single ``USEFUL_FILES_RESULT:<json>``
+    sentinel line keyed by path.
     """
     paths_json = json.dumps([path])
     return r'''
@@ -367,19 +345,15 @@ sys.stdout.write("\n")
 def _render_one(path: str, entry: dict) -> str:
     """Format one VM-side entry into a text block.
 
-    For spreadsheets (xlsx / ods / csv / xls) the VM-side already
-    produced a SheetPerceiver-shape parsed dict — we run it through
-    ``sheet_perceiver.render_block`` so init-time output is visually
-    identical to the per-turn SheetPerceiver block. For docx / pptx /
-    directories the soffice→txt path loses the structure DocPerceiver
-    / SlidePerceiver would surface (styles, slide layout), so we emit
-    the ``_text`` summary directly — less rich but still informative
-    for init reasoning."""
+    Spreadsheets carry a SheetPerceiver-shape dict → run through
+    ``sheet_perceiver.render_block`` (identical to the per-turn block). docx /
+    pptx / dirs went through soffice→txt (loses styles/layout), so we emit the
+    ``_text`` summary directly — less rich but enough for init reasoning."""
     fmt = entry.get("_format")
     if entry.get("error"):
         return "── %s\n   (parse failed: %s)" % (path, entry["error"])
     if "_text" in entry:
-        # dir / no-probe / not-found / crash / docx / pptx — already text.
+        # dir / no-probe / not-found / crash / docx / pptx — already text
         return "── %s\n%s" % (path, entry["_text"])
     if fmt == "xlsx":
         try:
@@ -404,10 +378,9 @@ def _format_block(results: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 def _probe_one(runner, path: str) -> Optional[dict]:
-    """Run the VM-side script for ONE path. Returns the parsed entry
-    dict ``{...}`` or ``None`` on any failure (script error, no
-    sentinel, JSON parse fail). All exceptions are swallowed — the
-    file is silently skipped, others still run."""
+    """Run the VM-side script for ONE path. Parsed entry dict, or ``None`` on
+    any failure (script error, no sentinel, bad JSON). Exceptions swallowed —
+    skip this file, keep going."""
     script = _build_script(path)
     try:
         result = runner(script)
@@ -431,7 +404,7 @@ def _probe_one(runner, path: str) -> Optional[dict]:
                 return None
             if not isinstance(d, dict) or not d:
                 return None
-            # script keys results by path; pull our path's entry out
+            # script keys by path; pull our entry out
             return d.get(path) or next(iter(d.values()), None)
     logger.info("[FileProbe] no sentinel for %s (%d chars out)",
                 path, len(out))
@@ -445,17 +418,13 @@ def probe_useful_files(
     per_file_budget: int = _PER_FILE_BUDGET_DEFAULT,
     wall_budget_s: float = 45.0,
 ) -> Optional[str]:
-    """Run the disk-content probe on the VM and return a formatted
-    text block (one ``── <path>`` section per file, body produced by
-    the matching live perceiver's ``render_block``).
+    """Run the disk-content probe on the VM; return a formatted text block
+    (one ``── <path>`` section per file).
 
-    One ``/run_python`` call per file — small per-call payloads keep
-    the controller responsive (mirrors the chunked-upload pattern in
-    ``_ops_lib_remote``: never let one long call block screenshot /
-    perceiver traffic on a busy VM). A wall-clock budget caps the
-    total cost — once exceeded, remaining paths are skipped and we
-    return what's already gathered. Returns ``None`` only if the
-    setup is unusable (no env, no runner) or nothing succeeded.
+    One ``/run_python`` call per file (see ``_build_script``). A wall-clock
+    budget caps total cost — once exceeded, remaining paths are skipped and we
+    return what we've got. ``None`` only if setup is unusable (no env/runner)
+    or nothing succeeded.
     """
     paths = [p for p in (paths or []) if p][:_MAX_FILES]
     if not paths:

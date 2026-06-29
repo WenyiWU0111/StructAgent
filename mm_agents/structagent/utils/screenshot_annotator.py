@@ -1,19 +1,12 @@
 """Screenshot action overlay — paint actor actions onto screenshots.
 
-Used to make trajectories human-reviewable: each turn's screenshot
-gets the action that ran from it overlaid (CLICK marker at coords,
-TYPE/HOTKEY/SCROLL labels). The annotated image replaces the raw
-screenshot in:
-  - the planner's K-frame history
-  - actor_history snapshots
-  - the ledger boundary-summarizer window
-  - the v2 timeline StepRecord
-  - lib_run_single's per-step record (rendered into trajectory.html)
-
-So the planner / detector / summarizer / human reviewer all see the
-SAME annotated frame for any past turn. Convention: the screenshot is
-the PRE-action observation (what the agent saw), with the action
-that was decided based on it overlaid.
+Makes trajectories human-reviewable: each turn's screenshot gets the action that
+ran from it overlaid (CLICK marker at coords, TYPE/HOTKEY/SCROLL labels). The
+annotated image replaces the raw screenshot everywhere a past frame is shown
+(planner K-frame history, actor_history, boundary-summarizer window, v2 timeline,
+trajectory.html), so planner / detector / summarizer / reviewer all see the same
+frame. Convention: the screenshot is the PRE-action observation, with the action
+decided from it overlaid.
 """
 from __future__ import annotations
 
@@ -31,10 +24,7 @@ except Exception:  # pragma: no cover
     _PIL_OK = False
 
 
-# --------------------------------------------------------------------------- #
-# Action parsing — pyautogui code → list of (kind, params) tuples
-# --------------------------------------------------------------------------- #
-
+# Action parsing — pyautogui code → list of (kind, params) tuples.
 
 _RE_CLICK = re.compile(
     r"pyautogui\.(click|rightClick|right_click|doubleClick|moveTo|moveRel)\s*"
@@ -53,10 +43,9 @@ _RE_SCROLL = re.compile(
 
 
 def parse_actions(code: str) -> List[Tuple[str, Dict[str, Any]]]:
-    """Find every pyautogui.* call in ``code`` and return ordered list of
-    (kind, params) tuples. ``kind`` ∈ {click, doubleclick, rightclick,
-    moveto, write, hotkey, press, scroll}. Multi-call code blocks are
-    handled (e.g. hotkey('ctrl','a') + write(...) + hotkey('enter'))."""
+    """Parse every pyautogui.* call in ``code`` into ordered (kind, params)
+    tuples. ``kind`` ∈ {click, doubleclick, rightclick, moveto, write, hotkey,
+    press, scroll}. Handles multi-call blocks."""
     if not code:
         return []
     out: List[Tuple[int, str, Dict[str, Any]]] = []  # (pos, kind, params)
@@ -89,11 +78,7 @@ def parse_actions(code: str) -> List[Tuple[str, Dict[str, Any]]]:
     return [(k, p) for _, k, p in out]
 
 
-# --------------------------------------------------------------------------- #
-# Drawing
-# --------------------------------------------------------------------------- #
-
-# Color palette (RGBA so we can fade)
+# Drawing. Color palette is RGBA so we can fade.
 _C_CLICK       = (220, 30,  30, 255)     # red
 _C_RIGHTCLICK  = (200, 30, 200, 255)     # magenta
 _C_DOUBLECLICK = (220, 100,  0, 255)     # orange
@@ -157,9 +142,9 @@ def annotate_screenshot_with_action(
     screenshot_bytes: bytes,
     action_codes: List[str],
 ) -> bytes:
-    """Overlay action markers on a PNG screenshot. Returns annotated
-    PNG bytes. Returns the input unchanged if PIL is unavailable, the
-    image fails to decode, or no actions parse out."""
+    """Overlay action markers on a PNG screenshot, returning annotated PNG bytes.
+    Returns the input unchanged if PIL is unavailable, the image won't decode, or
+    no actions parse out."""
     if not screenshot_bytes:
         return screenshot_bytes
     if not _PIL_OK:
@@ -167,7 +152,6 @@ def annotate_screenshot_with_action(
     if not action_codes:
         return screenshot_bytes
 
-    # Combine all action codes into one ordered list
     actions: List[Tuple[str, Dict[str, Any]]] = []
     for code in action_codes:
         if not code:
@@ -185,7 +169,7 @@ def annotate_screenshot_with_action(
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
 
-    # font sizes scale roughly with image height
+    # font sizes scale with image height
     base = max(14, img.height // 50)
     font_med = _try_font(base)
     font_big = _try_font(base + 4)
@@ -207,7 +191,7 @@ def annotate_screenshot_with_action(
             ay = y - amount * 6
             ay = max(60, min(img.height - 30, ay))
             draw.line([(x, y), (x, ay)], fill=_C_SCROLL, width=5)
-            # arrowhead pointing at ay
+            # arrowhead at ay
             ah = 10 if ay < y else -10
             draw.polygon(
                 [(x - 9, ay + ah), (x + 9, ay + ah), (x, ay)],
@@ -239,9 +223,7 @@ def annotate_screenshot_with_action(
     return out.getvalue()
 
 
-# --------------------------------------------------------------------------- #
-# Convenience: smoke test
-# --------------------------------------------------------------------------- #
+# Smoke test.
 
 
 if __name__ == "__main__":  # pragma: no cover

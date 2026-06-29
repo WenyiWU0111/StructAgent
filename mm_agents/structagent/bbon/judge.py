@@ -1,13 +1,12 @@
 """Comparative-MCQ judge for bBoN (see DESIGN.md).
 
 ONE prompt, all N candidates at once — comparative selection beats independent
-scoring (Agent-S3 finding). For EACH rubric outcome the judge decides which
-candidates satisfy it BY THE EVIDENCE (especially the final state), explicitly told
-NOT to trust any agent self-claim, then picks the single best candidate.
+scoring (Agent-S3 finding). Per rubric outcome the judge decides which candidates
+satisfy it from the evidence (weighting final state), never trusting agent
+self-claims, then picks the single best.
 
-Reuses the agent's ``call_llm`` + a VLM judge model (needs to see screenshots).
-``select_best`` is a pure function of its inputs (no agent state) so eval_judge can
-replay it on a frozen rollout set.
+Needs a VLM judge model (sees screenshots). ``select_best`` is pure in its inputs
+so eval_judge can replay it on a frozen rollout set.
 """
 from __future__ import annotations
 
@@ -76,9 +75,9 @@ def build_judge_prompt(task: str, rubric: List[str],
                        narratives: List[BehaviorNarrative]) -> list:
     """Comparative-MCQ message payload (system + one multi-image user turn).
 
-    Candidates are A, B, C…; each contributes its ``to_text()`` storyboard followed
-    by its decisive screenshots (BEFORE/AFTER on revert frames, plus the final
-    state), all labelled by candidate + step so the judge can cross-reference.
+    Candidates A, B, C…; each contributes its ``to_text()`` storyboard then its
+    decisive screenshots (BEFORE/AFTER on revert frames + final state), all
+    labelled by candidate + step for cross-reference.
     """
     rubric_txt = "\n".join(f"  - {r}" for r in rubric) or "  (no compiled outcomes)"
     content: list = [_text(
@@ -115,8 +114,8 @@ def _tok_to_idx(tok: str, n: int):
         return idx if 0 <= idx < n else None
     if tok.isdigit():
         v = int(tok)
-        # candidates are letters (A=1st); a digit is off-spec — read 1-based
-        # first ("1" -> A -> 0), then 0-based ("0" -> 0).
+        # candidates are letters; a digit is off-spec — try 1-based
+        # ("1"->A->0) before 0-based ("0"->0).
         if 1 <= v <= n:
             return v - 1
         if 0 <= v < n:
@@ -125,11 +124,10 @@ def _tok_to_idx(tok: str, n: int):
 
 
 def _parse_choice(resp: str, n: int):
-    """Strict verdict parse: a clean ``<choice>X</choice>`` (single letter/digit),
-    after dropping any ``<think>`` reasoning trailer. Off-format answers return
-    None so ``select_best`` can RE-ASK the judge — a retry beats guessing at a
-    garbled verdict (``<choice>A and C</choice>`` means the judge was unsure, not
-    'A'; a missing tag means it didn't answer, not whatever ``<cite>`` mentions)."""
+    """Strict parse of a clean ``<choice>X</choice>`` (single letter/digit), after
+    stripping any ``<think>`` trailer. Off-format returns None so ``select_best``
+    can RE-ASK rather than guess: ``<choice>A and C</choice>`` means unsure not 'A',
+    and a missing tag means no answer, not whatever ``<cite>`` happens to mention."""
     resp = resp or ""
     if "</think>" in resp:
         resp = resp.rsplit("</think>", 1)[-1]
@@ -145,13 +143,12 @@ def _cite_of(resp: str) -> str:
 def select_best(task: str, rubric: List[str], narratives: List[BehaviorNarrative],
                 call_llm: Callable, model: str, *, max_tries: int = 3,
                 temperature: float = 0.0) -> Selection:
-    """Run the comparative judge over the N narratives; parse the pick.
+    """Run the comparative judge over the N narratives and parse the pick.
 
-    On an unparseable verdict we RE-ASK the judge (up to ``max_tries``) with an
-    explicit format reminder rather than guessing at a garbled answer. Only if
-    every attempt fails do we fall back to candidate 0, flagged in ``rationale``
-    (so eval separates parse failures from genuine judge errors). Pure given a
-    deterministic ``call_llm`` so eval_judge can replay it.
+    On an unparseable verdict, RE-ASK with a format reminder (up to ``max_tries``).
+    If every attempt fails, fall back to candidate 0, flagged in ``rationale`` so
+    eval can separate parse failures from genuine judge errors. Pure given a
+    deterministic ``call_llm``.
     """
     if not narratives:
         return Selection(index=-1, rationale="no candidates")
@@ -182,9 +179,8 @@ def select_best_voting(task: str, rubric: List[str],
                        n_votes: int = 5, temperature: float = 0.7,
                        max_tries: int = 2) -> Selection:
     """Self-consistency judge: run ``select_best`` ``n_votes`` times at a sampling
-    temperature and take the MAJORITY pick. Ties break toward the lowest index
-    (stable). Cuts single-shot judge noise. Falls back to a single deterministic
-    pick when there's nothing to vote on.
+    temperature, take the MAJORITY pick (ties → lowest index). Cuts single-shot
+    judge noise; falls back to one deterministic pick when there's nothing to vote on.
     """
     if len(narratives) <= 1:
         return select_best(task, rubric, narratives, call_llm, model)
@@ -200,8 +196,7 @@ def select_best_voting(task: str, rubric: List[str],
             cites.setdefault(s.index, s.rationale)
     if not votes:
         return Selection(index=0, rationale="[voting: all tries unparseable]")
-    # most_common is order-stable for ties on Counter from a list; enforce
-    # lowest-index tie-break explicitly for determinism.
+    # explicit lowest-index tie-break for determinism
     top = max(set(votes), key=lambda i: (votes.count(i), -i))
     return Selection(index=top,
                      rationale=f"[vote {votes.count(top)}/{len(votes)}] "

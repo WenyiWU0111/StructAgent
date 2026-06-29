@@ -24,16 +24,12 @@ def find_leaf_nodes(xlm_file_str):
 
     root = ET.fromstring(xlm_file_str)
 
-    # Recursive function to traverse the XML tree and collect leaf nodes
     def collect_leaf_nodes(node, leaf_nodes):
-        # If the node has no children, it is a leaf node, add it to the list
         if not list(node):
             leaf_nodes.append(node)
-        # If the node has children, recurse on each child
         for child in node:
             collect_leaf_nodes(child, leaf_nodes)
 
-    # List to hold all leaf nodes
     leaf_nodes = []
     collect_leaf_nodes(root, leaf_nodes)
     return leaf_nodes
@@ -154,22 +150,18 @@ def draw_bounding_boxes(nodes, image_file_content, down_sampling_ratio=1.0, plat
     text_informations: List[str] = ["index\ttag\tname\ttext"]
 
     try:
-        # Adjust the path to the font file you have or use a default one
         font = ImageFont.truetype("arial.ttf", 15)
     except IOError:
-        # Fallback to a basic font if the specified font can't be loaded
         font = ImageFont.load_default()
 
     index = 1
 
-    # Loop over all the visible nodes and draw their bounding boxes
     for _node in nodes:
         coords_str = _node.attrib.get("{{{:}}}screencoord".format(_component_ns))
         size_str = _node.attrib.get("{{{:}}}size".format(_component_ns))
 
         if coords_str and size_str:
             try:
-                # Parse the coordinates and size from the strings
                 coords = tuple(map(int, coords_str.strip("()").split(", ")))
                 size = tuple(map(int, size_str.strip("()").split(", ")))
 
@@ -179,31 +171,25 @@ def draw_bounding_boxes(nodes, image_file_content, down_sampling_ratio=1.0, plat
                 original_size = copy.deepcopy(size)
 
                 if float(down_sampling_ratio) != 1.0:
-                    # Downsample the coordinates and size
                     coords = tuple(int(coord * down_sampling_ratio) for coord in coords)
                     size = tuple(int(s * down_sampling_ratio) for s in size)
 
-                # Check for negative sizes
                 if size[0] <= 0 or size[1] <= 0:
                     raise ValueError(f"Size must be positive, got: {size}")
 
-                # Calculate the bottom-right corner of the bounding box
                 bottom_right = (coords[0] + size[0], coords[1] + size[1])
-
-                # Check that bottom_right > coords (x1 >= x0, y1 >= y0)
                 if bottom_right[0] < coords[0] or bottom_right[1] < coords[1]:
                     raise ValueError(f"Invalid coordinates or size, coords: {coords}, size: {size}")
 
-                # Check if the area only contains one color
+                # Skip single-color (blank) regions.
                 cropped_image = image.crop((*coords, *bottom_right))
                 if len(set(list(cropped_image.getdata()))) == 1:
                     continue
 
-                # Draw rectangle on image
                 draw.rectangle([coords, bottom_right], outline="red", width=1)
 
-                # Draw index number at the bottom left of the bounding box with black background
-                text_position = (coords[0], bottom_right[1])  # Adjust Y to be above the bottom right
+                # Index label at the box's bottom-left, on a black background.
+                text_position = (coords[0], bottom_right[1])
                 text_bbox: Tuple[int, int, int, int] = draw.textbbox(text_position, str(index), font=font, anchor="lb")
                 # offset: int = bottom_right[1]-text_bbox[3]
                 # text_bbox = (text_bbox[0], text_bbox[1]+offset, text_bbox[2], text_bbox[3]+offset)
@@ -279,7 +265,7 @@ def linearize_accessibility_tree(accessibility_tree, platform="Ubuntu"):
         tree = ET.ElementTree(ET.fromstring(accessibility_tree))
         keep_apps = find_active_applications(tree, _state_ns)
 
-        # Remove inactive applications
+        # Drop inactive applications.
         for application in list(tree.getroot()):
             if application.get("name") not in keep_apps:
                 tree.getroot().remove(application)
@@ -287,12 +273,10 @@ def linearize_accessibility_tree(accessibility_tree, platform="Ubuntu"):
         filtered_nodes = filter_nodes(tree.getroot(), platform, check_image=True)
         linearized_accessibility_tree = ["tag\ttext\tstate"]
 
-        # State attributes worth surfacing (only included when XML sets them
-        # to "true"; AT-SPI omits the attr entirely when the state is false,
-        # so presence = true and we list each by its short name).
+        # State attributes worth surfacing. AT-SPI omits the attr when false,
+        # so presence == true.
         _STATE_KEYS = ("checked", "selected", "focused", "enabled")
 
-        # Linearize the accessibility tree nodes into a table format
         for node in filtered_nodes:
             try:
                 text = node.text if node.text is not None else ""
@@ -305,7 +289,7 @@ def linearize_accessibility_tree(accessibility_tree, platform="Ubuntu"):
 
                 text = text.replace("\n", "\\n")
 
-                # Collect true-valued state attributes. Preserve order.
+                # True-valued state attributes, in _STATE_KEYS order.
                 state_flags = [
                     k for k in _STATE_KEYS
                     if node.get("{{{:}}}{:}".format(_state_ns, k)) == "true"
@@ -318,7 +302,6 @@ def linearize_accessibility_tree(accessibility_tree, platform="Ubuntu"):
             except Exception as e:
                 continue
 
-        # Filter out similar nodes
         linearized_accessibility_tree = filter_similar_nodes("\n".join(linearized_accessibility_tree))
     except Exception as e:
         print(f"Error in linearize_accessibility_tree: {e}")

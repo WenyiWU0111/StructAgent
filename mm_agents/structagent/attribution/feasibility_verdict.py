@@ -1,44 +1,30 @@
 """Evidence-driven feasibility verdict — Fix 1 for the infeasible-task problem.
 
-Fires when the agent has force-replanned ``>= K`` times while stuck. A strong
-"feasibility judge" (the *verifier model*) reads the accumulated evidence and
-decides whether the task is genuinely **INFEASIBLE** (emit ``FAIL``) or the
-agent should **CONTINUE** replanning.
+Fires after the agent force-replans ``>= K`` times while stuck. A feasibility
+judge (the verifier model) reads the accumulated evidence and decides INFEASIBLE
+(emit ``FAIL``) vs CONTINUE replanning. Post-hoc rather than an up-front gate:
+a small model can't judge feasibility at t=0, but after K stuck replans there's
+enough evidence (paths walked, outcomes never reached, workarounds attempted)
+to make the call.
 
-Why post-hoc (not an up-front gate): a small model with no web access cannot
-reliably judge feasibility at task start. After K stuck replans the agent has
-*accumulated evidence* (legitimate paths walked, outcomes never reached,
-workarounds attempted) that makes the call tractable — a "feasibility-verify"
-job layered on top of the verifier's outcome-verify job.
+CONSISTENCY CONTRACT (read before editing the prompt or brief): this module is
+the single source of truth for the three artifacts validated on V4 replay
+(12/12: 2/2 infeasible detected, 0 FP; Sonnet + local Qwen3.5-9B, thinking ON):
+FEASIBILITY_SYSTEM, extract_brief_from_log, build_user_message + parse_verdict.
+The replay harness (/tmp/feasibility_replay/validate.py) imports these exact
+symbols, so validated == production by construction. The brief is built from the
+live runtime.log because the ``<evidence>`` stream only exists as logged LLM
+output — no structured in-memory field to read. RE-RUN validate.py after any
+change to the prompt or extraction.
 
-────────────────────────────────────────────────────────────────────────────
-CONSISTENCY CONTRACT (read before editing the prompt or the brief):
-
-This module is the SINGLE SOURCE OF TRUTH for the three artifacts that were
-validated on V4 trajectory replay (12/12: 2/2 infeasible detected, 0
-false-positive, with both Sonnet and local Qwen3.5-9B *thinking ON*):
-
-  1. ``FEASIBILITY_SYSTEM``        — the judge's system prompt
-  2. ``extract_brief_from_log``    — how the evidence brief is built
-  3. ``build_user_message`` + ``parse_verdict`` — the wrapper + the parser
-
-The replay harness (/tmp/feasibility_replay/validate.py) IMPORTS these exact
-symbols, so "what was validated" == "what runs in production" by construction.
-The brief is built from the live ``runtime.log`` (the SAME text the harness
-parses from the recorded log) because the ``<evidence>`` stream only exists as
-logged LLM output — there is no structured in-memory field to read instead.
-If you change the prompt or the extraction, RE-RUN validate.py before shipping.
-────────────────────────────────────────────────────────────────────────────
-
-Design invariants (each grounded in a replay failure mode):
-  * Reason from FACTS, not from the verifier's pass/fail verdict — verifiers
-    false-reject feasible tasks (over-strict regex / format / encoding), and
-    trusting the verdict caused the only 误伤 in the thinking-off run.
-  * INFEASIBLE requires DIRECT evidence the target feature/setting/resource is
-    ABSENT. "Stuck" or "verifier keeps rejecting" alone is NOT enough.
-  * Conservative — anything that is not a clean INFEASIBLE maps to CONTINUE.
-    A false INFEASIBLE FAILs a winnable task (high cost); a missed infeasible
-    merely keeps trying (low cost).
+Design invariants (each grounded in a replay failure):
+  * Reason from FACTS, not the verifier's pass/fail verdict — verifiers
+    false-reject feasible tasks (over-strict regex/format/encoding); trusting
+    the verdict caused the only false-positive in the thinking-off run.
+  * INFEASIBLE requires DIRECT evidence the target is ABSENT; "stuck" or
+    "verifier keeps rejecting" is not enough.
+  * Conservative — anything not a clean INFEASIBLE → CONTINUE. A false
+    INFEASIBLE fails a winnable task (high cost); a miss just keeps trying.
 """
 from __future__ import annotations
 
@@ -99,12 +85,10 @@ REASON: <one sentence citing the specific evidence>"""
 # ═══════════════════ 2. evidence brief (validated verbatim) ═══════════════ #
 
 def extract_brief_from_log(log_text: str, replan_cutoff: int) -> str:
-    """Build the feasibility-judge evidence brief from runtime-log TEXT, using
-    only what was logged BEFORE the ``replan_cutoff``-th ``force_replan`` (the
-    trigger point). Identical logic to the validated replay harness — strategy
-    tags, planner bottlenecks, and verifier ``<evidence>`` checks.
-
-    The harness and the live loop both call THIS function; do not fork it.
+    """Build the evidence brief from runtime-log TEXT, using only what was logged
+    before the ``replan_cutoff``-th ``force_replan`` (the trigger). Strategy tags,
+    planner bottlenecks, verifier ``<evidence>`` checks. Harness and live loop both
+    call this — do not fork it.
     """
     lines = log_text.splitlines()
     replan_idx = [i for i, l in enumerate(lines) if "force_replan" in l]
@@ -114,7 +98,7 @@ def extract_brief_from_log(log_text: str, replan_cutoff: int) -> str:
     strategies = re.findall(r"<strategy>(.*?)</strategy>", head, re.DOTALL)
     bottlenecks = [m.split("Bottleneck:", 1)[1].strip()
                    for m in re.findall(r"PA-Planner\] Bottleneck:[^\n]*", head)]
-    # verifier evidence: the per-step post-state checks. Drop the prompt template line.
+    # per-step post-state checks; drop the prompt-template line
     evid = re.findall(r"<evidence>(.*?)(?:</evidence>|\n)", head, re.DOTALL)
     evid = [e.strip()[:240] for e in evid if "One short sentence" not in e and e.strip()]
 
@@ -137,18 +121,18 @@ def build_user_message(instruction: str, brief: str) -> str:
 
 
 def _strip_thinking(txt: str) -> str:
-    """Qwen-3.5 (thinking on) via vLLM injects the OPENING <think> into the
-    prompt, so the completion carries only the CLOSING </think>. Take
-    everything after it. No-op for non-thinking output."""
+    """Qwen-3.5 (thinking on) via vLLM injects the opening <think> into the prompt,
+    so the completion carries only the closing </think>; return everything after it.
+    No-op for non-thinking output."""
     if "</think>" in txt:
         return txt.split("</think>", 1)[1]
     return txt
 
 
 def parse_verdict(text: str) -> Tuple[str, str]:
-    """Parse the judge reply → (verdict, reason). verdict ∈ {INFEASIBLE,
-    CONTINUE, PARSE_FAIL}. The replay harness shows PARSE_FAIL as a distinct
-    signal; production maps anything != INFEASIBLE to CONTINUE (conservative)."""
+    """Parse the judge reply → (verdict, reason), verdict ∈ {INFEASIBLE, CONTINUE,
+    PARSE_FAIL}. The harness keeps PARSE_FAIL distinct; production maps anything
+    != INFEASIBLE to CONTINUE (conservative)."""
     txt = _strip_thinking(text or "")
     m = re.search(r"VERDICT:\s*(INFEASIBLE|CONTINUE)", txt, re.I)
     v = m.group(1).upper() if m else PARSE_FAIL
@@ -167,13 +151,13 @@ def feasibility_verdict(
     max_tokens: int = 6144,
     logger=None,
 ) -> Tuple[str, str]:
-    """Run the feasibility judge via the agent's ``call_llm`` on the verifier
-    model. Returns ``(verdict, reason)`` with verdict ∈ {INFEASIBLE, CONTINUE}
-    (PARSE_FAIL and errors collapse to CONTINUE — conservative).
+    """Run the feasibility judge via ``call_llm`` on the verifier model. Returns
+    ``(verdict, reason)``, verdict ∈ {INFEASIBLE, CONTINUE} (PARSE_FAIL and errors
+    collapse to CONTINUE — conservative).
 
-    ``force_thinking`` is set on the payload so the llm-client forces thinking
-    ON for Qwen-3.5 regardless of the global ``QWEN35_THINKING`` switch — the
-    judge 误伤's without it (validated). No-op for Claude / other models."""
+    ``force_thinking`` makes the llm-client force thinking ON for Qwen-3.5
+    regardless of the global ``QWEN35_THINKING`` switch — the judge false-positives
+    without it (validated). No-op for Claude / other models."""
     payload = {
         "model": model,
         "messages": [

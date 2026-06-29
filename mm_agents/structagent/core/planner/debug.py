@@ -1,27 +1,15 @@
 """Per-planner-turn HTML dump for offline debug.
 
-For every planner LLM call, ``dump_planner_call()`` writes a single
-self-contained HTML page that shows:
-
-  • header — step_idx, mode (initial / force_replan / progress_check /
-    subgoal_done / all_subgoals_done / actor_exhausted), attempt index,
-    stuck_category if applicable, parsed decision, elapsed seconds
-  • system prompt (collapsed by default)
-  • each user message in order (text rendered as <pre>, images inlined
-    as <img src="data:..."> with size cap)
-  • raw response (formatted)
-  • parsed metadata (plan / decision / refined subgoal etc.)
-
-Layout under ``{results_dir}/planner_debug/``:
+For every planner LLM call, ``dump_planner_call()`` writes one self-contained
+HTML page (header, system prompt collapsed, user messages with inlined images,
+raw response, parsed metadata) under ``{results_dir}/planner_debug/``:
 
     step_0000_initial_attempt0.html
-    step_0001_progress_check_attempt0.html
-    step_0002_force_replan_actor_failure_attempt0.html
     step_0002_force_replan_actor_failure_attempt1.html  ← retry
     index.html                                          ← appended live
 
-The index page is rebuilt on each dump so a long-running task always
-has a usable summary even if interrupted.
+The index is rebuilt on each dump so a long-running task always has a usable
+summary even if interrupted.
 """
 
 from __future__ import annotations
@@ -44,8 +32,7 @@ def _safe(s: str, n: int = 60) -> str:
     return _SAFE.sub("_", (s or ""))[:n]
 
 
-# Images can be huge in base64; cap the visual size we render to keep
-# the HTML responsive. CSS handles downscaling; we don't re-encode.
+# Cap rendered image size for responsiveness; CSS downscales, no re-encode.
 _IMG_CSS_MAX_WIDTH = "1100px"
 
 
@@ -64,15 +51,14 @@ def _render_one_content_item(item: Any) -> str:
         return f'<pre class="text-block">{_esc(item.get("text") or "")}</pre>'
     if t == "image_url":
         url = (item.get("image_url") or {}).get("url") or ""
-        # Truncate the url just in the title to avoid storing a 200K data
-        # URL in HTML alt attribute (the src itself is the data URL).
+        # Truncate url in the title only; the src stays the full data URL.
         title = url[:80] + ("…" if len(url) > 80 else "")
         return (
             f'<div class="img-wrap">'
             f'<img src="{_esc(url)}" alt="planner image" title="{_esc(title)}" />'
             f'</div>'
         )
-    # Fallback — dump JSON of the item
+    # Fallback: dump item as JSON.
     return f'<pre class="text-block">{_esc(json.dumps(item, ensure_ascii=False, default=str))}</pre>'
 
 
@@ -82,14 +68,13 @@ def _render_message(role: str, content: Any, idx: int) -> str:
         "user": "msg-user",
         "assistant": "msg-assistant",
     }.get(role, "msg-other")
-    # System messages get collapsed by default.
+    # System messages collapsed by default.
     open_attr = "" if role == "system" else " open"
     header_label = {
         "system": "system",
         "user": "user",
         "assistant": "assistant",
     }.get(role, role or "?")
-    # Render content (may be a string or list of parts).
     if isinstance(content, list):
         body = "\n".join(_render_one_content_item(it) for it in content)
     elif content is None:
@@ -270,9 +255,7 @@ def _render_html(
     )
 
 
-# ──────────────────────────────────────────────────────────────────────
 # Index page — appended/refreshed on every dump_planner_call.
-# ──────────────────────────────────────────────────────────────────────
 
 
 def _index_record_path(out_dir: Path) -> Path:
@@ -306,7 +289,7 @@ def _rebuild_index(out_dir: Path) -> None:
         logger.info("[planner_debug] index read failed: %s", e)
         return
 
-    # Sort by step then attempt for natural reading.
+    # Sort by step then attempt.
     records.sort(key=lambda r: (
         int(r.get("step_idx", 0)), int(r.get("attempt", 0)),
     ))
@@ -354,9 +337,7 @@ def _rebuild_index(out_dir: Path) -> None:
         logger.info("[planner_debug] index write failed: %s", e)
 
 
-# ──────────────────────────────────────────────────────────────────────
 # Public entry point
-# ──────────────────────────────────────────────────────────────────────
 
 
 def dump_planner_call(
@@ -369,17 +350,12 @@ def dump_planner_call(
     response: Optional[str],
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Write one planner LLM call's HTML page + update the index.
+    """Write one planner LLM call's HTML page + update the index. Never raises;
+    failures are logged at info level.
 
-    ``metadata`` may include any of (all optional):
-      stuck_category   — recovery-rule category if mode==force_replan
-      stuck_reason     — recovery-rule one-line reason
-      parsed_decision  — CONTINUE / DONE / REPLAN from the response parser
-      parsed_plan      — extracted <plan> text (if any)
-      elapsed_s        — wall time of the LLM call in seconds
-      ... anything else the caller wants to surface in the page footer
-
-    Failures are logged at info level and never raise to the caller.
+    ``metadata`` (all optional): stuck_category / stuck_reason (force_replan),
+    parsed_decision (CONTINUE/DONE/REPLAN), parsed_plan, elapsed_s, plus anything
+    else to surface in the page footer.
     """
     if not results_dir:
         return
@@ -398,7 +374,6 @@ def dump_planner_call(
             metadata=metadata or {},
         )
         (out_dir / fname).write_text(page, encoding="utf-8")
-        # Append to index records + rebuild index.
         meta = metadata or {}
         _append_index_record(out_dir, {
             "step_idx": step_idx,

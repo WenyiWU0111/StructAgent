@@ -1,28 +1,17 @@
-"""Side-effect executors for the failure-attribution router decisions.
+"""Side-effect executors for failure-attribution router decisions.
 
-The router (failure_attribution_router) is a PURE function that picks an
-``InterventionDecision``. The executors here actually carry out two of
-those decisions in the live agent loop:
+The router is a pure function that picks an ``InterventionDecision``; these
+executors carry out two of them in the live loop:
 
-  apply_verifier_override(...)   — synthesize a high-confidence
-                                    ``KN_OUTCOME_SATISFIED`` KeyNode and
-                                    flip the focus outcome to VERIFIED.
-                                    Caller decides ``dry_run`` (default
-                                    True — never flips state unless the
-                                    caller explicitly passes False).
+  apply_verifier_override  — synthesize a high-confidence KN_OUTCOME_SATISFIED
+                             KeyNode and flip the focus outcome to VERIFIED
+                             (dry_run defaults True; only flips when passed False).
+  apply_env_intervention   — non-LLM env action (only ``wait`` wired today;
+                             other kinds log and let the caller fall back).
 
-  apply_env_intervention(...)    — perform a non-LLM env action (only
-                                    ``wait`` is wired today; other kinds
-                                    log + return False, leaving the
-                                    caller to fall back).
-
-Both functions are deliberately defensive and return a small dict
-capturing what they did (or would have done) so the agent can log + dump
-it without conditional duplication at the callsite.
-
-actor_redo + planner_replan / fallback_planner do NOT live here — those
-decisions affect the planner / actor prompt-build flow (handled in
-agent.py + planner.py + actor.py), not env / ledger state.
+Both return an audit dict so the caller can log/dump uniformly. actor_redo /
+planner_replan / fallback_planner live elsewhere (agent.py + planner.py +
+actor.py) since they touch prompt-build flow, not env/ledger state.
 """
 from __future__ import annotations
 
@@ -40,21 +29,16 @@ def apply_verifier_override(
     step_idx: int,
     dry_run: bool = True,
 ) -> Dict[str, Any]:
-    """Mark the focus outcome as VERIFIED via a synthetic KeyNode.
+    """Mark the focus outcome VERIFIED via a synthetic KeyNode. Idempotent
+    (already-verified → ``status=already_verified``). Returns an audit dict.
 
-    Returns an audit dict the caller logs / dumps. Idempotent on already-
-    verified outcomes (returns ``status=already_verified``).
+    DRY-RUN by default; caller must pass ``dry_run=False`` to flip. agent.py
+    derives this from USE_FAILURE_ATTRIBUTION (=1 dry-run, =2 LIVE).
 
-    Safety:
-      • Default behaviour is DRY-RUN — the caller must explicitly pass
-        ``dry_run=False`` to actually flip the outcome. agent.py derives
-        this from ``USE_FAILURE_ATTRIBUTION``: =1 → dry-run (safe
-        default); =2 → LIVE override.
-      • The KeyNode is emitted at ``confidence=CONF_HIGH`` so that
-        ``enters_derivation()`` is True and OutcomeStateCache picks it
-        up; we intentionally bypass low-confidence filtering because the
-        router has already imposed safety gates (high conf + N prior
-        verifier rejects + ≥1 verbatim evidence quote).
+    KeyNode is emitted at CONF_HIGH so ``enters_derivation()`` is True and
+    OutcomeStateCache picks it up — bypassing low-confidence filtering is safe
+    because the router already gated on high conf + N prior verifier rejects +
+    >=1 verbatim evidence quote.
     """
     from mm_agents.structagent.ledger.core.timeline import (
         KeyNode, KN_OUTCOME_SATISFIED, CONF_HIGH,
@@ -126,15 +110,12 @@ def apply_env_intervention(
     decision_params: Dict[str, Any],
     step_idx: int,
 ) -> Dict[str, Any]:
-    """Perform a non-LLM env-side recovery action.
+    """Perform a non-LLM env-side recovery action. Returns an audit dict.
 
-    Only ``recovery_kind="wait"`` is wired today — env.step("WAIT") is
-    a benign existing API. Other kinds (``focus`` / ``recovery_script``
-    / ``retry``) require deciding what counts as safe to execute without
-    the actor in the loop; for now we log and return ``status=
-    unsupported_kind`` so the caller can fall back.
-
-    Returns an audit dict with the new observation (if any) on success.
+    Only ``recovery_kind="wait"`` is wired (env.step("WAIT") is benign). Other
+    kinds (``focus`` / ``recovery_script`` / ``retry``) have non-trivial blast
+    radius without the actor in the loop, so they log and return
+    ``status=unsupported_kind`` for the caller to fall back.
     """
     kind = decision_params.get("recovery_kind")
     params = decision_params.get("recovery_params") or {}
@@ -152,7 +133,7 @@ def apply_env_intervention(
 
     if kind == "wait":
         ms = int(params.get("ms") or 2000)
-        ms = max(100, min(ms, 30_000))   # clamp 0.1s … 30s
+        ms = max(100, min(ms, 30_000))   # clamp 0.1s..30s
         audit["wait_ms_clamped"] = ms
         try:
             time.sleep(ms / 1000.0)
@@ -168,11 +149,8 @@ def apply_env_intervention(
             logger.warning("[env_intervention] env.step failed: %s", e)
         return audit
 
-    # Other recovery kinds are intentionally NOT auto-executed yet.
-    # ``recovery_script`` (shell command), ``retry`` (re-emit prior
-    # action), ``focus`` (click a a11y target) all have non-trivial
-    # blast radius without the actor in the loop. Log the desired
-    # action and let the caller fall back to planner_replan.
+    # recovery_script / retry / focus have non-trivial blast radius without the
+    # actor in the loop; log the intent and fall back to planner_replan.
     audit["status"] = "unsupported_kind"
     logger.info("[env_intervention] kind=%r not auto-executed yet — "
                 "caller should fall back to planner_replan", kind)

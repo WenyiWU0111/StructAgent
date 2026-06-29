@@ -1,26 +1,12 @@
-"""On-disk markdown plan file (T4).
+"""On-disk markdown plan file: ``<results_dir>/plan.md``.
 
-Each task run gets ``<results_dir>/plan.md`` — a human-readable
-rendering of the current Outcome DAG + state. The file is rewritten
-after every successful REPLAN so it always reflects the planner's
-most recent commitment.
+Human-readable rendering of the current Outcome DAG + state, rewritten
+after every successful REPLAN. Lets the planner read its own prior
+commitments at DONE-decision time (thrash check) and gives `cat plan.md`
+as a triage view instead of reconstructing from JSONL.
 
-Why this matters:
-
-  - **Plan thrash check**: planner can ``read_plan()`` at DONE-decision
-    time and see its own prior subgoal commitments, not a re-derived
-    snapshot of in-memory DAG.
-  - **Triage**: ``cat <results_dir>/plan.md`` is faster than reading
-    JSONL to reconstruct what the planner thought it was doing.
-  - **Token saving** (future): when LAYER 3 of the planner prompt
-    reads this file rather than rendering the DAG inline every turn,
-    we save the repeated render cost.
-
-Co-located with task artifacts (``<results_dir>/plan.md``) rather
-than ``~/.structagent/plans/`` because OSWorld already gives each
-run a dedicated dir via ``lib_run_single.py:181`` — no separate slug
-infrastructure needed.
-
+Co-located with task artifacts because OSWorld already gives each run a
+dedicated dir (lib_run_single.py:181) — no separate slug infra needed.
 See plan file Part I.3.
 """
 from __future__ import annotations
@@ -44,19 +30,15 @@ HISTORY_DIRNAME = "plans"
 
 
 def get_plan_path(results_dir: Optional[str]) -> Optional[Path]:
-    """Return ``<results_dir>/plan.md`` (the always-latest snapshot)
-    or None if ``results_dir`` is unset (e.g. running outside the
-    lib_run_single harness).
-    """
+    """``<results_dir>/plan.md`` (always-latest snapshot), or None when
+    results_dir is unset (e.g. running outside lib_run_single)."""
     if not results_dir:
         return None
     return Path(results_dir) / PLAN_FILENAME
 
 
 def get_history_dir(results_dir: Optional[str]) -> Optional[Path]:
-    """Return ``<results_dir>/plans/`` (per-step history directory)
-    or None if ``results_dir`` is unset.
-    """
+    """``<results_dir>/plans/`` (per-step history dir), or None when unset."""
     if not results_dir:
         return None
     return Path(results_dir) / HISTORY_DIRNAME
@@ -65,9 +47,8 @@ def get_history_dir(results_dir: Optional[str]) -> Optional[Path]:
 def get_history_path(
     results_dir: Optional[str], step_idx: int,
 ) -> Optional[Path]:
-    """Return ``<results_dir>/plans/step_NNNN.md`` for the given
-    step. 4-digit zero-pad keeps ``ls plans/`` sorted correctly up
-    to 9999 steps (we'd terminate the run long before).
+    """``<results_dir>/plans/step_NNNN.md`` for the given step.
+    4-digit zero-pad keeps ``ls plans/`` sorted (runs end well before 9999).
     """
     history_dir = get_history_dir(results_dir)
     if history_dir is None:
@@ -76,10 +57,7 @@ def get_history_path(
 
 
 def read_plan(results_dir: Optional[str]) -> Optional[str]:
-    """Read the latest plan markdown from ``<results_dir>/plan.md``.
-    Returns ``None`` on missing file or unset dir — callers never
-    have to try/except.
-    """
+    """Latest plan markdown, or None on missing file / unset dir."""
     path = get_plan_path(results_dir)
     if path is None:
         return None
@@ -92,10 +70,7 @@ def read_plan(results_dir: Optional[str]) -> Optional[str]:
 def read_plan_at_step(
     results_dir: Optional[str], step_idx: int,
 ) -> Optional[str]:
-    """Read a historical plan snapshot from
-    ``<results_dir>/plans/step_NNNN.md``. Returns ``None`` if no
-    snapshot was recorded at that step.
-    """
+    """Historical plan snapshot for a step, or None if none recorded."""
     path = get_history_path(results_dir, step_idx)
     if path is None:
         return None
@@ -106,9 +81,7 @@ def read_plan_at_step(
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` atomically via mkstemp + rename in
-    the same directory (so the rename is on the same filesystem).
-    """
+    """Atomic write via mkstemp + rename in the same dir (same filesystem)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
         prefix=".plan.", suffix=".tmp", dir=str(path.parent),
@@ -118,8 +91,7 @@ def _atomic_write(path: Path, text: str) -> None:
             f.write(text)
         os.replace(tmp_path, str(path))
     except Exception:
-        # Best-effort cleanup of the temp file; rename target may
-        # already exist from a prior successful write.
+        # Best-effort temp cleanup.
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -133,29 +105,16 @@ def write_plan(
     *,
     step_idx: Optional[int] = None,
 ) -> bool:
-    """Write the plan markdown atomically. No-op if ``results_dir``
-    is unset. Returns True on write, False on no-op.
+    """Write the plan markdown atomically. No-op (returns False) if
+    results_dir is unset, else True.
 
-    Writes up to two files:
+    Writes plan.md (latest, overwritten each call) plus, when step_idx
+    is given, plans/step_NNNN.md (history; diff two to see evolution).
+    Two writes at the same step_idx (e.g. install + REPLAN both before
+    step-0 _pa_predict returns) overwrite that one history file.
 
-      - ``<results_dir>/plan.md`` — always the latest snapshot
-        (overwritten each call). What ``cat plan.md`` and future
-        ``read_plan()`` consumers see.
-
-      - ``<results_dir>/plans/step_NNNN.md`` — historical snapshot,
-        only when ``step_idx`` is provided. Never overwritten across
-        steps; lets you ``diff plans/step_0007.md plans/step_0014.md``
-        to see how the plan evolved.
-
-    If two ``write_plan`` calls happen at the *same* ``step_idx``
-    (rare — e.g. initial install + REPLAN both before _pa_predict
-    returns at step 0), the per-step history file is overwritten.
-    The cumulative plan.md file always reflects the most recent
-    write.
-
-    Atomic because the planner is in the middle of a turn when this
-    fires; a partial-write crash would leave the plan file in a torn
-    state and the next ``read_plan`` would see garbage.
+    Atomic because this fires mid-turn; a torn partial write would make
+    the next read_plan see garbage.
     """
     latest_path = get_plan_path(results_dir)
     if latest_path is None:
@@ -172,10 +131,8 @@ def write_plan(
 
 
 def list_history_steps(results_dir: Optional[str]) -> "list[int]":
-    """Return sorted list of step indices for which a historical
-    snapshot exists under ``<results_dir>/plans/``. Returns empty
-    list if dir is unset or no history exists.
-    """
+    """Sorted step indices with a history snapshot under plans/ (empty
+    if dir unset or no history)."""
     history_dir = get_history_dir(results_dir)
     if history_dir is None or not history_dir.is_dir():
         return []
@@ -203,8 +160,7 @@ _STATE_ICON = {
 
 
 def _outcome_state_icon(outcome: "Outcome", is_focus: bool) -> str:
-    """Icon prefix: ▶ for the currently-focused PENDING outcome, else
-    the per-state icon."""
+    """▶ for the focused PENDING outcome, else the per-state icon."""
     if is_focus and outcome.state == "pending":
         return "▶"
     return _STATE_ICON.get(outcome.state, "?")
@@ -250,22 +206,14 @@ def render_plan_md(
     subgoal_expected_post_states: Optional[List[str]] = None,
     abandoned_subgoals: Optional[List[str]] = None,
 ) -> str:
-    """Render planner state + Outcome DAG + task context as human-readable
-    markdown. Stable shape so ``cat plan.md`` and ``diff turn_N`` are
-    both useful triage tools.
+    """Render planner state + Outcome DAG + task context as markdown.
+    Stable shape so ``cat plan.md`` and ``diff turn_N`` both work for triage.
 
-    Two distinct planner data sources are surfaced:
-
-      - ``ledger.required_outcomes`` (Outcome DAG) — high-level
-        milestones declared by ``init_ledger`` at task start. Usually
-        1-5 entries; the planner drives toward these.
-      - ``subgoal_queue`` + ``current_subgoal`` + ``abandoned_subgoals``
-        (Planner Subgoals) — the per-turn step decomposition the
-        planner emits in its ``<plan>``. These are the actual tactics
-        being attempted to satisfy the outcomes.
-
-    Both matter for triage; previously only the Outcome DAG was
-    rendered (see plan file Part I.3).
+    Surfaces two planner data sources: the Outcome DAG
+    (ledger.required_outcomes — high-level milestones from init_ledger)
+    and Planner Subgoals (subgoal_queue / current_subgoal /
+    abandoned_subgoals — the per-turn <plan> decomposition driving toward
+    them). Both matter; we used to render only the DAG (plan file Part I.3).
     """
     parts: list = []
 
@@ -277,15 +225,13 @@ def render_plan_md(
     parts.append(f"**Task:** {instruction.strip()}")
     parts.append("")
 
-    # Strategy — the one-sentence approach the planner declared in the
-    # head of its most recent ``<plan>``. Helps explain WHY the subgoal
-    # queue looks the way it does.
+    # Strategy: one-sentence approach from the head of the latest <plan>;
+    # explains why the subgoal queue looks the way it does.
     if plan_strategy and plan_strategy.strip():
         parts.append(f"**Strategy:** {plan_strategy.strip()}")
         parts.append("")
 
-    # Planner subgoals — current + upcoming queue + abandoned. The
-    # planner's per-turn decomposition (each REPLAN rewrites this).
+    # Planner subgoals: current + queue + abandoned (rewritten each REPLAN).
     has_subgoals = (
         current_subgoal
         or (subgoal_queue and len(subgoal_queue) > 0)
@@ -303,9 +249,8 @@ def render_plan_md(
             parts.append(f"### · Upcoming queue ({len(subgoal_queue)})")
             for i, sg in enumerate(subgoal_queue, start=1):
                 line = f"  {i}. {sg.strip()}"
-                # Surface the parallel expected_post_state when available,
-                # so triage can spot mismatch between subgoal and what
-                # the planner expected the screen to look like after.
+                # Surface the parallel expected_post_state so triage can
+                # spot subgoal/expectation mismatch.
                 if (subgoal_expected_post_states
                         and i - 1 < len(subgoal_expected_post_states)):
                     eps = (subgoal_expected_post_states[i - 1] or "").strip()
@@ -320,9 +265,8 @@ def render_plan_md(
                 parts.append(f"  {i}. {sg.strip()}")
             parts.append("")
 
-    # Outcome DAG (milestones) — declared at init_ledger time, driven
-    # toward by the subgoal queue above. Order preserved from ledger
-    # (DAG topo order via depends_on).
+    # Outcome DAG (milestones from init_ledger). Order preserved from
+    # ledger (topo order via depends_on).
     parts.append("## Outcomes (milestones from init_ledger)")
     parts.append("")
     if not ledger.required_outcomes:
@@ -333,7 +277,7 @@ def render_plan_md(
             parts.append(_render_outcome(outcome, is_focus))
             parts.append("")
 
-    # Slot snapshot — captured values agent has accumulated.
+    # Captured slots.
     if ledger.slots:
         parts.append("## Captured slots")
         parts.append("")
@@ -342,7 +286,7 @@ def render_plan_md(
             parts.append(f"- `{name}`: {val!r}")
         parts.append("")
 
-    # Failed paths — what's been ruled out.
+    # Dead-end paths already ruled out.
     if ledger.failed_paths:
         parts.append("## Dead-end paths already tried")
         parts.append("")
@@ -353,7 +297,7 @@ def render_plan_md(
             parts.append(f"- [{level}] **{path}** — {why}")
         parts.append("")
 
-    # Counter summary footer — quick at-a-glance state.
+    # Summary footer.
     n_total = len(ledger.required_outcomes)
     n_verified = sum(1 for o in ledger.required_outcomes if o.state == "verified")
     n_reverted = sum(1 for o in ledger.required_outcomes if o.state == "reverted")

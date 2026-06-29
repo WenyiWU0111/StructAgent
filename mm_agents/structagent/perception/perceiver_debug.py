@@ -1,24 +1,19 @@
 """Per-step perceiver debug dumper.
 
-Persists the perceiver's I/O + planner's downstream message construction
-to ``<results_dir>/perceiver_debug/`` for offline inspection. Files
-written per step:
+Persists the perceiver's I/O + planner's downstream message construction to
+``<results_dir>/perceiver_debug/`` for offline inspection. Files per step:
 
-  step_NNN_perceiver_input.json     — subgoal, expected_post_state,
-                                       target outcomes, filtered a11y,
-                                       transition block, screen size
+  step_NNN_perceiver_input.json     — subgoal, expected_post_state, target
+                                       outcomes, filtered a11y, transition, size
   step_NNN_perceiver_screen.png     — full screenshot the perceiver saw
   step_NNN_perceiver_raw.txt        — raw LLM response (reasoning+json)
   step_NNN_perceiver_snapshot.json  — parsed SubgoalSnapshot (no b64)
   step_NNN_perceiver_crop.png       — visual_focus crop image
-  step_NNN_planner_messages.json    — what the planner LLM sees
-                                       (image_url payloads stripped to
-                                       prefixes; text blocks kept full)
+  step_NNN_planner_messages.json    — planner input (image_url stripped to
+                                       prefixes; text kept full)
 
-All functions are graceful-fail: if the dump fails for any reason
-(disk full, permission, etc.) they log a warning and return None
-without raising. Disabling the dumper is as simple as not setting
-``self._results_dir`` on the agent.
+All dumpers graceful-fail (log + return None, never raise). Disable by not
+setting ``self._results_dir`` on the agent.
 
 See docs/PROGRESS_LEDGER_V2_CHANGELOG.md §17.
 """
@@ -53,7 +48,7 @@ def _ensure_dir(results_dir: Optional[str]) -> Optional[str]:
 
 
 def _step_prefix(step_idx: Optional[int]) -> str:
-    """Format the per-step file prefix. Falls back to 'step_xxx' if no idx."""
+    """Per-step file prefix, 1-based. 'step_xxx' if no idx."""
     if step_idx is None:
         return "step_xxx"
     try:
@@ -62,9 +57,7 @@ def _step_prefix(step_idx: Optional[int]) -> str:
         return "step_xxx"
 
 
-# --------------------------------------------------------------------------- #
-# Dumpers — all return None and never raise
-# --------------------------------------------------------------------------- #
+# Dumpers — all return None and never raise.
 
 def dump_perceiver_input(
     *,
@@ -80,12 +73,10 @@ def dump_perceiver_input(
     screen_size: Tuple[int, int],
     screenshot_bytes: Optional[bytes],   # accepted for API stability but not saved
 ) -> None:
-    """Save the perceiver's INPUT context as JSON.
+    """Save the perceiver's input context as JSON.
 
-    The full screenshot is intentionally NOT saved — it's already
-    available via the per-step trajectory artifacts (lib_run_single
-    writes the screenshot to disk per step) and was duplicating ~800KB
-    per step in the perceiver_debug dir for no extra debug value.
+    Screenshot deliberately NOT saved — lib_run_single already writes it per
+    step, so dumping it here just duplicated ~800KB/step for no debug value.
     """
     d = _ensure_dir(results_dir)
     if d is None:
@@ -144,10 +135,8 @@ def dump_perceiver_snapshot(
     snapshot: Optional[Any],
 ) -> None:
     """Save the parsed SubgoalSnapshot as JSON. ``crop_b64`` is stripped
-    from the JSON (cropping is currently disabled — see perceiver._parse_snapshot)
-    and the crop PNG side-file is no longer written; the
-    full screenshot is already saved separately as
-    ``step_NNN_perceiver_screen.png`` in dump_perceiver_input."""
+    (cropping disabled — see perceiver._parse_snapshot); the crop PNG side-file
+    is no longer written."""
     if snapshot is None:
         return
     d = _ensure_dir(results_dir)
@@ -160,8 +149,7 @@ def dump_perceiver_snapshot(
                         "skipping snapshot dump")
             return
         snap_dict = asdict(snapshot)
-        # Strip crop_b64 from the JSON for readability (it's expected to
-        # be empty under current 'no-crop' mode but defensively remove).
+        # Strip crop_b64 for readability (expected empty under no-crop mode).
         vf = snap_dict.get("visual_focus") or {}
         if isinstance(vf, dict):
             vf.pop("crop_b64", None)
@@ -179,15 +167,12 @@ def dump_environment_probe(
     digested: Optional[str],
     useful_file_contents: Optional[str] = None,
 ) -> None:
-    """Persist the once-per-task environment probe + the perceiver
-    digestion of it + (optional) the disk-content probe of files the
-    digestion surfaced. All under ``perceiver_debug/`` so every
-    perceiver-related artifact lives in one place. Files:
+    """Persist the once-per-task environment probe, its perceiver digestion, and
+    (optional) the disk-content probe of files the digestion surfaced. Files:
 
       environment_probe_raw.txt        — full bash probe stdout
       environment_probe_digested.txt   — perceive_environment output
       useful_file_contents.txt         — file_probes.probe_useful_files
-                                          (sheets + docs + dirs)
     """
     d = _ensure_dir(results_dir)
     if d is None:
@@ -221,9 +206,8 @@ def dump_planner_messages(
     step_idx: Optional[int],
     messages: Sequence[Dict[str, Any]],
 ) -> None:
-    """Save the planner's input messages with image_url payloads stripped
-    (just the data-URL prefix preserved). Text blocks are kept verbatim
-    so the planner's full prompt is inspectable."""
+    """Save the planner's input messages with image_url payloads stripped to the
+    data-URL prefix; text blocks kept verbatim for inspection."""
     d = _ensure_dir(results_dir)
     if d is None:
         return

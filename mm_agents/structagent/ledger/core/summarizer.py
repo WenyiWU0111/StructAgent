@@ -1,27 +1,18 @@
 """Ledger summarizer: one LLM call per subgoal boundary.
 
-Fires when the agent finishes (or abandons) a subgoal. Consumes the
-*whole sequence* of screenshots + actions accumulated during that
-subgoal unit, together with the previous ledger, and emits a JSON patch:
+Fires when the agent finishes or abandons a subgoal. Consumes the whole
+screenshot+action sequence for that subgoal plus the prior ledger, and emits a
+JSON patch ({done_add, failed_add}) applied via ledger.add_done /
+add_failed_path.
 
-  { "done_add":   [{"outcome_id": ..., "evidence": ...}, ...],
-    "failed_add": [{"path": ..., "why": ...}, ...] }
+Kept separate from the planner to prevent "narrative drift": facts observed
+here are frozen before the planner's next call reads them, so the planner can't
+silently swap an observed value for its desired target.
 
-The patch is applied to the ledger via ``ledger.add_done`` /
-``ledger.add_failed_path``; nothing else mutates the ledger. The reason
-this is a separate LLM call from the planner is exactly to prevent the
-observed "narrative drift" phenomenon: observed facts produced here are
-frozen before the planner's next call reads them, so the planner cannot
-silently replace an observed value with its desired target inside its
-own response body.
-
-Model routing note: when the caller passes a ``vllm_qwen35-vl``-style
-alias and uses the planner's ``self.call_llm``, the underlying
-``_call_llm_vllm`` already disables qwen3.5 thinking mode via
-``chat_template_kwargs={"enable_thinking": False}``. Callers using a
-different LLM path should make sure thinking is disabled themselves, or
-the summarizer may burn all tokens on reasoning and return empty
-``content``.
+Model routing: when the caller uses the planner's ``self.call_llm`` with a
+``vllm_qwen35-vl``-style alias, ``_call_llm_vllm`` already disables qwen3.5
+thinking. Other LLM paths must disable it themselves, else the summarizer burns
+all tokens reasoning and returns empty ``content``.
 """
 from __future__ import annotations
 import base64
@@ -39,17 +30,15 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Observable delta — hard-tier signal over the firing window
 # --------------------------------------------------------------------------- #
-# These are computed deterministically from env-reported state (URL + a11y
-# tree) before the summarizer LLM runs, and injected into its prompt as
-# objective facts. The LLM reasons FROM the delta, not from freely reading
-# screenshots. This is the "soft tier + hard tier" architecture from the
-# proprioception_layer paper frame: observation and belief disentangled.
+# Computed deterministically from env state (URL + a11y tree) before the LLM
+# runs, and injected as objective facts so the LLM reasons FROM the delta
+# rather than freely reading screenshots ("soft + hard tier", observation vs
+# belief disentangled).
 
 @dataclass
 class WindowDelta:
-    """Machine-computed delta between window-start and window-end state.
-    Feeds into the summarizer prompt as objective ground truth.
-    """
+    """Machine-computed delta between window-start and window-end state, fed to
+    the summarizer prompt as ground truth."""
     url_before: Optional[str]
     url_after: Optional[str]
     url_changed: bool
@@ -65,8 +54,7 @@ class WindowDelta:
                 and not self.state_flips)
 
     def to_prompt_block(self, max_items: int = 12) -> str:
-        """Compact, LLM-readable rendering. Caps each list at ``max_items``
-        to keep the prompt bounded."""
+        """Compact LLM-readable rendering; each list capped at ``max_items``."""
         parts = ["[Observable Delta — computed from env, not from your interpretation]"]
         if self.url_before is None and self.url_after is None:
             parts.append("  URL:            (unknown / not tracked)")
@@ -113,11 +101,9 @@ class WindowDelta:
         return "\n".join(parts)
 
 
-# Tags considered "interactive" for the purposes of diff filtering.
-# Tag names come from AT-SPI / pyatspi (Ubuntu linearized a11y output);
-# verified by inspecting trajectory.html a11y dumps. We also include a
-# few synonyms from other backends (e.g. ATK vs IAccessible2) so the
-# same code works across platforms without reconfiguration.
+# Tags kept by the diff filter. Names from AT-SPI/pyatspi (Ubuntu linearized
+# a11y); a few synonyms from other backends (ATK vs IAccessible2) so the same
+# code works cross-platform.
 _INTERACTIVE_TAGS: Set[str] = {
     # main set (AT-SPI on Ubuntu, which is what our linearize emits)
     "push-button", "toggle-button", "check-box", "radio-button",
@@ -132,10 +118,8 @@ _INTERACTIVE_TAGS: Set[str] = {
 def _parse_a11y_lines(a11y_text: Optional[str]) -> Dict[Tuple[str, str], str]:
     """Parse a tab-separated a11y dump into ``{(tag, text): state}``.
 
-    Keeps only rows whose ``tag`` is in ``_INTERACTIVE_TAGS`` so the diff
-    reflects clickable/inputable UI changes, not layout noise. Anonymous
-    rows (empty text) are kept but keyed by tag alone so multiple empty
-    buttons don't collapse to one.
+    Keeps only ``_INTERACTIVE_TAGS`` rows so the diff reflects clickable UI
+    changes, not layout noise.
     """
     out: Dict[Tuple[str, str], str] = {}
     if not a11y_text:
@@ -150,8 +134,7 @@ def _parse_a11y_lines(a11y_text: Optional[str]) -> Dict[Tuple[str, str], str]:
         if tag not in _INTERACTIVE_TAGS:
             continue
         key = (tag, txt)
-        # Collision handling: if tag+text already present with a different
-        # state, keep the last one (best-effort; a11y can have duplicates).
+        # Duplicate tag+text: keep the last state (best-effort).
         out[key] = st
     return out
 
@@ -163,16 +146,13 @@ def compute_window_delta(
     a11y_before: Optional[str],
     a11y_after: Optional[str],
 ) -> WindowDelta:
-    """Compute a deterministic delta between two observation snapshots.
-    Pure function, no LLM.
+    """Deterministic delta between two observation snapshots (pure, no LLM).
 
-    Treats (tag, text) as element identity; ``state`` is the value for
-    flip detection. Missing before/after a11y yields an empty diff
-    (not a false-signal).
+    Element identity is (tag, text); ``state`` drives flip detection. Missing
+    before/after a11y yields an empty diff, not a false signal.
     """
     url_changed = bool(url_before) and bool(url_after) and url_before != url_after
-    # If one side is None (a11y unavailable), we can't honestly diff —
-    # leave node-lists empty so the LLM is not misled.
+    # One side missing → can't honestly diff; leave node-lists empty.
     if not a11y_before or not a11y_after:
         return WindowDelta(
             url_before=url_before, url_after=url_after,
@@ -302,18 +282,15 @@ def update_ledger(
     window_delta: Optional[WindowDelta] = None,
     timeline_window: Optional[List[Any]] = None,   # List[TimelineEvent]
 ) -> ProgressLedger:
-    """Apply one summarizer pass to the ledger. Returns the same ledger
-    (mutated in-place for convenience; also returned so callers can chain).
+    """Apply one summarizer pass; mutate and return the ledger.
 
-    The caller is expected to fire this ONLY at a subgoal boundary. See
-    the plan for boundary definitions. If the segment is empty (no
-    screenshots and no actions), this call is a no-op.
+    Fire only at a subgoal boundary. No-op on an empty segment (no screenshots
+    and no actions).
     """
     if not subgoal_screenshots and not subgoal_actions:
         return ledger
 
-    # Nothing to do if we have no outcomes defined — the ledger is just
-    # initial_context in that degenerate case.
+    # No outcomes defined → ledger is just initial_context; nothing to do.
     if not ledger.required_outcomes:
         return ledger
 
@@ -368,21 +345,13 @@ _MAX_ACTIONS = 12
 
 
 def _summarize_timeline_signals(timeline_window: List[Any]) -> str:
-    """Derive a compact ``[Timeline signals]`` block from the recent
-    TimelineEvent list. Pure-Python aggregation — no LLM. Intended as
-    a structured input to the failed-path summarizer.
-
-    Provides counts that strongly indicate strategic dead-ends:
-      • how many actor steps in this window
-      • how many outcome_satisfied / outcome_invalidated KeyNodes
-      • subgoal recurrence (same text across multiple events with
-        outcome=abandoned_replan → likely loop)
-      • event-outcome distribution (committed / abandoned / ongoing)
+    """Compact ``[Timeline signals]`` block from the recent TimelineEvent list
+    (pure aggregation, no LLM). Counts that flag strategic dead-ends: steps,
+    satisfied/invalidated KeyNodes, subgoal recurrence, event-outcome dist.
     """
     if not timeline_window:
         return ""
-    # Avoid hard import dependency on timeline at module level (tests
-    # may stub TimelineEvent); use duck-typed access.
+    # Duck-typed access; no module-level timeline import (tests stub TimelineEvent).
     from collections import Counter
 
     n_events = len(timeline_window)
@@ -461,7 +430,7 @@ def _build_messages(
         except Exception as e:
             logger.warning("[LedgerSum] failed to encode screenshot: %s", e)
 
-    # Ledger snapshot (pre-update) so summarizer sees what's already done
+    # Pre-update ledger snapshot so the summarizer sees what's already done.
     text_parts: List[str] = [
         "Current ledger (before this update):",
         ledger.to_prompt_block(),
@@ -481,18 +450,12 @@ def _build_messages(
     else:
         text_parts.append("    (none recorded)")
 
-    # Hard-tier signal: machine-computed delta over this window. This is
-    # the authoritative "what changed" fact sheet the LLM must reason
-    # from in Step 1 of the procedural reasoning below.
+    # Hard-tier signal: the authoritative "what changed" fact sheet.
     if window_delta is not None:
         text_parts.append("")
         text_parts.append(window_delta.to_prompt_block())
 
-    # Structured timeline signals — derived from the agent's event
-    # timeline + KeyNode detector. Tells the failed-path summarizer
-    # things like "0 outcomes satisfied across N actions" or "subgoal
-    # X attempted in 3 separate events all REPLAN'd" — strong evidence
-    # of strategic dead-end without re-interpreting screenshots.
+    # Structured timeline signals (dead-end evidence without re-reading frames).
     if timeline_signals:
         text_parts.append("")
         text_parts.append(timeline_signals)
@@ -518,9 +481,8 @@ def _build_messages(
 
 
 def _select_images(imgs: List[bytes], cap: int) -> List[bytes]:
-    """Pick up to ``cap`` images preserving chronological order. Prefer the
-    first frame (before the attempt) and the last few (after). If there
-    are more than ``cap`` frames, keep 1 early + last ``cap-1``."""
+    """Up to ``cap`` images in chronological order. When over cap, keep the
+    first frame (before) + the last ``cap-1`` (after)."""
     if not imgs:
         return []
     if len(imgs) <= cap:
@@ -536,8 +498,7 @@ def _parse_patch_json(raw: str) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
     s = raw.strip()
-    # Prefer <patch>...</patch> body if present (Phase-3 reasoning-first
-    # output format). Falls back to the whole string for legacy outputs.
+    # Prefer the <patch>...</patch> body (reasoning-first format); else whole string.
     m = re.search(r"<patch>\s*([\s\S]*?)\s*</patch>", s, re.IGNORECASE)
     if m:
         s = m.group(1).strip()
@@ -570,19 +531,10 @@ def _apply_patch(
     step_idx: int,
     subgoal_text: str,
 ) -> Tuple[int, int]:
-    """Apply a v2 summarizer patch. Both ``done_add`` AND ``failed_add``
-    are now IGNORED — outcome state is owned by the KeyNode detector,
-    and dead-end paths are owned by the new write sources:
-
-      - heuristic triggers: REPLAN cadence (rule #6), KeyNode
-        invalidation causality (planned), same-coord stuck (planned)
-      - planner-driven: ``<dead_end_review>`` with the ref:N protocol,
-        merged via ``ledger.merge_planner_review`` after each planner
-        call.
-
-    The summarizer's free-form ``failed_add`` was producing low-signal,
-    duplicate-prone entries that confused the planner; removing it
-    leaves only deterministic + planner-vetted dead-ends in the ledger.
+    """v2: both ``done_add`` and ``failed_add`` are IGNORED. Outcome state is
+    owned by the KeyNode detector; dead-ends come from REPLAN cadence + the
+    planner's ``<dead_end_review>`` (merge_planner_review). The summarizer's
+    free-form failed_add was low-signal and duplicate-prone.
 
     Returns ``(0, 0)`` for caller signature compatibility."""
     if patch.get("done_add"):

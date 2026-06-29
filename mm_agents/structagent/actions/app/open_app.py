@@ -1,26 +1,15 @@
 """``open_app`` action — deterministic "ensure an app is open and focused".
 
-The planner-actor agent moves between applications constantly on
-multi-app tasks. Doing that through the GUI (clicking the dock,
-Alt+Tab, hunting for a window behind another) is the single largest
-source of churn in multi-app trajectories — the actor lands in the
-wrong window, the window is occluded, focus does not stick.
+Switching apps through the GUI (dock clicks, Alt+Tab, hunting for an
+occluded window) is the biggest source of churn on multi-app tasks: the
+actor lands in the wrong window or focus doesn't stick. ``open_app``
+collapses "switch to / launch app X (optionally with file Y)" into one
+action: activate+raise an existing window (``wmctrl -ia``), else launch,
+wait for the window, then activate. Idempotent.
 
-``open_app`` collapses "switch to / launch app X (optionally with
-file Y)" into ONE deterministic action:
-
-  * if a window for the app already exists → activate + raise it
-    (``wmctrl -ia``);
-  * otherwise → launch the app (with the file if given), wait for
-    its window, then activate it.
-
-It is idempotent: calling it when the app is already foreground just
-re-activates the same window.
-
-The action builds a self-contained Python script that runs on the VM
-(via the same ``execute_python_command`` path as ``cli_run``) and
-persists its result to ``/tmp/_last_cli_run.json`` so the planner
-sees, on its next turn, which window was activated / launched.
+Builds a self-contained VM-side script (same ``execute_python_command``
+path as ``cli_run``) and persists its result to ``/tmp/_last_cli_run.json``
+so the planner sees which window was activated/launched next turn.
 """
 from __future__ import annotations
 
@@ -28,10 +17,9 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 # app id  →  (window-title hint substrings, launch argv).
-# The title hint matches against ``wmctrl -l`` output (case-insensitive).
-# LibreOffice runs as ONE process for all documents, so Calc / Writer /
-# Impress are told apart by the window TITLE ("... - LibreOffice Calc"),
-# not the process / WM_CLASS.
+# Hints match ``wmctrl -l`` output case-insensitively. LibreOffice is ONE
+# process for all docs, so Calc/Writer/Impress are told apart by window
+# title ("... - LibreOffice Calc"), not process / WM_CLASS.
 _APP_SPECS: Dict[str, Tuple[List[str], List[str]]] = {
     "libreoffice_writer":  (["LibreOffice Writer"],  ["soffice", "--writer"]),
     "libreoffice_calc":    (["LibreOffice Calc"],    ["soffice", "--calc"]),
@@ -41,8 +29,8 @@ _APP_SPECS: Dict[str, Tuple[List[str], List[str]]] = {
     "os":                  (["Terminal"],            ["x-terminal-emulator"]),
 }
 
-# Caller-facing aliases (keys are underscore-normalized) — OSWorld
-# task metadata and the planner are inconsistent about app labels.
+# Caller-facing aliases (underscore-normalized keys) — task metadata and
+# the planner are inconsistent about app labels.
 _APP_ALIASES: Dict[str, str] = {
     "writer": "libreoffice_writer",
     "calc": "libreoffice_calc",
@@ -56,8 +44,7 @@ _APP_ALIASES: Dict[str, str] = {
 
 
 def normalize_app(app: Optional[str]) -> Optional[str]:
-    """Map a caller's app label to a canonical ``_APP_SPECS`` key, or
-    None when it does not resolve."""
+    """App label → canonical ``_APP_SPECS`` key, or None if unresolved."""
     if not app or not str(app).strip():
         return None
     key = str(app).strip().lower().replace("-", "_").replace(" ", "_")
@@ -66,7 +53,7 @@ def normalize_app(app: Optional[str]) -> Optional[str]:
     return _APP_ALIASES.get(key)
 
 
-# file extension → the app that owns it.
+# file extension → owning app.
 _EXT_TO_APP: Dict[str, str] = {
     ".docx": "libreoffice_writer", ".doc": "libreoffice_writer",
     ".odt": "libreoffice_writer", ".rtf": "libreoffice_writer",
@@ -78,7 +65,7 @@ _EXT_TO_APP: Dict[str, str] = {
 
 
 def app_for_file(path: Optional[str]) -> Optional[str]:
-    """Canonical app id that owns ``path`` by its extension, or None."""
+    """Canonical app id owning ``path`` by extension, or None."""
     if not path:
         return None
     import os
@@ -91,15 +78,13 @@ _PROBE_MARKER = "INITIAL_FILES:"
 
 
 def build_initial_files_probe_script() -> str:
-    """Return a VM-side Python script that OBSERVES which document
-    files are open at task start, and prints ``INITIAL_FILES:<json>``
-    where the json is ``{app_id: file_path}``.
+    """VM-side script printing ``INITIAL_FILES:<json>`` ({app_id: path}) for
+    documents open at task start.
 
-    This is a legitimate environment observation — it inspects the
-    running ``soffice`` process, NOT the task spec. LibreOffice creates
-    a ``.~lock.<name>#`` lock file next to every open document; that
-    lock file (visible via ``lsof`` on the soffice process) reveals the
-    document's real path. Direct document file handles are read too.
+    Observes the environment (running ``soffice`` process), not the task
+    spec. LibreOffice writes a ``.~lock.<name>#`` file next to each open
+    doc; that lock (visible via ``lsof``) reveals the real path. Direct
+    document file handles are read too.
     """
     ext_map = repr(_EXT_TO_APP)
     return f'''import subprocess, json, os
@@ -139,8 +124,8 @@ print("{_PROBE_MARKER}" + json.dumps(_result))
 
 
 def parse_initial_files_probe(output: Optional[str]) -> Dict[str, str]:
-    """Parse the ``INITIAL_FILES:<json>`` line from the probe's stdout
-    into ``{app_id: file_path}``. Returns ``{}`` on any failure."""
+    """Parse the probe's ``INITIAL_FILES:<json>`` line into
+    ``{app_id: file_path}``. ``{}`` on failure."""
     if not output:
         return {}
     for line in str(output).splitlines():
@@ -162,14 +147,10 @@ def build_open_app_script(
     *,
     logger: Optional[Any] = None,
 ) -> Optional[str]:
-    """Return the VM-side Python script for an ``open_app`` action.
+    """VM-side script for an ``open_app`` action.
 
-    ``app``        — canonical id or alias (see ``_APP_SPECS`` /
-                     ``_APP_ALIASES``).
-    ``file_path``  — optional file to open in that app. ``~`` is
-                     expanded on the VM.
-
-    Returns None on an unresolvable app (caller logs + drops the action).
+    ``app``: canonical id or alias. ``file_path``: optional file to open
+    (``~`` expanded on the VM). None on unresolvable app (caller drops it).
     """
     canon = normalize_app(app)
     if canon is None:
@@ -180,10 +161,9 @@ def build_open_app_script(
     title_hints, launch = _APP_SPECS[canon]
     fp = (str(file_path).strip() or None) if file_path else None
 
-    # repr() — NOT json.dumps() — for embedding as Python literals:
-    # json.dumps(None) is "null" (a NameError when exec'd), and
-    # json.dumps(True/False) is "true"/"false". repr() always yields a
-    # valid Python literal for str / list / None.
+    # repr(), NOT json.dumps(): json.dumps(None)="null" (NameError when
+    # exec'd), json.dumps(True)="true". repr() yields a valid Python
+    # literal for str / list / None.
     app_repr = repr(canon)
     hints_repr = repr(title_hints)
     launch_repr = repr(launch)

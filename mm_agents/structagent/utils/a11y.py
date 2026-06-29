@@ -1,9 +1,5 @@
-"""Accessibility-tree helpers used across the agent.
-
-Two functions: pull the active tab URL from a linearized a11y string,
-and linearize the raw a11y tree carried on ``obs``. Kept as plain
-module-level functions because they have no agent state.
-"""
+"""Accessibility-tree helpers: extract the active tab URL and linearize
+the raw a11y tree carried on ``obs``."""
 
 import logging
 import re
@@ -14,17 +10,12 @@ _logger = logging.getLogger(__name__)
 
 
 def extract_active_url_from_a11y(a11y_text: Optional[str]) -> Optional[str]:
-    """Best-effort: pull the active tab URL from a linearized a11y tree.
+    """Pull the active tab URL from a linearized a11y tree, or None.
 
-    Handles two row patterns Chrome's a11y produces:
-
-      1. ``entry\\thttps://...\\tenabled`` — address bar text IS the URL
-         (older Chrome / some configurations)
-      2. ``entry\\tAddress and search bar (https://...)\\tenabled``
-         — ATSPI labels the entry and includes the URL in parens
-         (current Chromium on Ubuntu)
-
-    Returns None if neither pattern matches.
+    Handles two Chrome a11y row patterns:
+      1. ``entry\\thttps://...\\tenabled`` — text is the URL (older Chrome).
+      2. ``entry\\tAddress and search bar (https://...)\\tenabled`` — URL
+         in parens (current Chromium on Ubuntu).
     """
     if not a11y_text:
         return None
@@ -51,11 +42,9 @@ def extract_active_url_from_a11y(a11y_text: Optional[str]) -> Optional[str]:
 
 
 def linearize_obs_a11y(obs: Optional[Dict[str, Any]], max_items: int = 300) -> Optional[str]:
-    """Best-effort: extract raw a11y XML from obs, linearize to tab-separated
-    ``tag \\t text \\t state`` rows, trim to ``max_items``.
-
-    Returns None if no tree is available or processing fails — callers
-    should treat that as 'tree unavailable' and fall back to pure visual.
+    """Linearize obs's a11y XML to tab-separated ``tag \\t text \\t state``
+    rows, trimmed to ``max_items``. None if unavailable — callers should
+    fall back to pure visual.
     """
     if not obs:
         return None

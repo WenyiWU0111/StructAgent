@@ -1,15 +1,12 @@
-"""Planner: build prompts, call LLM, parse the planner contract.
+"""Planner: build prompts, call the LLM, parse the planner contract.
 
-Methods folded into ``StructAgent`` via inheritance. They access
-``self.model`` / ``self.actor_history`` / ``self.subgoal_queue`` /
-``self.timeline`` / ``self.ledger`` / ``self._notebook`` on the composed
-instance.
+Mixed into ``StructAgent`` via inheritance; methods reach ``self.model`` /
+``self.actor_history`` / ``self.subgoal_queue`` / ``self.timeline`` /
+``self.ledger`` / ``self._notebook`` on the composed instance.
 
-Includes:
-  * instruction augmentation (resolve dates, append [Task Requirements])
-  * initial-plan / subgoal-check / progress-check / force-replan prompt builders
-  * the planner LLM call orchestrator with retry + re-author logic
-  * response parsers (planner-contract XML + plan-into-subgoals)
+Covers instruction augmentation, the initial-plan / subgoal-check /
+progress-check / force-replan prompt builders, the LLM-call orchestrator
+(retry + re-author), and the response parsers.
 """
 
 import base64
@@ -30,33 +27,23 @@ logger = logging.getLogger("desktopenv.qwen25vl_agent_planner")
 # ---------------------------------------------------------------------------
 # LAYERED PROMPT ARCHITECTURE
 #
-# The progress_check / force_replan planner prompt is assembled as 5
-# topically scoped LAYERS instead of a flat list of overlapping blocks.
-# Each FACT has ONE owner LAYER; sibling LAYERs reference the owner
-# rather than restating. When two LAYERs would disagree (e.g. Required
-# Outcomes says "verified" but the subgoal queue is non-empty), the
-# CONFLICT RESOLUTION table in LAYER 5 names the winner.
+# progress_check / force_replan prompts are assembled as 5 topically
+# scoped LAYERS, not a flat list of overlapping blocks. Each fact has ONE
+# owner LAYER; siblings reference the owner rather than restate. When two
+# LAYERS disagree, the CONFLICT RESOLUTION table in LAYER 5 picks the winner.
 #
-#   LAYER 1  Task constraint        — instruction + initial context +
-#                                     [Required Outcomes] (what success
-#                                     looks like)
-#   LAYER 2  Strategy history       — past abandoned strategies +
-#                                     [Failed paths] / dead-end patterns
-#                                     (what NOT to repeat)
-#   LAYER 3  Subgoal state          — current plan steps + which subgoal
-#                                     is active + queue + abandoned +
-#                                     working-memory Facts (where you
-#                                     are in the plan)
-#   LAYER 4  This turn's evidence   — K screenshots + perceiver SCREEN
-#                                     SNAPSHOT (or a11y delta) + recent
-#                                     actor actions + last cli_run +
-#                                     stuck signals
-#   LAYER 5  Decision contract      — assessment + decision rubric +
-#                                     output format + CONFLICT
-#                                     RESOLUTION table
+#   LAYER 1  Task constraint    — instruction + initial context + Required
+#                                 Outcomes (what success looks like)
+#   LAYER 2  Strategy history   — abandoned strategies + dead-end patterns
+#   LAYER 3  Subgoal state      — plan steps + active subgoal + queue +
+#                                 abandoned + working-memory Facts
+#   LAYER 4  Turn evidence      — K screenshots + perceiver snapshot (or
+#                                 a11y delta) + recent actions + last cli_run
+#   LAYER 5  Decision contract  — assessment + rubric + output format +
+#                                 CONFLICT RESOLUTION table
 #
-# The LAYER guide below is concatenated onto the SYSTEM prompt so the
-# planner reads the structure before any user message arrives.
+# The guide below is appended to the SYSTEM prompt so the planner sees the
+# structure before any user message.
 # ---------------------------------------------------------------------------
 
 _LAYERED_PROMPT_GUIDE = """\
@@ -91,9 +78,8 @@ queue is non-empty), the CONFLICT RESOLUTION table at the bottom of
 LAYER 5 names which wins. Read that table before emitting <decision>."""
 
 
-# Conflict-resolution table appended to LAYER 5. Kept as a constant so
-# additions ride with code review rather than getting embedded in a
-# prompt-building f-string with the rest of the contract.
+# Conflict-resolution table appended to LAYER 5. A standalone constant so
+# edits show up in code review instead of buried in a prompt f-string.
 _CONFLICT_RESOLUTION_TABLE = """\
 CONFLICT RESOLUTION — when two LAYERS disagree, the rule below picks
 the winner. Apply these BEFORE emitting <decision>.
@@ -132,11 +118,10 @@ class Planner:
     def _pa_augment_instruction(self, instruction: str) -> str:
         """Resolve relative dates and append a [Task Requirements] block.
 
-        Called once per task at the top of `_pa_predict` — before ledger
-        init — so both the ledger initializer and the initial planner
-        prompt observe the same enriched instruction (e.g. a task that
-        said "New York" gains a `destination: NYC` line the ledger can
-        cite as the evidence-bearing target).
+        Runs once per task at the top of `_pa_predict`, before ledger init,
+        so the ledger initializer and the initial plan see the same enriched
+        instruction (e.g. "New York" gains a `destination: NYC` line the
+        ledger can cite as the target).
         """
         from mm_agents.structagent.utils.helpers import resolve_relative_dates, extract_task_fields
 
@@ -158,8 +143,7 @@ class Planner:
         self, instruction: str,
         retrieved_knowledge: Optional[str] = None,
     ) -> str:
-        # Instruction is already augmented (date resolution + task_fields)
-        # by `_pa_augment_instruction`, called upstream in `_pa_predict`.
+        # Instruction already augmented by `_pa_augment_instruction` upstream.
         self.instruction = instruction
         from mm_agents.structagent.core.planner.prompts import _plan_format_block, _plan_quality_rules
         teacher_demo_block = self._init_plan_teacher_demo_block(instruction)
@@ -168,23 +152,15 @@ class Planner:
         planner_memory_block = self._init_plan_memory_block(instruction)
         rule_3c = self._init_plan_rule_3c()
 
-        # Synthesized-tool hint: same env-gating as the decomposer
-        # injection in actor.py. We split the hint into two pieces:
-        #
-        #   - synth_priority_block: a HIGH-PRIORITY block rendered ABOVE
-        #     the retrieved-experience blocks (L2 plan templates + L1
-        #     subgoal memory). Past trajectories were all GUI flows, so
-        #     when a synth tool exists the retrieved memory anchors the
-        #     planner on the multi-step click recipe — we need to break
-        #     that anchor BEFORE the planner reads the GUI plans.
-        #
-        #   - rule_3d: a one-liner stub inside the rule list, just so
-        #     the actor's-tools enumeration stays internally consistent
-        #     ("(a) GUI / (b) cli_run / (c) <domain>_* / (d) synth").
-        #
-        # Implemented per [[feedback-no-task-specifics-in-shared-prompts]]:
-        # only abstract tool names + abstract when_to_use go in here —
-        # no per-task literal values that would leak the eval answer.
+        # Synthesized-tool hint, in two parts:
+        #   - synth_priority_block: rendered ABOVE the retrieved-experience
+        #     blocks. Past trajectories were all GUI flows, so when a synth
+        #     tool exists we must break the retrieved memory's anchor on the
+        #     click recipe BEFORE the planner reads the GUI plans.
+        #   - rule_3d: a one-line stub so the tool enumeration stays
+        #     consistent ("(a) GUI / (b) cli_run / (c) <domain>_* / (d) synth").
+        # Per [[feedback-no-task-specifics-in-shared-prompts]]: abstract tool
+        # names + when_to_use only — no per-task literals that leak the answer.
         synth_priority_block = ""
         rule_3d = ""
 
@@ -216,10 +192,10 @@ Output format — use this exact XML. Every <step> MUST have BOTH <text> and <ex
 {_plan_format_block(domain=getattr(self, "_current_domain", None))}
 ...
 </plan>"""
-        # Text-answer tasks (WebVoyager / Mind2Web / MMInA): the
-        # ONLY verifiable artifact is the agent's final textual answer
-        # plus what's on screen. The planner must end its plan with a
-        # finished(answer="...") sentinel so the runner can score.
+        # Text-answer tasks (WebVoyager / Mind2Web / MMInA): the only
+        # verifiable artifact is the final textual answer plus what's on
+        # screen, so the plan must end with a finished(answer="...") sentinel
+        # the runner can score.
         if self._is_text_answer_task or self._is_mmina_task:
             prompt += """
 
@@ -267,9 +243,9 @@ decomposer doesn't waste turns trying to click around."""
     def _init_plan_teacher_demo_block(self, instruction):
         """Teacher-demo injection block.
 
-        This was an offline-training-only feature (few-shot teacher demos
-        mined from rollouts) and is not part of the released agent. It is
-        kept as a no-op so the planner prompt template stays stable.
+        Offline-training-only feature (few-shot demos mined from rollouts),
+        not part of the released agent. No-op kept to keep the prompt
+        template stable.
         """
         return ""
 
@@ -289,24 +265,20 @@ decomposer doesn't waste turns trying to click around."""
 
     def _init_plan_domain_block(self):
         """Per-domain knowledge + data-layout scaffold + live doc structure."""
-        # Domain-specific knowledge (injected ONLY when current task's
-        # domain has a knowledge file under mm_agents/domain_knowledge/).
-        # No bleed across domains. Source: <domain>.md — high-level
-        # framing of the whole domain, always injected when the file
-        # exists. (Per-operation UNO snippet retrieval was retired —
-        # all three LibreOffice domains now route through the
-        # structured calc_* / impress_* / writer_* action catalogues,
-        # whose schema rides in the action-schema block instead.)
+        # Domain knowledge from <domain>.md, injected only when the current
+        # domain has a file under mm_agents/domain_knowledge/. No cross-domain
+        # bleed. (Per-operation UNO snippet retrieval retired — the three
+        # LibreOffice domains now route through the calc_* / impress_* /
+        # writer_* action catalogues, whose schema rides in the action block.)
         domain_block = ""
         try:
             from mm_agents.structagent.domain import get_domain_knowledge
             cur_domain = getattr(self, "_current_domain", None)
             parts = []
             if self._is_multi_app():
-                # Multi-app: the INITIAL plan covers the whole cross-app
-                # task. Tell the planner it is multi-app + which apps,
-                # and give every related app's knowledge (each headed).
-                # Per-step prompts later narrow to the current app.
+                # Multi-app: the initial plan covers the whole cross-app task,
+                # so flag it as multi-app, name the apps, and give every
+                # related app's knowledge. Per-step prompts narrow later.
                 parts.append(
                     "\nMULTI-APP TASK — this task spans these "
                     f"applications: {self._related_apps}. Plan it as "
@@ -341,23 +313,16 @@ decomposer doesn't waste turns trying to click around."""
                         f"(applies only to this task's domain — use this "
                         f"when planning):\n{dk}\n"
                     )
-            # Phase B: structured Q1-Q4 data_layout reasoning slot for
-            # Calc. Forces the planner to answer row-semantics / task-
-            # pattern / output-target / lookup-spec BEFORE writing
-            # <strategy> / <step>s, so the subgoal text speaks the
-            # calc_* vocabulary (e.g. "Use calc_fill_column on F10:F23
-            # with template ...") instead of GUI shape ("click F10,
-            # type formula, drag fill handle"). The actor's translation
-            # is then a one-shot JSON construction.
-            # MULTI-APP: the initial plan covers the WHOLE cross-app
-            # task, but ``cur_domain`` is only related_apps[0]. Gating
-            # the calc/impress data_layout scaffold on
-            # ``cur_domain == "libreoffice_calc"`` therefore SKIPPED it
-            # whenever the task's first app isn't calc — so the planner
-            # decomposed the Calc phase into GUI-shape subgoals ("click
-            # cell A1") instead of calc_* vocabulary. Inject the
-            # scaffold for EVERY office app the task spans. Single-app:
-            # ``_dl_apps == {cur_domain}`` → byte-identical to before.
+            # Phase B: Q1-Q4 data_layout reasoning slot for Calc. Forces the
+            # planner to settle row-semantics / task-pattern / output-target /
+            # lookup-spec BEFORE writing <strategy>/<step>, so subgoals speak
+            # calc_* vocabulary ("calc_fill_column on F10:F23 ...") not GUI
+            # shape ("click F10, type formula, drag fill handle").
+            # Multi-app: ``cur_domain`` is only related_apps[0], so gating on
+            # ``cur_domain == "libreoffice_calc"`` skipped the scaffold when
+            # the first app wasn't Calc and the Calc phase regressed to
+            # GUI-shape subgoals. Inject for EVERY office app the task spans.
+            # Single-app: ``_dl_apps == {cur_domain}`` → byte-identical.
             _dl_apps = {
                 (a or "").lower()
                 for a in (self._related_apps if self._is_multi_app()
@@ -382,12 +347,11 @@ decomposer doesn't waste turns trying to click around."""
                     if logger:
                         logger.info("[PA-Planner] impress data_layout_planner_block "
                                     "load failed: %s", e)
-            # DocPerceiver block — the framework-side UNO probe's
-            # rendered structure (paragraph list with style/font/etc +
-            # tables + view-cursor). Refreshed at task start and after
-            # every structured-action mutation. Lets the planner pick concrete
-            # paragraph indices for ops like text_to_table / line_spacing
-            # instead of having the actor guess from a screenshot.
+            # DocPerceiver block — the UNO probe's rendered structure
+            # (paragraphs with style/font + tables + view-cursor), refreshed
+            # at task start and after each structured-action mutation. Lets the
+            # planner pick concrete paragraph indices for text_to_table /
+            # line_spacing instead of the actor guessing from a screenshot.
             doc_block = getattr(self, "_doc_inspect_block", None)
             if doc_block:
                 parts.append(
@@ -419,13 +383,10 @@ decomposer doesn't waste turns trying to click around."""
 
     def _init_plan_memory_block(self, instruction):
         """L2 planner-experience memory block (ENABLE_PLANNER_EXPERIENCE_MEMORY)."""
-        # Planner experience memory (L2 task-level skills) — gated on
-        # ENABLE_PLANNER_EXPERIENCE_MEMORY. Retrieves past successful
-        # plan templates whose when_to_use matches this task, renders a
-        # block to splice into the initial-plan prompt. Render layer
-        # returns ("", meta_with_OOD_mode) on miss → safe no-op.
-        # Also dumps block+meta to <results_dir>/planner_memory_debug/
-        # for post-hoc forensics.
+        # L2 task-level skills. Retrieves past successful plan templates whose
+        # when_to_use matches this task and renders a block for the initial
+        # plan. Render layer returns ("", meta) on miss → safe no-op. Also
+        # dumps block+meta to <results_dir>/planner_memory_debug/.
         planner_memory_block = ""
         from mm_agents.structagent.config import CAConfig
         if CAConfig.from_env().planner_experience_memory:
@@ -470,10 +431,8 @@ decomposer doesn't waste turns trying to click around."""
 
     def _init_plan_rule_3c(self):
         """Domain-aware canonical structured-action rule (calc_*/impress_*/writer_*)."""
-        # Rule-3(c) is domain-aware: each LibreOffice domain gets the
-        # canonical-path bullet for its own structured-action set
-        # (calc_* / impress_* / writer_*) so the planner's subgoals
-        # speak that vocabulary instead of GUI shape.
+        # Each LibreOffice domain gets the canonical-path bullet for its own
+        # action set so subgoals speak that vocabulary instead of GUI shape.
         _RULE_3C_CALC = (
             "   (c) calc_* JSON action — the CANONICAL path for "
             "libreoffice_calc spreadsheet edits. Full action schema "
@@ -511,11 +470,10 @@ decomposer doesn't waste turns trying to click around."""
             "structured action covers the operation."
         )
         _cur_dom_lc = (getattr(self, "_current_domain", None) or "").lower()
-        # MULTI-APP: the initial plan covers the whole cross-app task,
-        # so the planner needs the canonical-path rule for EVERY office
-        # app it spans — not just related_apps[0]. Gating on a single
-        # _current_domain left the planner planning, say, the Calc
-        # phase with only the Writer rule → GUI-shape subgoals.
+        # Multi-app: the planner needs the canonical-path rule for EVERY
+        # office app the task spans, not just related_apps[0]. Gating on a
+        # single _current_domain left, e.g., the Calc phase with only the
+        # Writer rule → GUI-shape subgoals.
         if self._is_multi_app():
             _apps = {(a or "").lower()
                      for a in (self._related_apps or [])}
@@ -534,8 +492,7 @@ decomposer doesn't waste turns trying to click around."""
         elif _cur_dom_lc == "libreoffice_writer":
             rule_3c = _RULE_3C_WRITER
         else:
-            # chrome / os / vlc / gimp / thunderbird / vs_code etc. —
-            # no LibreOffice structured-action set is available; the
+            # Non-LibreOffice domains have no structured-action set; the
             # planner stays on the (a) GUI + (b) cli_run menu.
             rule_3c = ""
         return rule_3c
@@ -545,16 +502,14 @@ decomposer doesn't waste turns trying to click around."""
                                        obs: Optional[dict] = None,
                                        env=None,
                                        force_replan: bool = False) -> str:
-        """Dispatch to situation-specific prompt builder in planner_prompts.py.
+        """Dispatch to the situation-specific prompt builder in prompts.py.
 
-        ``obs`` and ``env`` are threaded down so stuck retrieval can pull
-        the actual error evidence when ``force_replan`` is set.
-
-        ``force_replan``: passed by ``_pa_call_planner`` when the upfront
-        mode decision selected ``mode="force_replan"``. The reason that
-        triggered the mode is read from ``self._force_replan_reason``
-        (staged by ``_decide_planner_mode_and_reason`` before this is
-        called) and surfaced in <stuck_reason>."""
+        ``obs``/``env`` are threaded down so stuck retrieval can pull the
+        actual error evidence when ``force_replan`` is set. ``force_replan``
+        is passed by ``_pa_call_planner``; the triggering reason is read from
+        ``self._force_replan_reason`` (staged by
+        ``_decide_planner_mode_and_reason``) and surfaced in <stuck_reason>.
+        """
         from mm_agents.structagent.core.planner.prompts import (
             build_prompt_actor_exhausted,
             build_prompt_all_subgoals_done, build_prompt_subgoal_done,
@@ -568,18 +523,15 @@ decomposer doesn't waste turns trying to click around."""
             current_subgoal=self.current_subgoal,
             current_subgoal_step=self.current_subgoal_step,
             subgoal_queue=self.subgoal_queue,
-            # Domain steers the rule-#4 action menu (which structured
-            # action set — calc_* / impress_* / writer_*) in
-            # ``_plan_quality_rules``. Without this, situational REPLAN
-            # prompts can't name the right structured-action vocabulary
-            # and regress the subgoals to GUI shape.
+            # Domain steers the rule-#4 action menu in
+            # ``_plan_quality_rules``. Without it, situational REPLAN prompts
+            # can't name the right structured-action set and regress to GUI.
             domain=getattr(self, "_current_domain", None),
         )
 
-        # DocPerceiver block — prepend to whatever prompt the dispatcher
-        # returns, so initial / progress-check / force-replan / actor-
-        # exhausted etc. ALL see the live document structure. Mirrors
-        # the injection in _pa_build_initial_plan_prompt at line ~819.
+        # DocPerceiver block — prepended to whatever the dispatcher returns so
+        # every situational prompt sees the live document structure. Mirrors
+        # the injection in _pa_build_initial_plan_prompt.
         doc_block_prefix = ""
         doc_block = getattr(self, "_doc_inspect_block", None)
         if doc_block:
@@ -593,15 +545,12 @@ decomposer doesn't waste turns trying to click around."""
         # Multi-app per-step: inject ALL related_apps' knowledge.
         #
         # [FIX multi_app_per_turn_full_dk] Previously narrowed to just
-        # _current_domain. That dropped sibling-app idioms when the
-        # current phase needed a feature owned by another related app
-        # (e.g. e135df7c — chrome/thunderbird-tagged phase needed
-        # ``calc_export_file`` HTML export, but per-turn loaded only
-        # thunderbird.md → planner went down the GUI File→Export rabbit
-        # hole). The initial plan already loads everything; per-turn
-        # should match. Single-app tasks unchanged. Roll back by
-        # restoring ``_dk = get_domain_knowledge(_ps_dom)`` (single
-        # current domain) — both branches are kept side by side here.
+        # _current_domain, which dropped sibling-app idioms when the current
+        # phase needed another app's feature (e.g. e135df7c — a
+        # chrome/thunderbird phase needed ``calc_export_file`` but loaded only
+        # thunderbird.md → GUI File→Export rabbit hole). The initial plan
+        # already loads everything; per-turn now matches. Single-app
+        # unchanged. Roll back: restore ``_dk = get_domain_knowledge(_ps_dom)``.
         if self._is_multi_app():
             try:
                 from mm_agents.structagent.domain import get_domain_knowledge
@@ -611,8 +560,7 @@ decomposer doesn't waste turns trying to click around."""
                 _related = [a for a in (self._related_apps or [])
                             if a and str(a).strip()]
                 _seen = set()
-                # current_domain first (so planner reads "in-context"
-                # knowledge before sibling-app idioms)
+                # current_domain first, then sibling apps
                 _order = ([_ps_dom_lower] if _ps_dom_lower else []) + [
                     str(a).lower().strip() for a in _related
                     if str(a).lower().strip() != _ps_dom_lower]
@@ -638,13 +586,10 @@ decomposer doesn't waste turns trying to click around."""
                     + doc_block_prefix
                 )
                 if _dk:
-                    # [FIX multi_app_per_turn_full_dk] _dk now already
-                    # contains its own per-app ``### Domain-specific
-                    # knowledge for `<app>` ###`` headers (one section
-                    # per related app), so no outer wrapper needed.
-                    # Roll back: replace this block with the old
-                    # single-section "for the app you are currently in"
-                    # wrapper if reverting the per-turn full-DK fix.
+                    # [FIX multi_app_per_turn_full_dk] _dk already carries its
+                    # own per-app ``### Domain-specific knowledge for `<app>`
+                    # ###`` headers, so no outer wrapper. Roll back: restore
+                    # the old single-section "app you are currently in" wrapper.
                     doc_block_prefix = (
                         f"\n{_dk}\n\nThe `{self._current_domain}` "
                         "section is the app the current phase operates "
@@ -653,11 +598,10 @@ decomposer doesn't waste turns trying to click around."""
                         "an artifact in app A to feed phase B in app "
                         "B).\n\n" + doc_block_prefix
                     )
-                # PHASE BOARD — per-app phase decomposition + the
-                # cross-app handoff. Prepended FIRST so it frames the
-                # whole prompt: which phase the planner is in, what the
-                # upstream phase actually produced, plan only the active
-                # phase. None on single-app or init-failure → skipped.
+                # PHASE BOARD — per-app phase decomposition + cross-app
+                # handoff. Prepended first so it frames the prompt: which phase
+                # we're in, what the upstream phase produced, plan only the
+                # active phase. None on single-app / init-failure → skipped.
                 _pb = self._phase_board()
                 if _pb is not None:
                     try:
@@ -677,12 +621,10 @@ decomposer doesn't waste turns trying to click around."""
                             "re-derive it.\n\n"
                             + doc_block_prefix
                         )
-                # R3 — domain mismatch notice. The OS-focused window
-                # disagrees with the planner's intended domain. Tell
-                # the planner explicitly so it can either issue an
-                # ``open_app(<intended>)`` step or adapt to work in the
-                # currently-focused app. Surfaced for >0 mismatch
-                # turns; after 5 the agent auto-demotes intended so
+                # R3 — domain mismatch notice. The OS-focused window disagrees
+                # with the planner's intended domain, so tell it to either
+                # issue ``open_app(<intended>)`` or adapt to the focused app.
+                # After 5 mismatch turns the agent auto-demotes intended and
                 # this block stops appearing.
                 if (self._is_multi_app()
                         and self._physical_domain is not None
@@ -717,13 +659,11 @@ decomposer doesn't waste turns trying to click around."""
                     logger.info("[PA-Planner-Situational] multi-app "
                                 "domain_knowledge load failed: %s", e)
 
-        # Phase B (situational planners): same data_layout reasoning
-        # slot the initial-plan prompt gets. Without this, REPLAN-class
-        # prompts (force_replan / progress_check / actor_exhausted) drop
-        # the Q1-Q4 chain and regress to GUI-shape <step>s — which
-        # defeats the calc_* migration on the very subgoal the actor
-        # was stuck on. Prepended after the doc_block so the planner
-        # reads structure first, then the answer template.
+        # Phase B (situational planners): same data_layout slot the initial
+        # plan gets. Without it, REPLAN-class prompts drop the Q1-Q4 chain and
+        # regress to GUI-shape <step>s — defeating the calc_* migration on the
+        # very subgoal the actor was stuck on. After doc_block so structure
+        # reads before the answer template.
         data_layout_prefix = ""
         _cur_dom = (getattr(self, "_current_domain", None) or "").lower()
         if _cur_dom == "libreoffice_calc":
@@ -765,14 +705,12 @@ decomposer doesn't waste turns trying to click around."""
     def _build_subgoal_check_force_replan(self, common, doc_block_prefix,
                                           data_layout_prefix, obs, env,
                                           instruction):
-        """Build the force_replan situational prompt: failure-attribution
-        routing, verifier feedback, stuck diagnosis and L1/L2 replan memory,
-        then delegate to build_prompt_force_replan. Extracted verbatim from
-        the force_replan branch of _pa_build_subgoal_check_prompt."""
+        """Build the force_replan prompt: failure-attribution routing,
+        verifier feedback, stuck diagnosis, L1/L2 replan memory, then delegate
+        to build_prompt_force_replan."""
         from mm_agents.structagent.core.planner.prompts import build_prompt_force_replan
-        # Rich failure context for the stuck-mode REPLAN. These go into
-        # <stuck_analysis> so the planner reasons over concrete
-        # evidence instead of re-inventing the same-theme plan.
+        # Failure context for <stuck_analysis> so the planner reasons over
+        # concrete evidence instead of re-inventing the same-theme plan.
         recent_actions = list(self.actions[-6:]) if self.actions else []
         abandoned = list(self.abandoned_subgoals[-6:]) if getattr(self, "abandoned_subgoals", None) else []
         stuck_reason = getattr(self, "_force_replan_reason", None) \
@@ -782,32 +720,22 @@ decomposer doesn't waste turns trying to click around."""
         # consume so the next turn's dispatcher doesn't stale-read it
         self._force_replan_reason = None
         self._force_replan_category = None
-        # A8 debug: stash for the planner-call HTML dump downstream.
-        # _pa_call_planner reads (and clears) these around its LLM
-        # invocation so the HTML pages can show which recovery rule
-        # triggered this force_replan.
+        # Stash for the planner-call HTML dump downstream; _pa_call_planner
+        # reads + clears these so the dump shows which rule triggered this
+        # force_replan.
         self._dump_stuck_category = stuck_category
         self._dump_stuck_reason = stuck_reason
 
-        # External-knowledge retrieval via isolated headless Chrome.
-        # Stuck-recovery search is now agentic: when the planner
-        # decides it needs an external fact for THIS replan, it will
-        # emit a <search> tag and the tool-loop driver fetches it.
-        # The pre-built prompt no longer carries a retrieved_knowledge
-        # block.
+        # Stuck-recovery search is now agentic: the planner emits a <search>
+        # tag and the tool-loop driver fetches the fact, so the pre-built
+        # prompt no longer carries a retrieved_knowledge block.
 
-        # Verifier feedback block: render a concrete diagnostic
-        # (patterns checked, per-pattern hits, file size + change
-        # status, file content preview, LLM root-cause analysis)
-        # for every non-verified outcome. Used to be gated on
-        # ``stuck_category == "done_rejected"`` only, but now fires
-        # on every force_replan because:
-        #   • replan_cadence / actor_failure stuck reasons can
-        #     ALSO have unsatisfied outcomes whose feedback the
-        #     planner needs to see
-        #   • the LLM diagnoser caches per outcome trace signature,
-        #     so repeated force_replans without state change are
-        #     effectively free
+        # Verifier feedback block: a concrete diagnostic (patterns checked,
+        # per-pattern hits, file size + change status, content preview, LLM
+        # root-cause) per non-verified outcome. Now fires on every
+        # force_replan, not just done_rejected, because replan_cadence /
+        # actor_failure can also leave unsatisfied outcomes — and the LLM
+        # diagnoser caches per trace signature, so repeats are nearly free.
         verifier_fb_block: Optional[str] = None
         bad_outcomes_for_reauthor: List[Any] = []
         if self.ledger is not None:
@@ -829,21 +757,19 @@ decomposer doesn't waste turns trying to click around."""
                         blocks.append(b)
                 if blocks:
                     verifier_fb_block = "\n\n".join(blocks)
-                # Capture for the reauthor pass below — render_verifier_feedback
-                # has now updated verifier_mismatch_strikes via the diagnoser.
+                # For the reauthor pass below — render_verifier_feedback has
+                # updated verifier_mismatch_strikes via the diagnoser.
                 bad_outcomes_for_reauthor = bad_outcomes[:3]
             except Exception as e:
                 if logger:
                     logger.info(
                         "[PA-Planner] verifier feedback render failed: %s", e)
 
-        # G1+G2+G4 gate: when the diagnoser has consecutively classified
-        # an outcome's failures as ``verifier_mismatch`` (and we haven't
-        # already patched it), invoke the ledger-init authoring LLM to
-        # rewrite the verify spec. The init-author has the full prompt
-        # (KNOWN APP CONFIG PATHS, pattern tips, dual-channel rules), so
-        # it produces accurate replacements; we feed it the diagnoser's
-        # feedback as additional context.
+        # G1+G2+G4 gate: when the diagnoser has repeatedly classified an
+        # outcome's failures as ``verifier_mismatch`` (and we haven't patched
+        # it), call the ledger-init authoring LLM to rewrite the verify spec.
+        # The init-author has the full prompt (app config paths, pattern tips,
+        # dual-channel rules) and gets the diagnoser feedback as context.
         if self.ledger is not None and bad_outcomes_for_reauthor:
             try:
                 from mm_agents.structagent.ledger.core.initializer import (
@@ -866,32 +792,22 @@ decomposer doesn't waste turns trying to click around."""
                     logger.info(
                         "[PA-Planner] reauthor pass failed: %s", e)
 
-        # A8-V0: LLM-based stuck diagnosis. Fires on EVERY force_replan
-        # (no extra "min replans" gate — the 6-rule recovery cascade
-        # is already the conservative gate; if it decided to fire
-        # force_replan, the agent is stuck enough to warrant a focused
-        # root-cause synthesis). Duplicate calls on unchanged state
-        # are de-duped by signature-based cache in diagnose_stuck.
-        # The recovery's ``stuck_category`` + ``stuck_reason`` are
-        # passed through so the LLM can scope its diagnosis (e.g.
-        # replan_cadence → focus tactical not strategic; done_rejected
-        # → focus on the pending outcome's verifier trace). Full
-        # prompt + response persist to ``{results_dir}/stuck_diagnosis/``
-        # for offline debug.
+        # A8-V0: LLM-based stuck diagnosis. Fires on EVERY force_replan — the
+        # 6-rule recovery cascade is already the conservative gate. Unchanged
+        # state is de-duped by a signature cache in diagnose_stuck. Recovery's
+        # stuck_category/stuck_reason are passed through to scope the diagnosis
+        # (replan_cadence → tactical; done_rejected → the pending verifier
+        # trace). Full prompt + response persist to {results_dir}/stuck_diagnosis/.
         #
-        # Gated by ``self.enable_stuck_diagnosis_injection`` — when
-        # the flag is OFF (default) skip the LLM call entirely AND
-        # pass ``verifier_feedback=None`` to the builder so the
-        # prompt-side injection is also skipped (preserves baseline
-        # e8c4db0 behaviour exactly).
+        # Gated by ``self.enable_stuck_diagnosis_injection``; when OFF (default)
+        # skip the LLM call AND pass ``verifier_feedback=None`` so the prompt is
+        # byte-identical to baseline e8c4db0.
         if (self.ledger is not None
                 and getattr(self, "enable_stuck_diagnosis_injection",
                             False)):
-            # Switch between v1 stuck_diagnosis (the original 4-cat
-            # diagnose) and v2 failure_attribution (5-phase analysis
-            # + role attribution + router). Default v1 preserves
-            # production behaviour exactly; set
-            # USE_FAILURE_ATTRIBUTION=1 to opt into v2 LIVE
+            # v1 stuck_diagnosis (original 4-cat) vs v2 failure_attribution
+            # (5-phase analysis + role attribution + router). Default v1 keeps
+            # production behaviour; USE_FAILURE_ATTRIBUTION=1 opts into v2 live
             # (verifier_override actually flips outcomes).
             from mm_agents.structagent.config import CAConfig
             _attribution_active = CAConfig.from_env().failure_attribution
@@ -900,21 +816,16 @@ decomposer doesn't waste turns trying to click around."""
                 if focus is None:
                     pass
                 elif _attribution_active:
-                    # v2 path. The agent-side pre-replan hook (see
-                    # ``_pa_predict`` in agent.py) ALREADY ran
-                    # diagnose+router and either:
+                    # v2 path. The agent-side pre-replan hook in _pa_predict
+                    # already ran diagnose+router and either:
                     #   (a) cached the InterventionDecision on
-                    #       ``self._cached_failure_attribution_decision``
-                    #       — we consume it here, no duplicate
-                    #       LLM call; or
-                    #   (b) decided ``actor_redo`` and short-
-                    #       circuited the planner entirely — in
-                    #       which case this code path doesn't run
-                    #       at all (mode wouldn't be force_replan).
-                    # If neither cache nor short-circuit (e.g. the
-                    # pre-hook crashed), we fall through to a fresh
-                    # diagnose_failure call so the planner still
-                    # gets actionable analysis.
+                    #       ``self._cached_failure_attribution_decision`` —
+                    #       consumed here, no duplicate LLM call; or
+                    #   (b) decided ``actor_redo`` and short-circuited the
+                    #       planner (so mode wouldn't be force_replan and we
+                    #       wouldn't be here).
+                    # If neither (e.g. the pre-hook crashed), fall through to a
+                    # fresh diagnose_failure so the planner still gets analysis.
                     from mm_agents.structagent.memory.runtime.recovery.recovery_block import (
                         render_planner_recovery_block,
                     )
@@ -967,14 +878,11 @@ decomposer doesn't waste turns trying to click around."""
                                 decision.kind,
                             )
                     if decision is not None:
-                        # The planner sees the analysis as a block
-                        # so it can keep the same plan (when role=
-                        # actor/env/verifier) or replan deeply
-                        # (when role=planner/strategic). The actor
-                        # stash already happened in agent.py if
-                        # actor_redo (and in that case mode wouldn't
-                        # be force_replan, so this code path is for
-                        # planner_replan / fallback_planner only).
+                        # Surface the analysis as a block so the planner can
+                        # keep the plan (role=actor/env/verifier) or replan
+                        # deeply (role=planner/strategic). actor_redo already
+                        # stashed in agent.py and wouldn't reach force_replan,
+                        # so this is planner_replan / fallback_planner only.
                         block = render_planner_recovery_block(
                             decision.params, focus_id=focus.id)
                         if verifier_fb_block:
@@ -1019,11 +927,10 @@ decomposer doesn't waste turns trying to click around."""
                         "failure_attribution" if _attribution_active else "stuck_diagnosis",
                         e)
 
-        # Gate the injection at the builder boundary too — when the
-        # flag is OFF, pass ``verifier_feedback=None`` even if
-        # ``render_verifier_feedback`` populated ``verifier_fb_block``
-        # for the reauthor side-effects above. This way the planner
-        # prompt is byte-identical to baseline when the flag is off.
+        # Gate the injection at the builder boundary too: when the flag is OFF,
+        # pass ``verifier_feedback=None`` even though render_verifier_feedback
+        # populated ``verifier_fb_block`` for the reauthor side-effects — keeps
+        # the prompt byte-identical to baseline.
         _vfb_to_inject = (
             verifier_fb_block
             if getattr(self, "enable_stuck_diagnosis_injection",
@@ -1031,13 +938,11 @@ decomposer doesn't waste turns trying to click around."""
             else None
         )
 
-        # B2.A: at force_replan, surface corpus L2 alternative
-        # strategies + L1 alternative actions as a sibling block to
-        # the diagnosis. Gated on ENABLE_PLANNER_EXPERIENCE_MEMORY
-        # (same flag as the initial-plan L2 injection and the actor
-        # L1 injection). Render layer returns ("", meta_with_OOD)
-        # on miss → safe no-op. Failure is logged + swallowed so
-        # retrieval issues NEVER break the force_replan path.
+        # B2.A: at force_replan, surface corpus L2 alternative strategies + L1
+        # alternative actions alongside the diagnosis. Same flag as the
+        # initial-plan L2 / actor L1 injection. Render layer returns ("", meta)
+        # on miss → no-op. Failures logged + swallowed so retrieval never
+        # breaks the force_replan path.
         _l1_replan_block = ""
         _l2_replan_block = ""
         from mm_agents.structagent.config import CAConfig
@@ -1106,18 +1011,16 @@ decomposer doesn't waste turns trying to click around."""
 
 
     def _pa_check_subgoal_done(self, subgoal: str, obs: dict) -> Tuple[bool, Optional[str]]:
-        """Ask the planner model whether the current subgoal has been completed.
-        If NO, provides a refined subgoal with feedback for the actor.
+        """Ask the planner model whether the current subgoal is complete.
 
-        Returns: (is_done, refined_subgoal_or_None)
-            - (True, None) if subgoal is done
-            - (False, "refined subgoal text") if not done, with corrective feedback
-            - (False, None) on error
+        Returns (is_done, refined_subgoal):
+            (True, None)            done
+            (False, "refined ...")  not done, with corrective feedback
+            (False, None)           error
         """
         if not self.actor_history:
             return False, None
 
-        # Build messages with recent screenshots and actions for this subgoal
         messages = [
             {"role": "system", "content": [{"type": "text", "text":
                 "You are a GUI task evaluator. Given screenshots and actions taken for a specific subgoal, "
@@ -1152,7 +1055,7 @@ decomposer doesn't waste turns trying to click around."""
         ]
         user_content = []
 
-        # Include recent actor history (screenshots + actions for this subgoal)
+        # Recent actor history (screenshots + actions for this subgoal).
         history_to_show = self.actor_history[-3:]
         for entry in history_to_show:
             b64 = entry.get("screenshot_b64", "")
@@ -1162,16 +1065,15 @@ decomposer doesn't waste turns trying to click around."""
             if resp:
                 user_content.append({"type": "text", "text": f"Actor action: {resp[:500]}"})
 
-        # Add current screenshot
+        # Current screenshot.
         screenshot_bytes = obs.get("screenshot")
         if isinstance(screenshot_bytes, bytes):
             current_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
             user_content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{current_b64}"}})
 
-        # Attach a11y tree of the current screenshot — critical for the
-        # radio/checkbox checklist rules in the system prompt, which can
-        # now be answered from st:checked / st:selected state instead of
-        # pixel inspection.
+        # a11y tree of the current screenshot — lets the radio/checkbox
+        # checklist rules answer from st:checked / st:selected state instead
+        # of pixel inspection.
         a11y_text = _linearize_obs_a11y(obs)
         if a11y_text:
             user_content.append({"type": "text", "text": (
@@ -1211,10 +1113,9 @@ NO
                 self.model,
             )
             answer = (response or "").strip()
-            # Strip thinking content. Qwen3.5-VL emits free-form reasoning
-            # followed by </think> and then the answer (no opening tag).
-            # Drop everything up to and including the LAST </think>; also
-            # handle the older fully-wrapped <think>...</think> form.
+            # Strip thinking content. Qwen3.5-VL emits free-form reasoning +
+            # </think> + answer (no opening tag); drop up to the LAST </think>,
+            # and also handle the older fully-wrapped <think>...</think> form.
             answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
             _thk = answer.rfind("</think>")
             if _thk >= 0:
@@ -1223,7 +1124,6 @@ NO
 
             refined_subgoal = None
             if not is_done:
-                # Extract refined subgoal from response
                 m = re.search(r'<refined_subgoal>(.*?)</refined_subgoal>', answer, re.DOTALL)
                 if m:
                     refined_subgoal = m.group(1).strip()
@@ -1280,18 +1180,14 @@ NO
 
     @staticmethod
     def _pa_parse_planner_response(response: str) -> Dict[str, Any]:
-        """Parse the Phase-2 unified planner output contract.
+        """Parse the unified planner output contract (tags are tolerant/optional).
 
-        Expected tags (any may be missing; code is tolerant). The contract
-        was re-ordered to enforce a forward chain of thought:
-        observations → assessment → review → bottleneck → decision →
-        plan/hint. The old <feedback_to_actor> field (emitted INSIDE
-        <last_subgoal_assessment>) was renamed to <actor_hint> and moved
-        AFTER all reasoning so the model can no longer pre-commit to a
-        scroll-loop strategy. The <dead_end_review> block was also
-        removed — planner-driven review confused "I'm proposing X"
-        with "X failed", polluting failed_paths with strategies the
-        planner was about to TRY rather than ones that had FAILED.
+        Contract is ordered to force a forward chain of thought:
+        observations → assessment → bottleneck → decision → plan/hint.
+        <feedback_to_actor> was renamed <actor_hint> and moved after all
+        reasoning so the model can't pre-commit to a scroll-loop. The old
+        <dead_end_review> block was dropped — planner review confused "I'm
+        proposing X" with "X failed" and polluted failed_paths.
 
           <observations>...</observations>
           <last_subgoal_assessment>
@@ -1301,24 +1197,17 @@ NO
           <Bottleneck>one sentence</Bottleneck>
           <decision>DONE|CONTINUE|REPLAN</decision>
           <plan>
-            <strategy>...</strategy>                       (NEW: high-level approach)
+            <strategy>...</strategy>
             <step>...</step>
             ...
           </plan>                                          (REPLAN only)
           <actor_hint>...</actor_hint>                     (done=NO only)
           <root_cause>...</root_cause>                     (actor_exhausted path)
 
-        Returns a dict with:
-          plan (str | None)               raw <plan>..</plan> body for legacy callers
-          plan_strategy (str | None)      NEW: <strategy> text from inside <plan>;
-                                          drives strategy-level dead-end tracking
-          decision (str | None)           DONE / CONTINUE / REPLAN
-          last_subgoal_done (bool | None) parsed from <done>
-          evidence (str | None)
-          observations (str | None)
-          bottleneck (str | None)
-          feedback_to_actor (str | None)  populated from <actor_hint> (new) OR
-                                          <feedback_to_actor> (back-compat)
+        Returns a dict: plan, plan_strategy (<strategy>, drives strategy-level
+        dead-end tracking), decision, last_subgoal_done, evidence,
+        observations, bottleneck, feedback_to_actor (from <actor_hint>, or
+        <feedback_to_actor> for back-compat).
         """
         out: Dict[str, Any] = {
             "plan": None, "plan_strategy": None, "decision": None,
@@ -1329,11 +1218,9 @@ NO
         }
         if not (response and response.strip()):
             return out
-        # Qwen3.5 thinking-mode strip: drop everything up to and
-        # including the LAST </think>. With QWEN35_THINKING=1 the model
-        # emits free-form reasoning + </think> + structured answer; the
-        # reasoning can contain text that confuses tag parsers below.
-        # No-op when thinking is off.
+        # Qwen3.5 thinking-mode strip: drop up to the LAST </think>. With
+        # QWEN35_THINKING=1 the reasoning prefix can contain text that confuses
+        # the tag parsers below. No-op when thinking is off.
         _thk = response.rfind("</think>")
         if _thk >= 0:
             response = response[_thk + len("</think>"):].lstrip()
@@ -1360,9 +1247,8 @@ NO
             ev_m = re.search(r"<evidence>\s*([\s\S]*?)\s*</evidence>", body, re.IGNORECASE)
             if ev_m:
                 out["evidence"] = ev_m.group(1).strip()
-            # Back-compat: older planner checkpoints still emit
-            # <feedback_to_actor> inside the assessment. Honor it as a
-            # fallback when the new <actor_hint> tag is absent below.
+            # Back-compat: older checkpoints emit <feedback_to_actor> inside
+            # the assessment. Fallback when the new <actor_hint> is absent.
             fb_m = re.search(r"<feedback_to_actor>\s*([\s\S]*?)\s*</feedback_to_actor>",
                              body, re.IGNORECASE)
             if fb_m:
@@ -1370,10 +1256,9 @@ NO
                 if fb and fb.lower() not in ("(omit when done=yes)", "omitted", "n/a", "none"):
                     out["feedback_to_actor"] = fb
 
-        # NOTE: <dead_end_review> block was removed from the contract —
-        # see docstring above for rationale. Old planner checkpoints
-        # that still emit it are silently ignored; failed_paths is
-        # written exclusively by the cadence trigger.
+        # <dead_end_review> was removed from the contract (see docstring);
+        # checkpoints still emitting it are ignored. failed_paths is written
+        # exclusively by the cadence trigger.
 
         # --- Bottleneck (synthesis sentence — drives decision) ---
         bn_m = re.search(r"<Bottleneck>\s*([\s\S]*?)\s*</Bottleneck>",
@@ -1387,19 +1272,16 @@ NO
         plan_m = re.search(r"<plan>\s*([\s\S]*?)\s*</plan>", response, re.IGNORECASE)
         if plan_m:
             out["plan"] = plan_m.group(1).strip()
-            # Extract <strategy> from inside the plan body. The contract
-            # asks the planner to declare ONE strategy per plan as the
-            # high-level approach this plan implements; downstream
-            # bookkeeping uses it to detect strategy-level abandonment
-            # (planner switches strategy across REPLANs ⇒ old strategy
-            # was abandoned and gets recorded as a strategy-level dead-end).
+            # <strategy> = the one high-level approach this plan implements.
+            # Downstream bookkeeping uses it to detect strategy-level
+            # abandonment: a switch across REPLANs records the old strategy as
+            # a dead-end.
             strat_m = re.search(
                 r"<strategy>\s*([\s\S]*?)\s*</strategy>",
                 out["plan"], re.IGNORECASE)
             if strat_m:
                 strat = strat_m.group(1).strip()
-                # Drop placeholder / instruction echoes that small
-                # models occasionally copy verbatim from the prompt.
+                # Drop placeholder / prompt echoes small models copy verbatim.
                 if strat and "Strategy ≠ tactic" not in strat \
                         and not strat.lower().startswith("one sentence describing"):
                     out["plan_strategy"] = strat[:300]
@@ -1415,21 +1297,19 @@ NO
             elif "CONTINUE" in raw:
                 out["decision"] = "CONTINUE"
             elif "INFEASIBLE" in raw:
-                # Agent's own task-level infeasibility verdict (only offered in
-                # the stuck/force-replan contract after ≥2 abandoned approaches).
-                # Drives a terminal FAIL in the agent dispatch. REPLAN is checked
-                # first above, so any ambiguous "INFEASIBLE … REPLAN" favours
-                # retrying, never failing — the conservative default.
+                # Task-level infeasibility verdict (offered only in the
+                # stuck/force-replan contract after ≥2 abandoned approaches);
+                # drives a terminal FAIL. REPLAN is checked first, so ambiguous
+                # "INFEASIBLE … REPLAN" favours retrying — conservative default.
                 out["decision"] = "INFEASIBLE"
 
         # root_cause → REPLAN (actor_exhausted prompt shape)
         if re.search(r"<root_cause>", response, re.IGNORECASE):
             out["decision"] = "REPLAN"
 
-        # --- actor_hint (new contract) — preferred over the back-compat
-        # <feedback_to_actor> read above. The hint replaces feedback_to_actor
-        # at the prompt level but we keep the agent-side field name
-        # ``feedback_to_actor`` to avoid downstream churn. ---
+        # --- actor_hint — preferred over the back-compat <feedback_to_actor>
+        # above. Kept under the field name ``feedback_to_actor`` to avoid
+        # downstream churn. ---
         ah_m = re.search(r"<actor_hint>\s*([\s\S]*?)\s*</actor_hint>",
                          response, re.IGNORECASE)
         if ah_m:
@@ -1441,27 +1321,22 @@ NO
                     and "HARD CONSTRAINT" not in ah):
                 out["feedback_to_actor"] = ah  # NEW value wins over back-compat
 
-        # Phase-2 contract: <plan> is emitted ONLY when decision=REPLAN.
-        # Some planner checkpoints still emit a <plan> next to CONTINUE
-        # (restating what's already in the queue); honor the explicit
-        # <decision> tag and DROP the stray plan so the queue isn't
-        # needlessly replaced. Only infer REPLAN when decision is absent.
+        # <plan> is emitted ONLY with decision=REPLAN. Some checkpoints emit a
+        # <plan> next to CONTINUE (restating the queue); honor the explicit
+        # <decision> and drop the stray plan. Only infer REPLAN when decision
+        # is absent.
         if out["plan"] is not None and out["decision"] in ("CONTINUE", "INFEASIBLE"):
             out["plan"] = None
         if out["plan"] is not None and out["decision"] is None:
             out["decision"] = "REPLAN"
-            # ``decision_inferred`` lets the caller distinguish "LLM
-            # explicitly said REPLAN" from "LLM emitted a plan with no
-            # <decision> tag and we filled in REPLAN" — the latter is
-            # benign at step 0 (mode=initial never asks for a decision)
-            # but the planner-cadence counters / log labels should not
-            # treat it as a real REPLAN event.
+            # ``decision_inferred`` distinguishes an explicit REPLAN from one
+            # we filled in for a plan with no <decision> tag. The latter is
+            # benign at step 0 (mode=initial never asks for a decision) but the
+            # cadence counters / log labels must not treat it as a real REPLAN.
             out["decision_inferred"] = True
 
-        # Contract guard: actor_hint should only carry a value when
-        # last_subgoal_done is False. If the planner emitted <actor_hint>
-        # alongside done=YES (small-model contract leak), drop it — the
-        # subgoal succeeded so no hint applies.
+        # Contract guard: actor_hint only applies when last_subgoal_done is
+        # False. Drop a hint emitted alongside done=YES (small-model leak).
         if out["last_subgoal_done"] is True:
             out["feedback_to_actor"] = None
 
@@ -1470,12 +1345,10 @@ NO
             out["decision"] = "DONE"
 
         # --- notebook_audit (host-only Notebook writes) ---
-        # Planner contract: every <plan> begins with a <notebook_audit>
-        # carrying <needs_writes>YES|NO</needs_writes> + optional
-        # <writes> block with one note_write(key=..., value=...) call
-        # per line. Framework executes these BEFORE the actor runs the
-        # first GUI/calc <step>. Parser is tolerant — when the block
-        # is absent (older planner output) we just skip the dispatch.
+        # Every <plan> begins with a <notebook_audit> carrying
+        # <needs_writes>YES|NO</needs_writes> + an optional <writes> block of
+        # one note_write(key=..., value=...) per line, run BEFORE the actor's
+        # first <step>. Tolerant — absent block (older output) just skips.
         out["notebook_writes"] = []
         au_m = re.search(
             r"<notebook_audit>\s*([\s\S]*?)\s*</notebook_audit>",
@@ -1493,7 +1366,7 @@ NO
                     line = line.strip()
                     if not line:
                         continue
-                    # Drop any leading bullet / numbering noise.
+                    # Drop leading bullet / numbering noise.
                     line = re.sub(r"^[-*•\d.\)\s]+", "", line)
                     if line.lower().startswith("note_write"):
                         out["notebook_writes"].append(line)
@@ -1501,59 +1374,34 @@ NO
 
     @classmethod
     def _pa_parse_plan_into_subgoals(cls, plan_text: str) -> List[Dict[str, Any]]:
-        """Parse a plan body into ``[{"text": ..., "expected_post_state": ...}, ...]``.
+        """Parse a plan body into ``[{"text", "expected_post_state", ...}, ...]``.
 
-        Accepts two formats:
+        Two formats:
+          A) XML-structured plan (<step><text>...</text>
+             <expected_post_state>...</expected_post_state></step>).
+          B) Legacy numbered-list plan (back-compat).
 
-          A) New XML-structured plan (Phase 2 contract):
-             <step>
-               <text>Click the X button.</text>
-               <expected_post_state>Dropdown menu labeled Y is visible.</expected_post_state>
-             </step>
+        Format A tolerates the common planner XML emit bugs:
+          (1) missing ``</step>`` — split on the OPENING ``<step>`` tag rather
+              than requiring a balanced match;
+          (2) ``</text>`` typo closing ``<expected_post_state>`` — accepted;
+          (3) other missing closures fall back to peeking the next opening tag.
+        Without these, a malformed plan emits zero steps and falls through to
+        Format B, pushing XML-literal lines into ``subgoal_queue`` (the carl
+        bug). Format B is now XML-aware and skips lines starting with ``<``.
 
-          B) Legacy numbered-list plan (for back-compat with any planner
-             model call that still emits the old format).
-
-        Format A is tolerant of common planner-side XML emit bugs:
-
-          (1) Missing ``</step>`` closure — the planner sometimes opens
-              two ``<step>`` blocks back-to-back without closing the
-              first. We split on the OPENING ``<step>`` tag instead of
-              requiring a balanced ``<step>...</step>`` regex match.
-
-          (2) ``</text>`` typo as ``</expected_post_state>`` close —
-              planner often writes ``</text>`` to close the
-              ``<expected_post_state>`` tag. We accept ``</text>`` as a
-              tolerated closing tag for that field.
-
-          (3) Missing tag closures fall back to peeking the NEXT opening
-              tag (``<step>``, ``<expected_post_state>``, ``</plan>``)
-              as the implicit terminator.
-
-        Without these tolerances, Format A would silently emit zero
-        steps on a malformed plan, falling through to Format B's
-        "every non-empty line is a subgoal" branch and pushing
-        XML-tag-literal lines (``<step>``, ``<expected_post_state>...``)
-        into ``subgoal_queue`` — which is what bricked the carl
-        trajectory's later steps. Format B is now also XML-aware and
-        skips lines starting with ``<``.
-
-        Note: the legacy ``<script_body>`` tag is now defunct. If a stale
-        plan still contains ``<script_body>``, we silently strip it and
-        use ``<text>``.
+        The legacy ``<script_body>`` tag is defunct — silently stripped.
         """
         subs: List[Dict[str, str]] = []
         if not plan_text:
             return subs
 
         # --- Format A: split on <step> openings (tolerant of missing closures) ---
-        # ``re.split`` with a CAPTURING group on the OPENING tag yields:
-        #   [<prefix>, <step-tag-1>, body_1, <step-tag-2>, body_2, ...]
-        # Each body runs from after its opening <step> to right before
-        # the NEXT opening <step> or end-of-text — which means a missing
-        # </step> can no longer drop a step on the floor. The captured
-        # tag is kept so a multi-app ``<step app="...">`` attribute can
-        # be parsed (drives the agent's _current_domain switch).
+        # ``re.split`` with a capturing group on the OPENING tag yields
+        # [prefix, step-tag-1, body_1, step-tag-2, body_2, ...]; each body runs
+        # to the next opening <step> or EOT, so a missing </step> can't drop a
+        # step. The captured tag is kept so a multi-app ``<step app="...">``
+        # attribute can be parsed (drives the _current_domain switch).
         parts = re.split(
             r"(<step\b[^>]*>)", plan_text, flags=re.IGNORECASE,
         )
@@ -1561,25 +1409,20 @@ NO
         step_bodies = parts[2::2] if len(parts) > 1 else []
         for _si, body in enumerate(step_bodies):
             step_tag = step_tags[_si] if _si < len(step_tags) else ""
-            # Multi-app: parse the per-step app tag, e.g.
-            # <step app="libreoffice_calc">. Normalized to lowercase
-            # underscore form; None when absent (single-app plans).
+            # Multi-app: per-step app tag (e.g. <step app="libreoffice_calc">),
+            # normalized to lowercase_underscore; None on single-app plans.
             _app_m = re.search(
                 r'\bapp\s*=\s*["\']([^"\']+)["\']',
                 step_tag, re.IGNORECASE)
             step_app = (_app_m.group(1).strip().lower().replace(" ", "_")
                         if _app_m else None)
-            # Ledger-driven subgoal completion (C / P1). The planner
-            # declares which outcome id this step is supposed to flip
-            # to verified, e.g. <step app="thunderbird"
-            # target="bills_folder_selected">. Framework reads ledger
-            # state to decide subgoal-done instead of relying on the
-            # planner's self-assessment against an unobservable
-            # expected_post_state (the failure mode where "URL is in
-            # clipboard" loops forever because clipboard isn't
-            # visible). Empty when absent — falls back to legacy
-            # post-state self-check. Accept ``target`` (singular,
-            # canonical) and ``targets`` (legacy/alias).
+            # Ledger-driven subgoal completion (C / P1). The step declares
+            # which outcome id it should flip to verified (e.g. <step
+            # app="thunderbird" target="bills_folder_selected">), so the
+            # framework reads ledger state instead of self-assessing against an
+            # unobservable expected_post_state (the "URL is in clipboard" loop,
+            # since clipboard isn't visible). Empty → legacy post-state check.
+            # Accepts ``target`` (canonical) and ``targets`` (alias).
             _targets_m = re.search(
                 r'\btargets?\s*=\s*["\']([^"\']*)["\']',
                 step_tag, re.IGNORECASE)
@@ -1588,21 +1431,20 @@ NO
                 for t in _targets_m.group(1).split(","):
                     t = t.strip()
                     if t:
-                        # Normalize like outcome ids: snake_case
+                        # Normalize like outcome ids: snake_case.
                         t = re.sub(r"[^a-zA-Z0-9_]+", "_", t).strip("_").lower()
                         if t and t not in step_targets:
                             step_targets.append(t)
-            # Trim trailing </step>, </plan>, or any leaked </text> /
-            # </expected_post_state> at the very end so they don't end
-            # up inside the captured fields.
+            # Trim trailing </step> / </plan> (and leaked closers) so they
+            # don't land inside the captured fields.
             body_trimmed = re.sub(
                 r"\s*(?:</step>|</plan>)[\s\S]*$", "",
                 body, flags=re.IGNORECASE,
             )
 
-            # <text> ... terminator. Terminator: </text>, OR the next
-            # opening tag (<expected_post_state>, <step>, <plan>), OR
-            # </plan>. Lookahead lets us peek without consuming.
+            # <text> terminator: </text>, the next opening tag
+            # (<expected_post_state>/<step>/<plan>), or </plan>. Lookahead peeks
+            # without consuming.
             text_m = re.search(
                 r"<text>\s*([\s\S]*?)\s*"
                 r"(?:</text>"
@@ -1614,9 +1456,8 @@ NO
             )
             text = text_m.group(1).strip() if text_m else ""
 
-            # <expected_post_state> ... terminator. ALSO accepts </text>
-            # as the closing tag — that's the typo the planner emits in
-            # ~all plans we've sampled.
+            # <expected_post_state> terminator, also accepting </text> — the
+            # typo the planner emits in ~all sampled plans.
             eps_m = re.search(
                 r"<expected_post_state>\s*([\s\S]*?)\s*"
                 r"(?:</expected_post_state>"
@@ -1628,9 +1469,7 @@ NO
             )
             eps = eps_m.group(1).strip() if eps_m else ""
 
-            # Defensive: strip any straggling XML tags that snuck into
-            # the captured fields (e.g. when planner inlined a stray
-            # tag mid-sentence).
+            # Strip straggling XML tags inlined mid-sentence by the planner.
             text = re.sub(r"<[^>]+>", "", text).strip()
             eps = re.sub(r"<[^>]+>", "", eps).strip()
 
@@ -1638,10 +1477,9 @@ NO
                 subs.append({"text": text, "expected_post_state": eps,
                              "app": step_app, "targets": step_targets})
 
-        # If the planner emitted ANY Format-A <step> opening, commit to
-        # Format A — even if some/all blocks lacked <text>. Falling
-        # through to Format-B's "every non-empty line is a subgoal"
-        # catch-all is what produces the XML-noise-as-subgoal bug.
+        # If the planner emitted ANY <step> opening, commit to Format A even
+        # when blocks lacked <text> — falling through to Format B's
+        # line-is-a-subgoal catch-all causes the XML-noise-as-subgoal bug.
         if step_bodies:
             return subs
 
@@ -1650,10 +1488,9 @@ NO
             line = line.strip()
             if not line:
                 continue
-            # Defensive: never accept a bare XML-tag-literal line as a
-            # subgoal. If we got here, Format A found no <step> opening,
-            # but the plan may still contain straggler tags from a
-            # half-emitted XML response — skip them outright.
+            # Never accept a bare XML-tag line as a subgoal — Format A found no
+            # <step>, but straggler tags from a half-emitted XML response may
+            # remain.
             if line.startswith("<") or line.startswith("</"):
                 continue
             m = re.match(r'^(?:step\s*)?\d+[\.\):\-]\s*(.+)$', line, re.IGNORECASE)
@@ -1677,12 +1514,9 @@ NO
     # --- LAYER 3 / LAYER 4 renderers (see _LAYERED_PROMPT_GUIDE) ---
 
     def _render_layer3_subgoal_state(self) -> str:
-        """LAYER 3 — subgoal state. Sole owner of:
-          • current plan steps (✓ done / ▶ active / · pending)
-          • current_subgoal text + expected_post_state
-          • subgoal_queue / completed / abandoned
-          • working-memory Facts produced by past subgoals
-        """
+        """LAYER 3 — subgoal state. Sole owner of plan steps (✓/▶/·),
+        current_subgoal + expected_post_state, the queue/completed/abandoned
+        lists, and working-memory Facts from past subgoals."""
         lines: List[str] = ["[LAYER 3 — Subgoal state]", ""]
 
         # Plan structure: completed → active → remaining.
@@ -1705,7 +1539,7 @@ NO
             lines.append(f"  · step {i} — {sg[:140]}")
         lines.append(f"Remaining-subgoals count: {len(queue)}")
 
-        # Abandoned subgoals — pulled from agent state if tracked.
+        # Abandoned subgoals, if tracked.
         abandoned = list(getattr(self, "abandoned_subgoals", []) or [])
         if abandoned:
             lines.append("")
@@ -1727,7 +1561,7 @@ NO
                 "automatic runtime decision.")
             lines.append(verifier_report)
 
-        # Working memory (Facts captured so far by completed subgoals).
+        # Working memory (Facts from completed subgoals).
         if self.ledger is not None:
             try:
                 from mm_agents.structagent.ledger.core.records import (
@@ -1746,9 +1580,8 @@ NO
                 if logger:
                     logger.info("[LAYER 3] facts render failed: %s", e)
 
-        # Judge guidance — kept here (LAYER 3 owns the subgoal/eps the
-        # judgment is scoped to). The actual judgment goes in LAYER 5's
-        # <last_subgoal_assessment> output tag.
+        # Judge guidance — LAYER 3 owns the subgoal/eps the judgment is scoped
+        # to; the verdict itself goes in LAYER 5's <last_subgoal_assessment>.
         lines.append("")
         lines.append(
             "When you fill <last_subgoal_assessment> in your output, "
@@ -1774,14 +1607,10 @@ NO
         stuck_category: Optional[str],
         stuck_reason: Optional[str],
     ) -> str:
-        """LAYER 4 — turn evidence text block. Images attached separately
-        upstream (K-frame history attach). Sole owner of:
-          • perceiver SCREEN SNAPSHOT  (perceiver path)
-          • a11y tree + last-turn delta (raw-obs path)
-          • recent actor actions on this subgoal (last 6, newest-first)
-          • last cli_run output
-          • stuck signal (force_replan category + reason)
-        """
+        """LAYER 4 — turn evidence text (images attached separately upstream).
+        Sole owner of the perceiver SCREEN SNAPSHOT (or a11y tree + last-turn
+        delta on the raw-obs path), recent actor actions, last cli_run output,
+        and the stuck signal (force_replan category + reason)."""
         lines: List[str] = ["[LAYER 4 — This turn's evidence]", ""]
         lines.append(
             "Up to 3 screenshots are attached separately ABOVE this "
@@ -1859,26 +1688,21 @@ NO
                          env=None,
                          mode: str = "progress_check"
                          ) -> Tuple[Optional[str], Optional[str]]:
-        """Call planner model. Returns (plan_text_or_None, decision_or_None).
+        """Call the planner model. Returns (plan_text|None, decision|None).
 
-        ``env`` is the OSWorld DesktopEnv handle, threaded down so the
-        stuck-recovery search can read error evidence directly via
-        ``env.controller``.
+        ``env`` is the OSWorld DesktopEnv handle, threaded down so stuck
+        recovery can read error evidence via ``env.controller``.
 
-        ``mode`` selects which planner prompt to build:
-          - "initial"        : step==0 — build_prompt_initial_plan
-          - "force_replan"   : known-stuck → build_prompt_force_replan
-            with stuck context. The reason is read from
+        ``mode`` picks the prompt:
+          - "initial"        : step==0 plan.
+          - "force_replan"   : known-stuck; reason from
             ``self._force_replan_reason`` (staged by
-            ``_decide_planner_mode_and_reason`` or by
-            ``_check_done_acceptance`` when DONE was rejected).
-          - "progress_check" : default — _pa_build_subgoal_check_prompt
-            does its normal CONTINUE/REPLAN/DONE dispatch.
+            ``_decide_planner_mode_and_reason`` / ``_check_done_acceptance``).
+          - "progress_check" : default CONTINUE/REPLAN/DONE dispatch.
         """
         screenshot_bytes = obs["screenshot"]
         processed_image = process_image(screenshot_bytes)
 
-        # Update planner history
         if self.planner_history and self.planner_history[-1][1] is None and self.current_subgoal_feedbacks:
             self.planner_history[-1] = (self.planner_history[-1][0], self.current_subgoal_feedbacks[-1])
         self.planner_history.append((processed_image, None))
@@ -1896,13 +1720,10 @@ NO
             )
             k = self.planner_max_images
         else:
-            # The list of decisions the planner is allowed to emit this
-            # turn (CONTINUE / REPLAN / DONE) is determined by which
-            # situation builder LAYER 5 dispatches to — progress_check
-            # disallows DONE, force_replan disallows CONTINUE,
-            # done_rejected disallows both DONE and CONTINUE, etc. The
-            # system prompt does NOT enumerate decisions; it points the
-            # planner at LAYER 5's "Decision semantics" block, which is
+            # Which decisions are allowed this turn depends on the situation
+            # builder LAYER 5 dispatches to (progress_check disallows DONE,
+            # force_replan disallows CONTINUE, etc.). The system prompt doesn't
+            # enumerate them; it points at LAYER 5's "Decision semantics" block,
             # built dynamically with the right allow_* flags.
             system_content = self._compose_system_prompt(
                 "You are the planner for a desktop GUI task agent. Each "
@@ -1931,9 +1752,8 @@ NO
             mode, planning_prompt, entries, snap, url_after,
             a11y_text, messages)
 
-        # Debug dump: persist what the planner LLM is about to see.
-        # Active only when use_perceiver is on (otherwise the planner is
-        # in pure raw-obs mode and existing dumps already cover it).
+        # Debug dump of the planner LLM input. Only when use_perceiver is on;
+        # raw-obs mode is already covered by existing dumps.
         if getattr(self, "use_perceiver", False):
             try:
                 from mm_agents.structagent.perception import perceiver_debug
@@ -1953,16 +1773,14 @@ NO
 
     def _assemble_planner_messages(self, mode, planning_prompt, entries,
                                    snap, url_after, a11y_text, messages):
-        """Assemble the planner LLM message payload: initial flat path or
-        the LAYERED (1-5) progress_check/force_replan path. Returns the
-        completed messages list. Extracted verbatim from _pa_call_planner."""
+        """Assemble the planner message payload: flat initial path or the
+        LAYERED (1-5) progress_check/force_replan path. Returns the messages
+        list."""
 
         # ============================================================
-        # INITIAL-PLAN PATH — legacy flat assembly. The layered
-        # structure below only restructures the progress_check /
-        # force_replan turns where the cross-block contradiction bugs
-        # (e.g. "Required Outcomes N/N verified" vs. "Remaining
-        # subgoals non-empty") actually manifested.
+        # INITIAL-PLAN PATH — flat assembly. The layered structure below only
+        # applies to progress_check / force_replan, where the cross-block
+        # contradiction bugs (e.g. "N/N verified" vs. non-empty queue) showed up.
         # ============================================================
         if mode == "initial":
             for past_img_b64, _ in entries[:-1]:
@@ -1984,11 +1802,9 @@ NO
                 {"type": "text", "text": planning_prompt}]})
         else:
             # ============================================================
-            # LAYERED PATH (progress_check / force_replan / actor_exhausted /
-            # all_subgoals_done / subgoal_done — whichever was dispatched
-            # inside _pa_build_subgoal_check_prompt). The dispatcher
-            # already selected the right LAYER 5 contract; LAYERS 1-4
-            # are mode-agnostic.
+            # LAYERED PATH (whichever situation _pa_build_subgoal_check_prompt
+            # dispatched). The dispatcher already picked the LAYER 5 contract;
+            # LAYERS 1-4 are mode-agnostic.
             # ============================================================
 
             # ---------- LAYER 1 — Task constraint ----------
@@ -2039,9 +1855,8 @@ NO
             )}]})
 
             # ---------- LAYER 4a — image attachments ----------
-            # K screenshots (oldest → newest). Image messages are
-            # wordless — they go BEFORE the LAYER 4 text block so the
-            # text can reference "the latest screenshot above".
+            # K screenshots (oldest → newest), wordless, placed BEFORE the
+            # LAYER 4 text so it can say "the latest screenshot above".
             for past_img_b64, _ in entries[:-1]:
                 past_url = (past_img_b64 if past_img_b64.startswith("data:image")
                             else f"data:image/png;base64,{past_img_b64}")
@@ -2091,11 +1906,9 @@ NO
             self._planner_a11y_at_last_turn = a11y_text
 
             # ---------- LAYER 5 — Decision contract ----------
-            # planning_prompt already encodes which decisions are
-            # allowed this turn (via the situation-specific builder's
-            # allow_done / allow_continue / allow_replan kwargs to
-            # _output_contract). The dead-end mandatory check + the
-            # conflict-resolution table are appended afterward.
+            # planning_prompt already encodes the allowed decisions (via the
+            # builder's allow_* kwargs to _output_contract); the mandatory
+            # dead-end check + conflict-resolution table are appended after.
             layer5_parts: List[str] = [
                 "[LAYER 5 — Decision contract] — your output rubric, "
                 "decision rules, and CONFLICT RESOLUTION table. Apply "
@@ -2125,18 +1938,16 @@ NO
         return messages
 
     def _planner_call_retry_parse(self, messages, step_idx, mode):
-        """Call the planner model with up to 3 attempts, parse each response,
-        stash self.planner_* state, and return (plan, decision). Extracted
-        verbatim from _pa_call_planner."""
+        """Call the planner (up to 3 attempts), parse each response, stash
+        self.planner_* state, and return (plan, decision)."""
         def _planner_call_once(_msgs):
             return self.call_llm(
                 {"model": self.model, "messages": _msgs,
                  "max_tokens": 2000, "top_p": self.top_p,
-                 # bBoN diversity knob. ``self.temperature`` is 0.0 everywhere
-                 # except live best-of-N rollouts (run_bbon.py sets ~0.7), so at
-                 # the default this is byte-identical to before. The planner
-                 # decision is bBoN's main diversity source: different plans ->
-                 # different trajectories to choose between.
+                 # bBoN diversity knob. ``self.temperature`` is 0.0 except in
+                 # best-of-N rollouts (run_bbon.py sets ~0.7), so the default is
+                 # byte-identical. The planner decision is bBoN's main diversity
+                 # source: different plans → different trajectories to rank.
                  "temperature": self.temperature},
                 self.model,
             ) or ""
@@ -2151,10 +1962,9 @@ NO
             planner_response = _planner_call_once(messages)
             _elapsed = _time.time() - _t0
             parsed = self._pa_parse_planner_response(planner_response or "")
-            # A8 debug — dump every planner LLM call (input + response) to
-            # ``{results_dir}/planner_debug/`` as a self-contained HTML
-            # page. Index updated on each dump so the debug tree is usable
-            # mid-run. Failures here never raise.
+            # Dump each planner call (input + response) to
+            # ``{results_dir}/planner_debug/`` as a self-contained HTML page;
+            # index updated each time so it's usable mid-run. Never raises.
             try:
                 from mm_agents.structagent.core.planner.debug import (
                     dump_planner_call as _dump_planner_call,
@@ -2185,38 +1995,33 @@ NO
                     break
             elif parsed["decision"] is not None:
                 break
-        # A8 debug: clear the stuck_category stash so the next planner
-        # turn (which may be progress_check / initial / etc.) starts
-        # without stale recovery context bleeding into its HTML dump.
+        # Clear the stuck_category stash so the next planner turn doesn't bleed
+        # stale recovery context into its HTML dump.
         self._dump_stuck_category = None
         self._dump_stuck_reason = None
         self.planner_response = planner_response
-        # At step 0 (mode=initial), the LLM is asked for a fresh <plan>
-        # with no <decision> tag. The parser fills in decision="REPLAN"
-        # as a fallback (see ``_pa_parse_planner_response``), but that
-        # is a parser-only inference, NOT a real REPLAN event. Blank it
-        # so the runtime log, trajectory HTML, and REPLAN-cadence
-        # counters (rule #6 of ``_decide_planner_mode_and_reason``) don't
-        # treat the initial plan emission as a back-tracking REPLAN.
+        # At step 0 the LLM emits a <plan> with no <decision>; the parser
+        # backfills decision="REPLAN", but that's a parser inference, not a
+        # real REPLAN. Blank it so logs, trajectory HTML, and the REPLAN-cadence
+        # counters don't treat the initial plan as back-tracking.
         if step_idx == 0 and parsed.get("decision_inferred"):
             parsed["decision"] = None
         self.planner_decision = parsed["decision"]
-        # Expose the full parsed record for _pa_predict's control flow.
+        # Full parsed record for _pa_predict's control flow.
         self.planner_parsed = parsed
         if logger:
             logger.info("[PA-Planner] step=%d response=%s", step_idx, (planner_response or ""))
         return parsed["plan"], parsed["decision"]
 
 
-    # T4: write the disk plan snapshot after every plan commit.
-    # See plan file Part I.3.
+    # T4: write the disk plan snapshot after every plan commit. See plan
+    # file Part I.3.
     def _write_plan_snapshot(self, step_idx: int) -> None:
-        """Render the current Outcome DAG + subgoal state as markdown
-        and write to ``<results_dir>/plan.md`` (atomic).
+        """Render Outcome DAG + subgoal state as markdown to
+        ``<results_dir>/plan.md`` (atomic).
 
-        Called from each plan-commit site (step==0 install + REPLAN
-        swap). Best-effort: any failure is logged and swallowed —
-        plan_store is a debug artifact, not in the control path.
+        Called at each plan commit (step==0 install + REPLAN swap).
+        Best-effort: plan_store is a debug artifact, not in the control path.
         """
         from mm_agents.structagent.core.planner.plan_store import (
             render_plan_md, write_plan,
@@ -2237,10 +2042,9 @@ NO
                 current_focus_id=focus_id,
                 current_subgoal=getattr(self, "current_subgoal", None),
                 step_idx=step_idx,
-                # Planner-side state — the per-turn subgoal decomposition
-                # the planner emitted via <plan>. Distinct from the
-                # ledger's Outcome DAG (milestones). Without these, the
-                # disk plan.md only showed milestones and looked
+                # Planner-side state: the per-turn subgoal decomposition from
+                # <plan>, distinct from the ledger's Outcome DAG (milestones).
+                # Without it, plan.md showed only milestones and looked
                 # incomplete during triage.
                 plan_strategy=getattr(self, "current_plan_strategy", None),
                 subgoal_queue=list(
@@ -2250,10 +2054,9 @@ NO
                 abandoned_subgoals=list(
                     getattr(self, "abandoned_subgoals", []) or []),
             )
-            # step_idx pinned so the per-step history file at
-            # plans/step_NNNN.md preserves this revision (diffable
-            # vs prior REPLAN snapshots). plan.md still gets the
-            # latest. See plan file Part I.3.
+            # step_idx pinned so plans/step_NNNN.md preserves this revision
+            # (diffable vs prior REPLANs); plan.md still gets the latest.
+            # See plan file Part I.3.
             write_plan(results_dir, md, step_idx=step_idx)
         except Exception as e:
             if logger:

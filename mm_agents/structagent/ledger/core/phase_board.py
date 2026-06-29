@@ -1,34 +1,24 @@
 """Phase Board — the per-app phase layer for multi-application tasks.
 
-A multi-app task is fundamentally a chain of app phases:
+A multi-app task is a chain of app phases:
 
-    Phase 1 (app A: produce artifact X) → handoff(X)
+    Phase 1 (app A: produce X) → handoff(X)
         → Phase 2 (app B: consume X, produce Y) → handoff(Y) → ...
 
-Before this module the agent had three loosely-coupled "progress"
-systems that disagreed with each other:
+The pre-existing progress systems (subgoal_queue, ledger Outcome set,
+per-turn-derived _current_domain) each tracked something else; none was
+the coarse "phase". The PhaseBoard adds it:
 
-  * ``subgoal_queue`` / ``completed_subgoals`` — the plan execution
-    pointer (planner-authored text, frozen at plan time).
-  * the ledger ``Outcome`` set — deliverable verification state.
-  * ``_current_domain`` — per-turn-derived execution context routing.
+  * an app-aggregated view of the ledger (phase done iff all its
+    outcomes verified) — NOT a new verifier.
+  * the committed execution-context source: ``_current_domain`` follows
+    the active phase's ``app`` instead of being re-derived (and
+    thrashed) every turn.
+  * the home of the explicit handoff record — what each phase produced
+    for the next, LLM-summarized at the boundary (Phase.actual_handoff_out).
 
-None of them was the *phase* — the coarse "we are working in app X
-toward goal G, and app X hands Y to the next app". The PhaseBoard
-adds exactly that missing layer. It is:
-
-  * an **app-aggregated view** of the ledger (a phase is "done" iff
-    every outcome assigned to it is verified) — NOT a new verifier.
-  * the **committed** execution-context source: ``_current_domain``
-    follows the active phase's ``app`` instead of being re-derived
-    (and thrashed) every turn.
-  * the home of the explicit **handoff** record — what each phase
-    produced for the next, summarized by an LLM at the phase boundary
-    (see ``Phase.actual_handoff_out``).
-
-Multi-app only. Single-app tasks never build a PhaseBoard; every
-call site is gated so single-domain behaviour is byte-for-byte
-unchanged.
+Multi-app only. Single-app tasks never build a board; every call site
+is gated so single-domain behaviour is byte-for-byte unchanged.
 """
 from __future__ import annotations
 
@@ -46,20 +36,17 @@ PHASE_DONE = "done"
 class Phase:
     """One app phase of a multi-app task.
 
-    ``goal`` is SEMANTIC — it names what to accomplish in this app
-    without concrete anchors (cell ranges, indices, counts, literal
-    values), because the phase is authored at task start before the
-    app is observed (same rule as plan-quality rule 10).
+    ``goal`` is SEMANTIC — no concrete anchors (cell ranges, indices,
+    counts, literals), since the phase is authored at task start before
+    the app is observed (plan-quality rule 10).
 
     Handoff fields, two layers:
-      * ``planned_handoff_in`` / ``planned_handoff_out`` — authored by
-        init_ledger, the SEMANTIC contract ("this phase receives the
-        requested rows on the clipboard / produces a saved PDF").
-      * ``actual_handoff_out`` — filled at the phase→done boundary by
-        an LLM that reads the phase's real trajectory + filesystem
-        diff + clipboard probe. This is what the downstream phase
-        actually sees ("clipboard holds 工作表1!A1:L2, 2 rows × 12
-        cols" / "saved /home/user/Desktop/receipt.pdf").
+      * ``planned_handoff_in`` / ``planned_handoff_out`` — init_ledger's
+        semantic contract ("receives the requested rows on the clipboard
+        / produces a saved PDF").
+      * ``actual_handoff_out`` — filled at the phase→done boundary by an
+        LLM reading the real trajectory + filesystem diff + clipboard
+        probe; what the downstream phase actually sees.
     """
     index: int                       # 1-based execution order
     app: str                         # domain, e.g. "libreoffice_calc" / "chrome" / "os"
@@ -91,9 +78,9 @@ class Phase:
 class PhaseBoard:
     """Ordered list of phases for one multi-app task.
 
-    Exactly one phase is ``active`` at a time (the first non-done
-    phase). ``advance()`` is called by the agent once every outcome
-    assigned to the active phase is verified.
+    Exactly one phase is ``active`` at a time (the first non-done one).
+    The agent calls ``advance()`` once all the active phase's outcomes
+    are verified.
     """
     phases: List[Phase] = field(default_factory=list)
 
@@ -104,9 +91,8 @@ class PhaseBoard:
     def from_init_payload(cls, phases_json: Any) -> Optional["PhaseBoard"]:
         """Build from the ``phases`` array of the init_ledger LLM output.
 
-        Returns None when the payload is missing / malformed / has <2
-        phases (a <2-phase board is not a multi-app handoff chain and
-        adds only overhead — fall back to the flat subgoal model).
+        None when missing / malformed / <2 phases — a <2-phase board is
+        not a handoff chain, so fall back to the flat subgoal model.
         """
         if not isinstance(phases_json, list) or len(phases_json) < 2:
             return None
@@ -146,8 +132,8 @@ class PhaseBoard:
         return None
 
     def previous_done(self) -> Optional[Phase]:
-        """The most-recently-completed phase (the one whose handoff the
-        active phase consumes). None when the active phase is first."""
+        """Most-recently-completed phase (whose handoff the active phase
+        consumes). None when the active phase is first."""
         done = [p for p in self.phases if p.status == PHASE_DONE]
         return done[-1] if done else None
 
@@ -160,7 +146,7 @@ class PhaseBoard:
         return list(a.outcome_ids) if a else []
 
     def summary_line(self) -> str:
-        """Compact one-line status for runtime.log (greppable per turn)."""
+        """Compact one-line status for runtime.log (greppable)."""
         if not self.phases:
             return "PhaseBoard: empty"
         active = self.active()
@@ -178,11 +164,9 @@ class PhaseBoard:
     # ------------------------------------------------------------------ #
     def advance(self, actual_handoff_out: Optional[str] = None
                 ) -> Optional[Phase]:
-        """Mark the active phase done (storing its LLM-summarized
-        handoff) and promote the next pending phase to active.
-
-        Returns the new active phase, or None if the board is now
-        fully done.
+        """Mark the active phase done (storing its handoff) and promote the
+        next pending phase. Returns the new active phase, or None if the
+        board is now fully done.
         """
         cur = self.active()
         if cur is None:
@@ -200,11 +184,9 @@ class PhaseBoard:
     # Rendering — injected into the planner prompt
     # ------------------------------------------------------------------ #
     def render_block(self) -> str:
-        """Human-readable PHASE BOARD block for the planner prompt.
-
-        Shows every phase's status, the active phase's incoming
-        handoff (what the previous phase actually produced), and which
-        phase the planner should plan for right now.
+        """Human-readable PHASE BOARD block for the planner prompt: every
+        phase's status, the active phase's incoming handoff, and which
+        phase to plan for now.
         """
         if not self.phases:
             return ""
@@ -222,9 +204,8 @@ class PhaseBoard:
                 lines.append(f"         └ produced: {p.actual_handoff_out}")
             elif p.status == PHASE_ACTIVE:
                 prev = self.previous_done()
-                # What the active phase receives: prefer the upstream
-                # phase's ACTUAL produced summary; fall back to this
-                # phase's planned_handoff_in semantic description.
+                # Prefer the upstream phase's ACTUAL produced summary;
+                # fall back to this phase's planned_handoff_in.
                 recv = None
                 if prev is not None and prev.actual_handoff_out:
                     recv = prev.actual_handoff_out
@@ -236,11 +217,9 @@ class PhaseBoard:
 
 
 # ---------------------------------------------------------------------- #
-# Orchestration — phase-boundary handoff summary + advance
-#
-# These are module-level functions (not agent methods) so the agent
-# file stays thin: it only holds the PhaseBoard reference + the
-# per-phase action-index cursor, and delegates the logic here.
+# Orchestration — phase-boundary handoff summary + advance.
+# Module-level (not agent methods) to keep the agent file thin: it holds
+# only the board ref + per-phase action cursor and delegates here.
 # ---------------------------------------------------------------------- #
 
 def _strip_think(text: str) -> str:
@@ -258,11 +237,11 @@ def summarize_phase_handoff(
     model: str,
     logger: Any = None,
 ) -> Optional[str]:
-    """LLM-summarize what a just-completed phase produced for the next
-    phase. ``phase_actions`` is the slice of the agent's action log
-    taken while this phase was active. Returns a 1-2 sentence handoff
-    description (WHAT was produced + WHERE it lives), or the phase's
-    ``planned_handoff_out`` on empty trajectory / LLM failure.
+    """LLM-summarize what a just-completed phase produced for the next.
+
+    ``phase_actions`` is the action-log slice taken while this phase was
+    active. Returns a 1-2 sentence handoff (WHAT + WHERE), or falls back
+    to ``planned_handoff_out`` on empty trajectory / LLM failure.
     """
     fallback = phase.planned_handoff_out
     acts = [a for a in (phase_actions or []) if a]
@@ -370,13 +349,12 @@ def audit_phase_handoff(
     current_a11y: Optional[str] = None,
     doc_inspect_block: Optional[str] = None,
 ) -> str:
-    """Adversarially verify the just-summarized ``actual_handoff_out``
-    against the action trajectory + current observable state. Returns
-    ``"PASS"`` / ``"FAIL"``.
+    """Adversarially verify ``actual_handoff_out`` against the action
+    trajectory + current observable state. Returns ``"PASS"`` / ``"FAIL"``.
 
-    Fail-open semantics: on LLM error, empty inputs, or unparseable
-    verdict, returns ``"PASS"`` (don't block phase advance on
-    framework hiccup). The caller checks ``"FAIL"`` explicitly.
+    Fail-open: LLM error, empty inputs, or unparseable verdict → "PASS"
+    (don't block phase advance on a framework hiccup). Caller checks
+    "FAIL" explicitly.
     """
     if not phase_actions or not phase.actual_handoff_out:
         return "PASS"
@@ -469,18 +447,14 @@ def advance_phase_if_complete(
     current_a11y: Optional[str] = None,
     doc_inspect_block: Optional[str] = None,
 ) -> bool:
-    """If the active phase is complete, summarize its handoff and
-    advance ``board``. Returns True iff a phase advanced (the caller
-    then resets its per-phase action cursor).
+    """If the active phase is complete, summarize its handoff and advance
+    ``board``. True iff a phase advanced (caller then resets its per-phase
+    action cursor). No-op (False) when ``board`` is None (single-app).
 
     Phase-complete test:
-      * outcome-bearing phase → every assigned outcome_id is in
-        ``verified_ids``.
-      * zero-outcome phase    → ``current_subgoal_app`` has moved to
-        the NEXT phase's app (nothing to verify; the planner's own
-        progress is the only available signal).
-
-    No-op (returns False) when ``board`` is None — single-app tasks.
+      * outcome-bearing phase → all assigned outcome_ids in ``verified_ids``.
+      * zero-outcome phase    → ``current_subgoal_app`` moved to the next
+        phase's app (nothing to verify; planner progress is the only signal).
     """
     if board is None:
         return False
@@ -500,8 +474,8 @@ def advance_phase_if_complete(
             return False
     summary = summarize_phase_handoff(
         active, phase_actions, call_llm=call_llm, model=model, logger=logger)
-    # Stage the summary on the phase so the auditor can read
-    # ``phase.actual_handoff_out`` even before advance() commits.
+    # Stage the summary so the auditor can read actual_handoff_out before
+    # advance() commits.
     if summary:
         active.actual_handoff_out = summary.strip()
     if enable_audit:
@@ -521,8 +495,7 @@ def advance_phase_if_complete(
                     active.index, active.app,
                     (summary or "(none)")[:200],
                 )
-            # Roll back the staged claim so a future retry's summary
-            # call writes fresh, not appended to the rejected one.
+            # Roll back the staged claim so a retry writes fresh.
             active.actual_handoff_out = None
             return False
     new_active = board.advance(summary)

@@ -1,32 +1,21 @@
 """Phase 3 L1 — Step 2: cluster subgoal segments PER DOMAIN.
 
-Reads ``_l1_segments_raw.jsonl`` (~22K segments produced by
+Reads ``_l1_segments_raw.jsonl`` (~22K segments from
 ``extract_subgoal_segments``) and clusters by ``subgoal`` text within
-each domain. Per-domain (not cross-domain) for three reasons:
+each domain. Per-domain rather than cross-domain because:
+  - keeps each cosine matrix small (chrome's 11K vs all 22K) and lets
+    domains run in parallel;
+  - L1 actions ("Click Insert > Image") are naturally domain-bound;
+  - matches the v2 approach that already proved per-domain L1 mining works.
 
-  1. Memory: chrome has 11K segments; cluster-all-at-once would build
-     a 22K×22K cosine matrix (~1.9 GB) — fits but slow. Per-domain
-     keeps each pass ≤ chrome's 11K×11K (~480 MB) and runs in parallel.
-  2. Semantic: an L1 action like "Click Insert > Image" is naturally
-     domain-bound (the menu lives in the office app); cross-domain
-     "Click File menu" cohesion is a side effect we accept (file menu
-     exists in many apps but the L1 polish prompt will keep per-domain
-     variants distinct).
-  3. Reuse: matches the existing v2 cluster_l1_segments approach which
-     already proved per-domain L1 mining works.
+Output under ``results/unified_memory/_l1_clusters_v3/<domain>/``:
+  cluster_NNN/members.json   — segments in the cluster
+  _summary.json              — per-domain + per-cluster stats
 
-For each domain, output (under
-``results/unified_memory/_l1_clusters_v3/<domain>/``):
-  cluster_NNN/members.json   — flat list of segments in this cluster
-  _summary.json              — per-domain stats + per-cluster summary
-
-Embedding text: subgoal only (no domain prefix, no action — those would
-collapse same-domain clusters by surface form rather than by
-semantic intent).
-
-Threshold tuned to L1 granularity — TIGHTER than L2 (0.40) because
-subgoal text is shorter and more uniform; we want "Click File > Open"
-to cluster apart from "Open File Manager".
+Embedding text is the subgoal only — adding domain/action would cluster
+by surface form rather than intent. Threshold is tighter than L2's 0.40
+since subgoals are short and uniform (keep "Click File > Open" apart from
+"Open File Manager").
 
 Run:
   PYTHONPATH=. python -m mm_agents.structagent.memory.offline.cluster.cluster_subgoal_segments

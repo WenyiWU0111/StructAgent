@@ -1,10 +1,8 @@
 """Auditor system prompt + user-message templating.
 
-Validated in Phase A (see ``tests/replay_done_audit.py`` —
-``replay_done_audit_labels.csv`` and the v1 batch report). The known-
-artifact table was removed per user mandate (task-spec leak); the
-3-check BEFORE-FAIL gate (RELEVANCE / GROUNDING / AVAILABILITY) is
-the abstract replacement.
+Validated in Phase A (tests/replay_done_audit.py + replay_done_audit_labels.csv).
+The known-artifact table was dropped (task-spec leak); the 3-check BEFORE-FAIL
+gate (RELEVANCE / GROUNDING / AVAILABILITY) is its abstract replacement.
 """
 from __future__ import annotations
 
@@ -14,9 +12,8 @@ from typing import Any, Dict, List
 from mm_agents.structagent.core.final_audit.snapshot import DoneAuditSnapshot
 
 
-# Adversarial system prompt. Adapts the Claude Code verificationAgent
-# pattern (plan file Part I.2) to OSWorld. Phase-A metrics: 4/6
-# detection on false-DONEs, 1/6 FP on true-DONEs, 0/3 control fires.
+# Adversarial system prompt (verificationAgent pattern, adapted to OSWorld).
+# Phase-A: 4/6 detection on false-DONEs, 1/6 FP on true-DONEs, 0/3 control fires.
 SYSTEM_PROMPT = """\
 You are the Done-Auditor for an OSWorld GUI agent. The agent has just
 claimed the task is DONE. A separate structured verifier has already
@@ -154,10 +151,10 @@ def _render_verifier_spec_line(s: Dict[str, Any]) -> str:
 
 
 def build_user_message_text(snap: DoneAuditSnapshot) -> str:
-    """Render the snapshot as the auditor's user-message text content.
+    """Render the snapshot as the auditor's user-message text.
 
-    Screenshots are appended as separate image_url parts (see
-    ``build_chat_messages``); this text content covers everything else.
+    Screenshots are appended separately as image_url parts (build_chat_messages);
+    this covers everything else.
     """
     parts: List[str] = []
 
@@ -236,10 +233,9 @@ def build_chat_messages(
 ) -> List[Dict[str, Any]]:
     """Compose [system, user] OpenAI-style chat messages.
 
-    The user message is multimodal: text content (the rendered snapshot)
-    + up to ``max_screenshots`` image_url parts (initial + last K
-    sub-action frames). Screenshots are b64-data-URLs so any
-    OpenAI-compatible vLLM endpoint accepts them.
+    User message is multimodal: rendered-snapshot text + up to ``max_screenshots``
+    image_url parts (initial + last K frames), b64 data-URLs for any
+    OpenAI-compatible vLLM endpoint.
     """
     user_text = build_user_message_text(snap)
     user_content: List[Dict[str, Any]] = [
@@ -251,9 +247,8 @@ def build_chat_messages(
         if snap.initial_screenshot_b64:
             ss.append(snap.initial_screenshot_b64)
         ss.extend(snap.recent_screenshots_b64)
-        # Dedup adjacent duplicates (some runs have initial == first
-        # recent). Strict equality is enough — they're the same b64
-        # payload byte-for-byte.
+        # Dedup adjacent dupes (some runs have initial == first recent);
+        # strict equality is enough — same b64 payload byte-for-byte.
         deduped: List[str] = []
         for s in ss:
             if not deduped or deduped[-1] != s:

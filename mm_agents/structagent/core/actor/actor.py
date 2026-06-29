@@ -1,13 +1,12 @@
 """Actor: turn one subgoal into one Thought/Action emission.
 
-Decomposer LLM with inline grounding; structured-action catalogues
-(calc_* / impress_* / writer_*) are injected when the current domain is
-LibreOffice. The output is UI-TARS Thought/Action format so the shared
-parser (``_pa_parse_actor_response``) handles it uniformly.
+Decomposer LLM with inline grounding. Structured-action catalogues
+(calc_*/impress_*/writer_*) are injected for LibreOffice domains. Output is
+UI-TARS Thought/Action format so the shared parser handles it.
 
-``Actor`` is folded into ``StructAgent`` via inheritance; methods read
-``self.decomposer_model`` / ``self.actor_history`` /
-``self._current_domain`` / ``self.ledger`` on the composed instance.
+``Actor`` is mixed into ``StructAgent`` via inheritance; methods read
+``self.decomposer_model`` / ``self.actor_history`` / ``self._current_domain``
+/ ``self.ledger`` off the composed instance.
 """
 
 import logging
@@ -30,13 +29,11 @@ class Actor:
     )
     _FROZEN_MARKER_CLOSE_RE_STATIC = re.compile(r"\{\{#\s*END\s+FROZEN\s*#\}\}\n?")
 
-    # Domain coding-gate: the cli_run/edit_json "coding route" sections of
-    # the A2 decomposer prompt are wrapped in {{# CODING_ROUTE #}} ...
-    # {{# END CODING_ROUTE #}}. For GUI-only domains (chrome/gimp/thunderbird,
-    # when ENABLE_DOMAIN_CODING_GATE) the whole block is stripped SILENTLY so
-    # the decomposer never even learns cli_run/edit_json exist — it just sees
-    # the GUI action set and uses it. Otherwise only the marker lines are
-    # stripped (content kept). See domain.GUI_ONLY_DOMAINS.
+    # Domain coding-gate: the cli_run/edit_json "coding route" of the
+    # decomposer prompt is wrapped in {{# CODING_ROUTE #}} ... {{# END
+    # CODING_ROUTE #}}. For GUI-only domains (and when the gate is on) the
+    # whole block is stripped so the decomposer never learns those actions
+    # exist; otherwise only the marker lines go. See domain.GUI_ONLY_DOMAINS.
     _CODING_ROUTE_BLOCK_RE = re.compile(
         r"\{\{#\s*CODING_ROUTE\s*#\}\}.*?\{\{#\s*END\s+CODING_ROUTE\s*#\}\}\n?",
         re.DOTALL)
@@ -44,9 +41,9 @@ class Actor:
         r"\{\{#\s*(?:END\s+)?CODING_ROUTE\s*#\}\}\n?")
 
     def _load_decomposer_system_template(self) -> str:
-        """Return the A2 decomposer template with ``{{# FROZEN ... #}}`` markers
-        stripped (cached). Uses the bundled ``DECOMPOSER_SYSTEM_TEMPLATE`` constant
-        unless ``decomposer_system_path`` overrides it with an external file."""
+        """Decomposer template with ``{{# FROZEN ... #}}`` markers stripped
+        (cached). Uses bundled ``DECOMPOSER_SYSTEM_TEMPLATE`` unless
+        ``decomposer_system_path`` points at an external file."""
         if self._decomposer_system_template is not None:
             return self._decomposer_system_template
         if self.decomposer_system_path:
@@ -65,12 +62,8 @@ class Actor:
     def _pa_call_actor_points(self, instruction: str, subgoal: str,
                                 screenshot_bytes: bytes,
                                 screen_size: Tuple[int, int]) -> str:
-        """Decomposer LLM with inline grounding actor path.
-
-        Returns a string in UI-TARS's Thought/Action format so the
-        downstream parser (``_pa_parse_actor_response`` /
-        ``_pa_to_pyautogui``) sees a consistent shape.
-        """
+        """Inline-grounding actor path. Returns UI-TARS Thought/Action text
+        so the downstream parser sees a consistent shape."""
         from mm_agents.structagent.core.actor.decomposer_actor import (
             call_decomposer_actor, INLINE_GROUNDING_INSTRUCTION,
         )
@@ -81,10 +74,9 @@ class Actor:
                 "the decomposer actor requires decomposer_model "
                 "(or planner model attribute to fall back to)"
             )
-        # Alias → served-model-name map, mirroring the planner's own
-        # _call_llm_vllm so the decomposer recognises OpenRouter-hosted
-        # multimodal models (Claude, GPT-4o, Gemini, Qwen-VL-32B) in
-        # addition to the local vLLM set. Keep in sync with _call_llm_vllm.
+        # Alias -> served-model-name map, mirroring the planner's
+        # _call_llm_vllm so the decomposer also recognises OpenRouter-hosted
+        # models on top of the local vLLM set. Keep in sync with _call_llm_vllm.
         dec_key = dec_alias.split("_")[-1] if "_" in dec_alias else dec_alias
         dec_model = ME.model_name(dec_key) if ME.is_known(dec_key) else dec_alias
         dec_url = ((ME.server_url(dec_key) if ME.is_known(dec_key) else None)
@@ -96,9 +88,8 @@ class Actor:
                 "or the planner's model_url")
         dec_url = dec_url if dec_url.endswith("/v1") else dec_url.rstrip("/") + "/v1"
 
-        # Fill decomposer template context (subgoal + completed + remaining).
-        # str.replace, NOT .format(): the template contains literal JSON
-        # examples that .format() would misinterpret as placeholders.
+        # Fill template context. str.replace, NOT .format(): the template has
+        # literal JSON examples that .format() would read as placeholders.
         tpl = self._load_decomposer_system_template()
         completed_str = "\n".join(f"  ✓ {s}" for s in self.completed_subgoals) or "  (none)"
         remaining_str = "\n".join(f"  {i+2}. {s}"
@@ -107,13 +98,10 @@ class Actor:
                        .replace("{completed_subgoals}", completed_str)
                        .replace("{remaining_subgoals}", remaining_str))
 
-        # Domain coding-gate (ENABLE_DOMAIN_CODING_GATE): GUI-only domains
-        # (chrome/gimp/thunderbird) SILENTLY lose the cli_run/edit_json
-        # "coding route" — strip the whole {{# CODING_ROUTE #}} block so the
-        # decomposer never even learns those actions exist and just uses the
-        # GUI action set. Other domains (os/vs_code/libreoffice/vlc) keep
-        # coding — only the marker lines are stripped. Gate off → always keep
-        # (byte-identical to current behaviour).
+        # Domain coding-gate: GUI-only domains silently lose the
+        # cli_run/edit_json coding route (strip the whole {{# CODING_ROUTE #}}
+        # block). Other domains keep it (strip only the marker lines). Gate
+        # off -> always keep.
         from mm_agents.structagent.config import CAConfig as _CAC
         from mm_agents.structagent.domain import is_gui_only as _is_gui_only
         if _CAC.from_env().domain_coding_gate and _is_gui_only(
@@ -122,10 +110,8 @@ class Actor:
         else:
             rendered = self._CODING_ROUTE_MARKER_RE.sub("", rendered)
 
-        # Domain-specific structured-action catalogue injection. All
-        # LibreOffice document mutations route through structured
-        # calc_*/impress_*/writer_* JSON actions; the per-domain schema
-        # is injected only when that domain is active.
+        # Inject the structured-action catalogue for the active LibreOffice
+        # domain (all doc mutations route through calc_*/impress_*/writer_*).
         dom = getattr(self, "_current_domain", None)
         if (dom or "").lower() in ("libreoffice_calc",
                                    "libreoffice_impress"):
@@ -175,14 +161,11 @@ class Actor:
             )
 
 
-        # Actor experience memory (L1 subgoal-level actions) — gated on
-        # ENABLE_PLANNER_EXPERIENCE_MEMORY. Retrieves past successful
-        # action recipes whose subgoal/when_to_use matches the current
-        # subgoal, renders a block with typical_actions + gotchas, and
-        # appends to the decomposer system prompt. Render layer returns
-        # ("", meta_with_OOD_mode) on miss → safe no-op. Also dumps
-        # block+meta to <results_dir>/planner_memory_debug/ keyed on
-        # subgoal slug + completed-count for ordering.
+        # Actor experience memory (L1 subgoal-level). Retrieves past
+        # successful action recipes matching this subgoal and appends a
+        # typical_actions + gotchas block to the prompt. Render returns ""
+        # on a miss (safe no-op). Also dumps block+meta to
+        # <results_dir>/planner_memory_debug/.
         from mm_agents.structagent.config import CAConfig
         if CAConfig.from_env().planner_experience_memory and subgoal:
             try:
@@ -226,13 +209,11 @@ class Actor:
                     _l1e,
                 )
 
-        # Failure-attribution v2 actor recovery block: when the planner
-        # path attributed the previous stuck state to ROLE=actor + decided
-        # ``actor_redo``, it stashed prose-level recovery guidance on
-        # ``self._pending_actor_recovery_payload``. Inject + clear here so
-        # the actor sees it exactly once (per recovery cycle). Gated on
-        # USE_FAILURE_ATTRIBUTION env at the planner-side stash; this
-        # consumer is unconditional — if there's a payload, use it.
+        # Failure-attribution actor recovery block: when the planner blamed
+        # the stuck state on ROLE=actor + ``actor_redo``, it stashed recovery
+        # guidance on ``self._pending_actor_recovery_payload``. Inject + clear
+        # here so the actor sees it exactly once. Consumer is unconditional:
+        # if there's a payload, use it.
         _actor_recov_payload = getattr(
             self, "_pending_actor_recovery_payload", None)
         if _actor_recov_payload:
@@ -257,13 +238,12 @@ class Actor:
                     "[FailureAttribution] recovery-block render failed "
                     "(ignored): %s", _recov_e)
             finally:
-                # One-shot consumption — clear so next subgoal doesn't
-                # re-receive the same stale recovery context.
+                # One-shot: clear so the next subgoal doesn't re-receive it.
                 self._pending_actor_recovery_payload = None
 
-        # Append the directive that makes the decomposer emit a 0-1000 ``point``
-        # (and start_point/end_point/anchor_point for drag/scroll) per spatial
-        # action — decomposer_actor reads these coordinates directly.
+        # Directive that makes the decomposer emit a 0-1000 ``point`` (plus
+        # start/end/anchor_point for drag/scroll) per spatial action;
+        # decomposer_actor reads these coordinates directly.
         rendered = rendered + "\n\n" + INLINE_GROUNDING_INSTRUCTION
 
         # Apply online debug runtime prompt patch (actor target)
@@ -271,16 +251,14 @@ class Actor:
 
         _logger.info("[PA-Actor] decomposer=%s (alias=%s) @ %s",
                      dec_model, dec_alias, dec_url)
-        # OpenRouter-hosted decomposers need the real API key; local vLLM
-        # accepts "EMPTY".
+        # OpenRouter needs the real key; local vLLM accepts "EMPTY".
         if "openrouter.ai" in dec_url:
             dec_api_key = os.environ.get("OPENROUTER_API_KEY") or "EMPTY"
         else:
             dec_api_key = "EMPTY"
         dec_client = openai.OpenAI(base_url=dec_url, api_key=dec_api_key)
-        # [Possibly useful files] inventory from the env-perceiver —
-        # passed verbatim so extract_info can't invent filenames from a
-        # pattern.
+        # Env-perceiver file inventory, passed verbatim so extract_info can't
+        # invent filenames from a pattern.
         _useful_paths: Optional[List[str]] = None
         try:
             if self.ledger is not None and self.ledger.initial_context is not None:
@@ -307,9 +285,9 @@ class Actor:
         )
 
     def _build_working_memory_text(self) -> Optional[str]:
-        """A6: render the per-outcome Fact view for the decomposer
-        prompt. Returns None when no Facts are live so the call site
-        doesn't inject an empty block."""
+        """Render the per-outcome Fact view for the decomposer prompt.
+        Returns None when no Facts are live so the caller skips an empty
+        block."""
         try:
             from mm_agents.structagent.ledger.core.records import (
                 render_working_memory,
@@ -326,9 +304,7 @@ class Actor:
 
     def _pa_call_actor(self, instruction: str, subgoal: str, screenshot_bytes: bytes,
                        screen_size: Tuple[int, int]) -> str:
-        """Decomposer actor: one subgoal -> one Thought/Action emission
-        (decomposer LLM with inline grounding; calc_*/impress_*/writer_*
-        catalogues injected for LibreOffice domains). Output is UI-TARS
-        Thought/Action format so the shared parser handles it."""
+        """One subgoal -> one Thought/Action emission via the inline-grounding
+        decomposer."""
         return self._pa_call_actor_points(instruction, subgoal,
                                           screenshot_bytes, screen_size)

@@ -1,16 +1,12 @@
 """Recovery transition labels.
 
-Adapts Claude Code's ``transition: Continue | undefined`` discriminator
-(see plan file Part I.1) to Causal-Agent's recovery dispatcher. A
-transition is a *receipt* — written after the previous turn fired one
-of the 5 stuck categories (or a normal-flow label), so tests and
-downstream escalation (T3 done-auditor) can see which path fired
-without inspecting prompt / message contents.
+A transition is a receipt written after a turn fires a stuck category
+(or normal-flow label), so tests and downstream escalation (T3
+done-auditor) can see which path fired without parsing messages.
 
-The 5 stuck categories match those set on ``self._force_replan_category``
-by ``recovery.dispatcher._decide_planner_mode_and_reason``. The 2
-normal-flow labels match the ``mode`` strings returned by the same
-dispatcher.
+Stuck categories match ``self._force_replan_category`` set by
+``recovery.dispatcher._decide_planner_mode_and_reason``; normal-flow
+labels match that dispatcher's ``mode`` strings.
 """
 
 from typing import Literal
@@ -30,8 +26,7 @@ Transition = Literal[
 ]
 
 
-# The 6 stuck categories as a frozenset. Useful for filters like
-# "did the previous turn fire any recovery path?".
+# Stuck categories as a frozenset, for "did the last turn fire recovery?" filters.
 STUCK_CATEGORIES: "frozenset[str]" = frozenset({
     "actor_failure",
     "done_rejected",

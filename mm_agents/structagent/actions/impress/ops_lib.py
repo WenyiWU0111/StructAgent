@@ -1,48 +1,33 @@
-"""Pre-built LibreOffice Impress operations injected into every
-cli_run_uno script when the task domain is ``libreoffice_impress``.
+"""Pre-built LibreOffice Impress ops, injected into every cli_run_uno
+script for the ``libreoffice_impress`` domain.
 
-Mirrors :mod:`mm_agents.actions.calc.ops_lib`: the IMPRESS_OPS_LIBRARY string is
-concatenated AFTER the connect + domain-setup block and BEFORE the
-actor's body, so the actor's structured ``impress_*`` actions can call
-``op_impress_*`` and ``verify_impress_*`` helpers directly without
-writing any UNO API.
+Mirrors :mod:`mm_agents.actions.calc.ops_lib`: IMPRESS_OPS_LIBRARY is
+concatenated after the connect + domain-setup block and before the
+actor body, so structured ``impress_*`` actions call ``op_impress_*`` /
+``verify_impress_*`` directly without touching the UNO API. Helpers rely
+on the wrapper's globals: ``doc``, ``slides`` (= ``doc.DrawPages``),
+``controller``, ``active_slide``.
 
-Each helper relies on the wrapper's already-bound globals: ``doc``,
-``slides`` (= ``doc.DrawPages``), ``controller``, ``active_slide``.
+  * ``op_impress_*``     — mutations; raise on failure (the wrapper
+                           turns the exception into a ``FAIL: <reason>``
+                           ledger entry the planner sees next turn).
+  * ``verify_impress_*`` — read-only checks for init_ledger's
+                           verify_spec; return ``True`` / ``False``.
 
-Two kinds of helpers live here:
+Known limitations (verified on the OSWorld docker LO build):
 
-  * ``op_impress_*(...)``  — mutation operations.  Raise on failure;
-                            the wrapper turns the exception into a
-                            ``FAIL: <reason>`` ledger entry so the
-                            planner sees the concrete cause on the
-                            next turn.
+  * ``op_impress_move_slide`` — this build rejects both
+    ``XDrawPage.Number = N`` and the duplicate-shift workaround. The op
+    raises a clear error so the planner routes around it (usually a
+    delete + new-slide sequence).
 
-  * ``verify_impress_*(...)`` — read-only checks for init_ledger's
-                            verify_spec.  Return ``True`` / ``False``;
-                            the caller prints ``PASS`` / ``FAIL``.
-
-Known limitations (verified live-VM against the OSWorld docker LO
-build):
-
-  * ``op_impress_move_slide`` — this LO build rejects both
-    ``XDrawPage.Number = N`` (the documented reorder primitive) AND
-    the duplicate-shift workaround.  The op raises a clear error so
-    the planner can route around it (typically by emitting a delete
-    + new-slide sequence instead).
-
-  * ``op_impress_insert_chart`` — LO Impress's chart insertion goes
-    through OLE2Shape + a CLSID property write.  On this LO build the
-    CLSID setter raises a NATIVE C++ fault (``svx/source/unodraw/
-    unoshap4.cxx:199``) that bypasses Python's ``except`` chain, so the
-    op finishes after adding the OLE2Shape placeholder but without an
-    embedded chart Model.  ``verify_impress_chart_exists`` (with NO
-    chart_type / title filter) still passes on the OLE2Shape class.
-    Use this op as best-effort and prefer setting chart_type=None /
-    title=None in the verify spec for those tasks.
-
-The remaining 19 ops + 15 verifies have been exercised end-to-end on
-the live VM and reliably mutate / probe state.
+  * ``op_impress_insert_chart`` — the OLE2Shape CLSID setter raises a
+    native C++ fault (``svx/source/unodraw/unoshap4.cxx:199``) that
+    bypasses Python's ``except``, so the op leaves an OLE2Shape
+    placeholder with no embedded chart Model.
+    ``verify_impress_chart_exists`` (no chart_type / title filter) still
+    passes on the OLE2Shape class — treat the op as best-effort and
+    prefer chart_type=None / title=None in the verify spec.
 """
 
 IMPRESS_OPS_LIBRARY = '''

@@ -1,15 +1,12 @@
 """Task-agnostic environment probe.
 
-A single batched bash script run on the OSWorld VM at task start that
-captures user identity, available binaries, common app config-file
-locations, the GNOME GSettings schema pool, and current-running
-processes. The intent is to ground the ledger initializer (and the
-planner downstream) in the VM's actual state rather than pre-baked
-domain knowledge.
+One batched bash script run on the OSWorld VM at task start, capturing user
+identity, available binaries, app config-file locations, the GSettings schema
+pool, and running processes — to ground the ledger initializer (and planner) in
+the VM's actual state rather than pre-baked domain knowledge.
 
-The script is fully task-agnostic — it does NOT consume the user's
-instruction. Per-task filtering (selecting which schemas / binaries
-matter for *this* task) happens later, in
+It does NOT consume the user's instruction; per-task filtering (which schemas /
+binaries matter for *this* task) happens later in
 :func:`mm_agents.perceiver.perceiver.perceive_environment`.
 """
 from __future__ import annotations
@@ -19,9 +16,8 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
-# Inline shell. Each command falls back to /dev/null on error so a
-# missing tool never blocks the rest. ``head`` caps output of the
-# noisier commands so the total payload stays around 4-10KB.
+# Inline shell. Each command swallows errors so a missing tool never blocks the
+# rest; ``head`` caps the noisier commands to keep the payload ~4-10KB.
 PROBE_SCRIPT = r"""
 echo "### identity"
 echo "user=$(whoami)  home=$HOME"
@@ -79,10 +75,8 @@ pgrep -af '(code|chrome|firefox|thunderbird|soffice|gimp|vlc)' 2>/dev/null \
 """
 
 
-# Domain-conditional probe sections. Appended to :data:`PROBE_SCRIPT`
-# only when the task's domain matches. Keep each tail bash-only and
-# fully read-only (no app launches, no writes) — the probe contract is
-# that it never mutates VM state.
+# Domain-conditional tails, appended to PROBE_SCRIPT when the domain matches.
+# Keep each bash-only and fully read-only — the probe never mutates VM state.
 
 _VSCODE_PROBE_TAIL = r"""
 echo "### vscode config"
@@ -189,8 +183,8 @@ fi
 """
 
 
-# Map of canonical-domain (lowercased, _-separated) → tail. Aliases
-# (e.g. "vscode" for "vs_code") are normalised in :func:`build_probe_script`.
+# canonical domain (lowercased, _-separated) → tail. Aliases (e.g. "vscode")
+# are normalised in build_probe_script.
 _DOMAIN_PROBE_TAILS = {
     "vs_code":              _VSCODE_PROBE_TAIL,
     "chrome":               _CHROME_PROBE_TAIL,
@@ -210,17 +204,16 @@ _DOMAIN_PROBE_ALIASES = {
 
 
 def build_probe_script(domain: Optional[str] = None) -> str:
-    """Return the bash probe script, with any domain-specific tail
-    appended. ``domain=None`` (or an unrecognised domain) returns the
-    common probe unchanged. ``multi_apps`` emits every app tail so a
-    cross-app task sees all relevant configs.
+    """Return the probe script with any domain-specific tail appended.
+
+    domain=None or an unrecognised domain returns the common probe unchanged;
+    ``multi_apps`` emits every app tail so a cross-app task sees all configs.
     """
     d = (domain or "").lower().strip()
     d = _DOMAIN_PROBE_ALIASES.get(d, d)
     if d == "multi_apps":
-        # Cross-app task — emit every app-specific tail. Dedupe by
-        # identity to avoid the LibreOffice tail being concatenated
-        # three times.
+        # Every app tail; dedupe by identity (the LibreOffice tail is shared by
+        # three domains).
         seen = set()
         parts = []
         for v in _DOMAIN_PROBE_TAILS.values():
@@ -240,15 +233,10 @@ def probe_environment(
     domain: Optional[str] = None,
     timeout_s: int = 10,
 ) -> Optional[str]:
-    """Run the probe script on the VM via
-    ``env.controller.run_bash_script`` and return the combined stdout.
+    """Run the probe script on the VM via env.controller.run_bash_script.
 
-    The script is :data:`PROBE_SCRIPT` plus any domain-specific tail
-    appended by :func:`build_probe_script`.
-
-    Returns ``None`` if the env doesn't expose ``run_bash_script`` or the
-    script run failed — caller should treat this as "no probe available"
-    and fall back to current behavior (no environment context).
+    Returns combined stdout, or None if the env lacks run_bash_script or the run
+    failed — caller treats None as "no probe available" (no environment context).
     """
     if not env or not getattr(env, "controller", None):
         logger.info("[Probe] no env / controller; skipping")

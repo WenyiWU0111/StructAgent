@@ -1,33 +1,15 @@
-"""A8-V0: LLM-based stuck-state diagnosis for the planner's force_replan path.
+"""LLM-based stuck-state diagnosis for the planner's force_replan path.
 
-When the planner has already issued N replans against the same focus
-outcome without progress, the existing 6-rule recovery cascade has done
-its job — it fired force_replan, surfaced a stuck_reason, and let the
-planner try again. But the failure mode this addresses is the case where
-*the planner keeps trying* and *still can't recognize the root cause*
-on its own — typically because the relevant pieces (what O4 requires,
-what working memory holds, what's currently observable, what the recent
-actions actually changed) are scattered across separate parts of the
-prompt.
+The 6-rule recovery cascade fires force_replan but the planner often still
+can't spot the root cause on its own, because the relevant signals are
+scattered across the prompt. This module collects those structured pieces,
+hands them to a small LLM call, and gets back: a root-cause summary, a
+category tag, a "missing or wrong" list, and a next-action hint. The result
+is rendered into the force_replan prompt under [Stuck diagnosis ...].
 
-This module's job is to be a high-fidelity information collector that
-hands all of those structured pieces to a small LLM call which
-synthesizes:
-  • a 2-3 sentence root-cause summary
-  • a category tag (info_gap / wrong_info / wrong_target / wrong_env /
-    strategy_unfit / unclear)
-  • a concrete "missing or wrong" list
-  • a short next-action hint
-
-The result is rendered into the force_replan prompt under
-[Stuck diagnosis ...]. Cache memoizes by (focus_id, action-summary digest,
-observation digest) so unchanged state re-uses the prior diagnosis
-without re-billing.
-
-For debug: every call's full prompt messages + raw response + parsed
-result get persisted under ``{results_dir}/stuck_diagnosis/`` keyed by
-step + focus outcome. Cache hits also dump (with cache_status="hit") so
-the trace is complete.
+Cache memoizes by (focus_id, action digest, observation digest, screenshot
+digest) so unchanged state reuses the prior diagnosis. Every call (incl.
+cache hits) is persisted under ``{results_dir}/stuck_diagnosis/`` for debug.
 """
 
 from __future__ import annotations
@@ -44,11 +26,8 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
-# How many replans against the same focus outcome must have happened
-# before we fire the diagnose call. 0 = fire every force_replan; 2 =
-# fire only after the planner has already replanned ≥2 times here.
-# Conservative default avoids LLM calls on first-replan turns where the
-# 6-rule cascade has not yet shown the planner can't self-recover.
+# Replans on the same focus before firing diagnose. 0 = every force_replan;
+# 2 avoids LLM calls on first-replan turns where self-recovery is still likely.
 STUCK_DIAGNOSIS_MIN_REPLANS = 2
 
 # Cap on per-turn LLM input size (rough char budget).
@@ -139,9 +118,8 @@ class StuckDiagnosis:
         }
 
 
-# Legacy 6-category → new 4-category mapping. Used when reading cached
-# diagnoses written by older diagnose runs (the cache lives on
-# focus_outcome.last_stuck_diagnosis). Keeps cross-version replay sane.
+# Legacy 6-category → new 4-category mapping, for cached diagnoses written by
+# older runs (cache lives on focus_outcome.last_stuck_diagnosis).
 _LEGACY_CATEGORY_MAP = {
     "info_gap":       ("info",      None),
     "wrong_info":     ("info",      None),
@@ -161,13 +139,12 @@ _VALID_SUBKINDS = {
 def _normalize_category(
     raw_category: str, raw_subkind: Optional[str],
 ) -> tuple:
-    """Accept either the new 4-cat enum or the old 6-cat enum (from
-    cached diagnoses). Returns (category, tactical_subkind).
+    """Map new 4-cat or legacy 6-cat enum → (category, tactical_subkind).
     Unknown values map to ('unclear', None)."""
     c = (raw_category or "").strip().lower()
     s = (raw_subkind or "").strip().lower() if raw_subkind else None
     if c in _NEW_CATEGORIES:
-        # New schema: validate subkind only when tactical.
+        # subkind only meaningful when tactical.
         if c == "tactical":
             return ("tactical", s if s in _VALID_SUBKINDS else None)
         return (c, None)
@@ -182,11 +159,8 @@ def _normalize_category(
 
 
 def replans_on_focus(strategy_history: List[Any], focus_id: Optional[str]) -> int:
-    """Count REPLAN events whose ``focus_outcome_id`` matches ``focus_id``.
-    'install' events are excluded (no prior strategy to replan from);
-    'same' and 'switch' both count as "the planner felt this wasn't
-    working".
-    """
+    """Count REPLAN events matching ``focus_id``. 'install' is excluded (no
+    prior strategy to replan from); 'same' and 'switch' both count."""
     if not focus_id:
         return 0
     return sum(
@@ -236,32 +210,24 @@ _ACTION_LINE_RE = re.compile(r"^\*\s+([a-z][a-z0-9_]+)\s+[—–-]\s+(.+)$", re.
 
 def _extract_action_one_liners(schema_text: str) -> List[tuple]:
     """Pull (action_name, one-line-description) pairs from an
-    ``action_schema_block()`` text. The schema follows the pattern
-    ``* <name> — <description>`` with optional JSON-template lines
-    indented below. We grab the first description line only — diagnose
-    just needs the name + purpose, not the full param signature."""
+    ``action_schema_block()`` text (``* <name> — <description>``). First
+    description line only — diagnose needs name + purpose, not the signature."""
     out: List[tuple] = []
     seen = set()
     for m in _ACTION_LINE_RE.finditer(schema_text or ""):
         name = (m.group(1) or "").strip()
         desc = (m.group(2) or "").strip().rstrip(",;:")
-        # Some descriptions start with continuation prefix like "—" or "-"
         if not name or name in seen:
             continue
         seen.add(name)
-        # Truncate to one short line (description sometimes runs long).
         out.append((name, desc[:160]))
     return out
 
 
 def _render_available_actions_section(domain: Optional[str]) -> str:
-    """Render the AVAILABLE ACTIONS catalogue for diagnose.
-
-    Lists base GUI/CLI actions always present, then the domain-specific
-    structured ops when ``domain`` is one of the LibreOffice variants.
-    Tries to keep total length manageable (target ≤2k chars) so the
-    diagnostician's prompt stays focused.
-    """
+    """Render the AVAILABLE ACTIONS catalogue: base GUI/CLI actions plus the
+    domain-specific structured ops for LibreOffice variants. Kept short
+    (~2k chars) to keep the diagnostician's prompt focused."""
     lines: List[str] = ["  # Always available (GUI + shell):"]
     for name, desc in _BASE_ACTIONS:
         lines.append(f"  - {name:<15} : {desc}")
@@ -297,8 +263,7 @@ def _render_available_actions_section(domain: Optional[str]) -> str:
             for name, desc in ops:
                 lines.append(f"  - {name:<32} : {desc}")
     except Exception:
-        # Any import / extract failure is non-fatal; the base block above
-        # is still useful and the LLM will still produce a hint.
+        # Non-fatal: the base block above is still a usable catalogue.
         pass
 
     return "\n".join(lines)
@@ -356,27 +321,21 @@ def _render_goal_section(focus_outcome: Any) -> str:
     return "\n".join(lines)
 
 
-# Match literal ``Action: <verb>(<args>)`` text in an actor response.
-# The first capture group is the action verb; the second is the
-# parens-balanced arg blob (truncated to a reasonable size).
+# Match ``Action: <verb>(<args>)`` in an actor response. Group 1 = verb,
+# group 2 = arg blob.
 _ACTION_SIGN_RE = re.compile(r"Action:\s*([a-z_][a-z0-9_]*)\(([^)]{0,300})\)",
                               re.IGNORECASE)
 
-# Keyword arg names whose VALUE is content/data rather than target
-# identity. When generating a rollup signature we drop these arg's
-# values (replacing them with ``…``) so calls that hit the same target
-# with different payloads cluster together — that's the pattern we
-# need to catch ("5x impress_set_text on the SAME shape with different
-# text" → 1 group of 5 in rollup, not 5 groups of 1).
+# Kwargs whose value is content/data, not target identity. Blanked to ``…`` in
+# rollup signatures so same-target/different-payload calls cluster (5x
+# impress_set_text on the SAME shape → 1 group of 5, not 5 groups of 1).
 _VALUE_ARG_NAMES = frozenset({
     "text", "content", "value", "values", "new_text", "formula",
     "formula_template", "header", "body", "message", "name",
     "font_name", "color", "url", "path", "filename", "command",
 })
 
-# Within the args blob, find ``<name>=<value>`` pairs. The value can
-# be a quoted string, a number, or a bracketed list — we just want to
-# blank out content-like values, so a tolerant pattern is fine.
+# ``<name>=<value>`` pairs in the args blob (quoted string / number / list).
 _KWARG_RE = re.compile(
     r"(?P<name>[a-z_][a-z0-9_]*)\s*=\s*"
     r"(?P<value>(?:'[^']*'|\"[^\"]*\"|\[[^\]]*\]|[^,)]+))",
@@ -385,16 +344,10 @@ _KWARG_RE = re.compile(
 
 
 def _extract_action_signature(action_text: str) -> Optional[str]:
-    """Extract a canonical ``<verb>(<args>)`` signature from an actor
-    response. Returns None if the response has no ``Action: ...``
-    payload.
-
-    Normalization: blank out kwarg values for content/data args
-    (text, content, value, formula, etc.) so the SAME target with
-    different payloads clusters into one rollup row. Keep target-
-    identifying args (slide, shape, sheet, column, a1_ref, key,
-    coords, etc.) verbatim so distinct targets stay separate.
-    """
+    """Extract a canonical ``<verb>(<args>)`` signature from an actor response,
+    or None if there's no ``Action: ...`` payload. Content/data kwarg values
+    are blanked so same-target/different-payload calls cluster; target-
+    identifying args (slide, shape, a1_ref, coords, ...) stay verbatim."""
     if not action_text:
         return None
     m = _ACTION_SIGN_RE.search(action_text)
@@ -402,14 +355,12 @@ def _extract_action_signature(action_text: str) -> Optional[str]:
         return None
     verb = m.group(1).strip().lower()
     args = m.group(2).strip()
-    # Drop kwarg values for content-like args.
     def _sub(m2):
         name = m2.group("name").lower()
         if name in _VALUE_ARG_NAMES:
             return f"{m2.group('name')}=…"
         return m2.group(0)
     args = _KWARG_RE.sub(_sub, args)
-    # Normalize whitespace.
     args = re.sub(r"\s+", " ", args)
     return f"{verb}({args[:80]})"
 
@@ -417,19 +368,12 @@ def _extract_action_signature(action_text: str) -> Optional[str]:
 def _render_action_rollup_section(
     timeline: List[Any], focus_id: str, *, max_n: int = 12,
 ) -> str:
-    """Group the last N actions on this focus by their literal
-    ``<verb>(<args>)`` signature and report the count + observable
-    deltas (perceiver's ``overall`` verdict).
-
-    Without this, RECENT ATTEMPTS surfaces 5 raw action strings and the
-    LLM has to manually count "tried this 5x". The v_p audit showed one
-    case where the planner emitted ``impress_set_text`` with the SAME
-    shape arg 27 times — invisible in the raw list. This rollup makes
-    it impossible to miss.
-    """
+    """Group the last N actions on this focus by ``<verb>(<args>)`` signature,
+    reporting count + observable deltas (perceiver ``overall`` verdict). Makes
+    "tried this 27x with no change" impossible to miss in the raw action list."""
     if not timeline:
         return "  (no actions on record this strategy)"
-    # Walk newest → oldest, collect last ``max_n`` step records.
+    # Newest → oldest, last ``max_n`` step records.
     flat: List[Any] = []
     for ev in reversed(timeline):
         for s in reversed(getattr(ev, "steps", []) or []):
@@ -439,7 +383,6 @@ def _render_action_rollup_section(
         if len(flat) >= max_n:
             break
     flat.reverse()
-    # Group by signature.
     groups: Dict[str, Dict[str, Any]] = {}
     for s in flat:
         action_text = (getattr(s, "actor_action_summary", "") or "").strip()
@@ -464,8 +407,7 @@ def _render_action_rollup_section(
             g["outcomes"]["unknown"] += 1
     if not groups:
         return "  (no parseable Action: lines in recent attempts)"
-    # Sort by count desc — most-tried signatures first (those are the
-    # exhaustion candidates the diagnostician must flag as strategic).
+    # Most-tried first — these are the strategic-exhaustion candidates.
     ranked = sorted(groups.items(),
                      key=lambda kv: (-kv[1]["count"], kv[1]["last_step"]))
     lines: List[str] = []
@@ -474,13 +416,13 @@ def _render_action_rollup_section(
         first = g["first_step"]
         last = g["last_step"]
         out = g["outcomes"]
-        # Compact delta summary: only mention non-zero buckets.
+        # Non-zero buckets only.
         delta_bits = []
         for k in ("yes", "partial", "no", "unknown"):
             if out[k] > 0:
                 delta_bits.append(f"{k}={out[k]}")
         delta_str = ", ".join(delta_bits)
-        # Flag exhaustion: 3+ tries with no positive delta = strategic candidate.
+        # 3+ tries with no positive delta = strategic-exhaustion candidate.
         flag = ""
         if cnt >= 3 and out["yes"] == 0 and out["partial"] == 0:
             flag = "  ⚠ STRATEGIC CANDIDATE (≥3 tries, no positive delta)"
@@ -494,11 +436,9 @@ def _render_action_rollup_section(
 
 
 def _render_prior_diagnoses_section(focus_outcome: Any) -> str:
-    """Render the last 3 diagnoses on the SAME focus outcome. Without
-    this, the diagnostician cannot tell that it just said the opposite
-    thing 2 steps ago — and v_p data showed 11-call foci flip-flopping
-    between wrong_target and wrong_env on adjacent calls.
-    """
+    """Render the last 3 diagnoses on the SAME focus, so the diagnostician
+    can see it just said the opposite 2 steps ago. Kills the observed
+    wrong_target ↔ wrong_env flip-flop on adjacent calls."""
     history = list(getattr(focus_outcome, "recent_stuck_diagnoses", []) or [])
     if not history:
         return "  (no prior diagnoses on this focus — this is the first call)"
@@ -518,16 +458,13 @@ def _render_prior_diagnoses_section(focus_outcome: Any) -> str:
 
 
 def _render_cli_run_section(cli_run_output: Optional[Dict[str, Any]]) -> str:
-    """Render the most recent cli_run/open_app result so diagnose can
-    see script crashes, returncodes, stdout / stderr from the actor's
-    own commands. WITHOUT this, diagnose cannot distinguish a script
-    that crashed at line 5 from one that ran but produced wrong output.
+    """Render the most recent cli_run/open_app result (returncode, stdout,
+    stderr) so diagnose can tell a crash from wrong output.
 
-    ``cli_run_output`` is the dict persisted to /tmp/_last_cli_run.json
-    by the cli_run wrappers (see actions/handlers/cli_run_helpers.py:71). Shape:
+    ``cli_run_output`` is the dict persisted to /tmp/_last_cli_run.json by the
+    cli_run wrappers (see actions/handlers/cli_run_helpers.py:71):
         {command, mode, returncode, stdout, stderr, timestamp}
-    Truncated heads/tails so the LLM sees the salient ends.
-    """
+    Heads/tails truncated to keep the salient ends."""
     if not isinstance(cli_run_output, dict) or not cli_run_output:
         return "  (no cli_run / open_app executed since last reset)"
     cmd = (cli_run_output.get("command") or "").strip()
@@ -540,8 +477,7 @@ def _render_cli_run_section(cli_run_output: Optional[Dict[str, Any]]) -> str:
         f"  mode:       {mode}",
         f"  returncode: {rc if rc is not None else '(none — backgrounded)'}",
     ]
-    # stdout: show head + tail if long (script may print progress at
-    # head and the error at the tail).
+    # stdout: head + tail if long (progress at head, error at tail).
     if stdout:
         if len(stdout) > 800:
             lines.append(f"  stdout (head, {len(stdout)} chars total):")
@@ -554,7 +490,6 @@ def _render_cli_run_section(cli_run_output: Optional[Dict[str, Any]]) -> str:
     else:
         lines.append("  stdout:     (empty)")
     if stderr:
-        # stderr is usually short; show all.
         lines.append(f"  stderr ({len(stderr)} chars):")
         lines.append("    " + stderr[:1000].replace("\n", "\n    "))
     else:
@@ -563,24 +498,18 @@ def _render_cli_run_section(cli_run_output: Optional[Dict[str, Any]]) -> str:
 
 
 def _render_observation_section(observation: Dict[str, Any]) -> str:
-    """Render a11y-derived signals as supplementary text. Screenshot
-    is passed separately as an image_url message — this is the textual
-    complement, not the primary observation.
+    """Render a11y signals as supplementary text (the screenshot is the
+    primary observation, passed separately as image_url).
 
-    Uses ``linearize_obs_a11y`` to turn the raw AT-SPI XML into
-    tab-separated rows (``tag\\ttext\\tstate``) — the same format the
-    perceiver consumes. We then filter to interactive-widget tags with
-    non-empty text. The prior implementation looked for
-    ``<node role=...>`` regex against the raw XML — but OSWorld AT-SPI
-    XML uses the tag itself as the role (``<push-button name="...">``)
-    with no ``role=`` attribute, so that regex matched 0 / 681 calls in
-    the v_p audit.
-    """
+    ``linearize_obs_a11y`` turns AT-SPI XML into ``tag\\ttext\\tstate`` rows
+    (the perceiver's format); we filter to interactive widgets with non-empty
+    text. NB OSWorld AT-SPI uses the tag itself as the role
+    (``<push-button name=...>``, no ``role=`` attr) — a prior ``role=`` regex
+    matched 0/681 calls."""
     if not isinstance(observation, dict):
         return "  (no observation dict)"
-    # Lazy import: utils.a11y depends on autoglm which may not load in
-    # some replay contexts. If linearization fails we still fall back
-    # below to the raw a11y splitlines.
+    # Lazy import: utils.a11y pulls autoglm, which may not load in some replay
+    # contexts. Fall back to raw splitlines below if linearization fails.
     linearized: Optional[str] = None
     try:
         from mm_agents.structagent.utils.a11y import linearize_obs_a11y
@@ -594,13 +523,9 @@ def _render_observation_section(observation: Dict[str, Any]) -> str:
     if not (linearized and linearized.strip()) and not a11y_raw.strip():
         return "  (no a11y tree captured this turn — rely on the screenshot above)"
 
-    # Interactive AT-SPI widget tags. These are roles a planner / actor
-    # can click, type into, toggle, or navigate to. Structural tags
-    # (panel, section, filler, separator) are EXCLUDED — they add noise
-    # without helping the diagnostician understand what the user can
-    # interact with. ``label`` and ``heading`` are included because they
-    # often carry the visible target text (e.g. "Time range: All time")
-    # even when the actionable control is anonymous.
+    # Interactive AT-SPI tags (clickable/typeable/toggleable). Structural tags
+    # (panel, filler, separator) excluded as noise. label/heading kept: they
+    # often carry the visible target text when the control itself is anonymous.
     _IFACE_TAGS = {
         "push-button", "toggle-button", "menu-item", "menu",
         "entry", "combo-box", "link", "check-box", "radio-button",
@@ -625,8 +550,7 @@ def _render_observation_section(observation: Dict[str, Any]) -> str:
             if key in seen:
                 continue
             seen.add(key)
-            # State is informative — keep "enabled" / "focused" / etc.;
-            # treat "-" as no-state-info.
+            # Keep "enabled"/"focused"/etc.; "-" means no state info.
             state_str = f"  [{state}]" if (state and state != "-") else ""
             extracted.append(f"    {tag:<14}  \"{name[:80]}\"{state_str}")
             if len(extracted) >= _MAX_OBS_A11Y_LINES:
@@ -636,9 +560,8 @@ def _render_observation_section(observation: Dict[str, Any]) -> str:
         lines.append("  a11y interactive widgets (tag / name / state):")
         lines.extend(extracted)
     else:
-        # Fall back to first ~8 non-empty content-bearing lines, raw,
-        # so the LLM at least sees the tree shape; the screenshot
-        # carries the real signal.
+        # Fall back to ~8 raw content-bearing lines so the LLM sees the tree
+        # shape; the screenshot carries the real signal.
         src = linearized or a11y_raw
         snippet: List[str] = []
         for ln in src.splitlines():
@@ -661,16 +584,12 @@ def _render_observation_section(observation: Dict[str, Any]) -> str:
 def _render_recent_attempts_section(
     timeline: List[Any], focus_outcome_id: str, *, max_n: int = _MAX_RECENT_STEPS,
 ) -> str:
-    """Walk the timeline back-to-front, collect the last ``max_n`` step
-    records (regardless of which event they belong to). For each step
-    surface: step_idx, actor_action_summary, and the perceiver overall
-    verdict + relevant_controls count when present (this is the cheapest
-    "what observation did this action produce?" signal we have).
-    """
+    """Last ``max_n`` step records across all events: step_idx,
+    actor_action_summary, and perceiver overall + relevant_controls when
+    present — the cheapest "what did this action produce?" signal."""
     rows: List[Dict[str, Any]] = []
     if not timeline:
         return "  (no recent attempts on record)"
-    # Flatten step records in reverse chronological order.
     flat: List[Any] = []
     for ev in reversed(timeline):
         for s in reversed(getattr(ev, "steps", []) or []):
@@ -679,7 +598,7 @@ def _render_recent_attempts_section(
                 break
         if len(flat) >= max_n:
             break
-    # Re-sort ascending by step_idx for natural read.
+    # Ascending by step_idx for natural read.
     flat.sort(key=lambda s: getattr(s, "step_idx", 0))
     for s in flat:
         rows.append({
@@ -717,16 +636,14 @@ def _render_recent_attempts_section(
 def _screenshot_data_url_from_observation(
     observation: Dict[str, Any],
 ) -> Optional[str]:
-    """Pull the current screenshot bytes from an OSWorld observation
-    dict and return a ``data:image/png;base64,...`` URL ready to embed
-    in an OpenAI-style multimodal message. Returns None when no usable
-    screenshot field is present so the caller can fall back to text.
-    """
+    """Screenshot bytes from an OSWorld observation → ``data:image/png;base64,...``
+    URL for an OpenAI-style multimodal message. None when no usable field, so
+    the caller can fall back to text."""
     if not isinstance(observation, dict):
         return None
     raw = observation.get("screenshot")
     if raw is None:
-        # Some replay paths key the field differently.
+        # Some replay paths key it differently.
         raw = observation.get("screenshot_bytes")
     if raw is None:
         return None
@@ -734,7 +651,7 @@ def _screenshot_data_url_from_observation(
         s = raw.strip()
         if s.startswith("data:image"):
             return s
-        # Bare base64 string — wrap as PNG data URL.
+        # Bare base64 → wrap as PNG data URL.
         return f"data:image/png;base64,{s}"
     if isinstance(raw, (bytes, bytearray, memoryview)):
         try:
@@ -748,16 +665,15 @@ def _screenshot_data_url_from_observation(
 def _screenshot_digest_from_observation(
     observation: Dict[str, Any],
 ) -> str:
-    """Short hash of the current screenshot bytes for the cache
-    signature. Same screen → same digest → cache hit. Returns
-    ``"no_screenshot"`` when the observation lacks bytes."""
+    """Short hash of the screenshot bytes for the cache signature (same screen →
+    same digest → cache hit). ``"no_screenshot"`` when bytes are absent."""
     if not isinstance(observation, dict):
         return "no_screenshot"
     raw = observation.get("screenshot") or observation.get("screenshot_bytes")
     if raw is None:
         return "no_screenshot"
     if isinstance(raw, str):
-        # base64 or data URL — hash the string itself
+        # base64 or data URL — hash the string itself.
         return _digest(raw)
     if isinstance(raw, (bytes, bytearray, memoryview)):
         try:
@@ -770,9 +686,8 @@ def _screenshot_digest_from_observation(
 def _render_recovery_trigger_section(
     stuck_category: Optional[str], stuck_reason: Optional[str],
 ) -> str:
-    """One-line summary of which 6-rule recovery condition fired this
-    turn. Empty marker when the caller didn't pass these (back-compat
-    for any test fixture; LLM still works without it)."""
+    """One-line summary of which 6-rule recovery condition fired this turn.
+    Empty marker when not supplied (back-compat; LLM still works without it)."""
     if not stuck_category and not stuck_reason:
         return "  (no recovery-trigger info supplied — treat as generic stuck)"
     lines: List[str] = []
@@ -823,12 +738,9 @@ def _signature(
     verifier_trace_text: str, recovery_trigger_text: str,
     screenshot_digest: str,
 ) -> str:
-    """Hash the LLM input slice. Identical state → same signature → cache hit.
-
-    A different ``stuck_category`` (or reason) OR a different screenshot
-    produces a different signature: each is part of what the LLM is asked
-    to reason over, so a fresh diagnosis is warranted.
-    """
+    """Hash the LLM input slice; identical state → same signature → cache hit.
+    A different recovery trigger or screenshot changes the signature (each is
+    part of what the LLM reasons over), forcing a fresh diagnosis."""
     blob = "|".join([
         focus_outcome_id,
         _digest(observation_text),
@@ -863,9 +775,8 @@ def _parse_response(raw: str) -> Optional[StuckDiagnosis]:
     hint = str(obj.get("next_action_hint") or "").strip()
     if not summary or not raw_category:
         return None
-    # Map legacy 6-cat → new 4-cat enum + validate subkind.
     category, subkind = _normalize_category(raw_category, raw_subkind)
-    # Bound the field sizes so prompt rendering stays compact.
+    # Bound field sizes so prompt rendering stays compact.
     return StuckDiagnosis(
         root_cause_summary=summary[:600],
         category=category,
@@ -895,18 +806,14 @@ def diagnose_stuck(
     current_domain: Optional[str] = None,
     last_cli_run_output: Optional[Dict[str, Any]] = None,
 ) -> Optional[StuckDiagnosis]:
-    """Run the LLM diagnose, cache the result on the focus outcome, and
-    persist prompt + response to disk for debug. Returns None when the
-    call fails or output can't be parsed (caller should skip rendering
-    the block in that case).
+    """Run the LLM diagnose, cache it on the focus outcome, persist the
+    prompt+response to disk for debug. None on call/parse failure (caller
+    skips rendering the block).
 
-    ``stuck_category`` + ``stuck_reason`` are which 6-rule recovery
-    condition fired (actor_failure / done_rejected / budget_exhausted /
-    replan_cadence / queue_empty_no_done) and its one-line reason. Fed
-    to the LLM so the diagnosis can be scoped tactically — e.g.
-    replan_cadence pulls focus to wrong_target / wrong_env not
-    strategy_unfit.
-    """
+    ``stuck_category`` + ``stuck_reason`` name which 6-rule recovery condition
+    fired (actor_failure / done_rejected / budget_exhausted / replan_cadence /
+    queue_empty_no_done) and its reason — fed to the LLM to scope the
+    diagnosis."""
     if focus_outcome is None:
         return None
 
@@ -927,10 +834,9 @@ def diagnose_stuck(
         stuck_category, stuck_reason,
     )
 
-    # Two text blocks bracketing the screenshot. The screenshot lands
-    # in between so the LLM sees: goal/trigger/memory → look at
-    # screen → recent attempts/verifier trace. Multimodal Qwen3.5-VL
-    # processes images interleaved with text.
+    # Two text blocks bracketing the screenshot, so the LLM reads
+    # goal/trigger/memory → screen → recent attempts/verifier trace.
+    # Qwen3.5-VL processes images interleaved with text.
     text_pre = (
         "GOAL (the outcome currently being attempted):\n"
         f"{goal_section}\n\n"
@@ -962,10 +868,8 @@ def diagnose_stuck(
         f"{trace_section}\n"
     )
 
-    # Extract current screenshot, if available, and emit as image_url.
-    # Falls back to a placeholder when missing — keeps the prompt
-    # working even if the caller passed a screenshot-less observation
-    # (tests, replay tools).
+    # Emit the screenshot as image_url; placeholder when missing (keeps the
+    # prompt working for screenshot-less observations in tests / replay).
     user_content: List[Dict[str, Any]] = [
         {"type": "text", "text": text_pre},
     ]
@@ -982,10 +886,8 @@ def diagnose_stuck(
         })
     user_content.append({"type": "text", "text": text_post})
 
-    # 2. Cache check on the focus outcome. Screenshot bytes are folded
-    # into the signature so the same prompt text but a different screen
-    # still produces a fresh diagnosis (the screen IS the primary
-    # signal now).
+    # 2. Cache check. Screenshot digest is in the signature, so same prompt
+    # text + different screen still produces a fresh diagnosis.
     sig = _signature(
         focus_outcome_id=focus_outcome.id,
         observation_text=obs_section,
@@ -1050,12 +952,9 @@ def diagnose_stuck(
         # Cache the fresh diagnosis on the outcome.
         focus_outcome.last_stuck_diagnosis = diag.to_dict()
         focus_outcome.last_stuck_diagnosis_signature = sig
-        # B1.2: maintain a rolling history (last 3) of diagnoses on this
-        # focus so the NEXT diagnose can see what we said before. This
-        # is what kills the same-focus flip-flop pattern
-        # (wrong_target ↔ wrong_env alternation on consecutive steps in
-        # the v_p audit) — the model now has to either build on its
-        # prior diagnosis or explain why it's flipping.
+        # Rolling history (last 3) so the NEXT diagnose can see what we said
+        # before — kills the wrong_target ↔ wrong_env flip-flop on consecutive
+        # steps (model must build on its prior diagnosis or justify the flip).
         recent = list(getattr(focus_outcome, "recent_stuck_diagnoses", []) or [])
         recent.append({
             "step_idx": step_idx,
@@ -1086,9 +985,8 @@ def diagnose_stuck(
 
 
 def render_stuck_diagnosis(diag: StuckDiagnosis, *, focus_id: str) -> str:
-    """Format the LLM's diagnosis as a single block for the force_replan
-    prompt. Compact (so it doesn't displace other prompt sections) but
-    structured (so the planner can latch onto each part)."""
+    """Format the diagnosis as a single force_replan-prompt block: compact
+    (won't displace other sections) but structured (planner latches on)."""
     category_str = diag.category
     if diag.category == "tactical" and diag.tactical_subkind:
         category_str = f"{diag.category} / {diag.tactical_subkind}"
@@ -1127,12 +1025,9 @@ def _sanitize_messages_for_disk(
     messages: List[Dict[str, Any]],
     *, dir_path: Path, base_fname: str,
 ) -> List[Dict[str, Any]]:
-    """Strip large base64 image_url payloads from messages before JSON
-    dump (to keep stuck_diagnosis JSON files in the KB range instead
-    of MB). The screenshot bytes are saved as a sidecar PNG so the
-    debug viewer can show them; JSON references the sidecar path +
-    a sha256 digest.
-    """
+    """Strip base64 image_url payloads before JSON dump (keeps the JSON in KB,
+    not MB). Screenshot bytes go to a sidecar PNG; JSON references its path +
+    sha256 digest."""
     out: List[Dict[str, Any]] = []
     img_count = 0
     for msg in messages or []:
@@ -1144,7 +1039,7 @@ def _sanitize_messages_for_disk(
                 if (isinstance(item, dict)
                         and item.get("type") == "image_url"):
                     url = (item.get("image_url") or {}).get("url") or ""
-                    # Extract base64 payload + save sidecar PNG.
+                    # Decode base64 → save sidecar PNG.
                     sidecar_name = None
                     digest = None
                     nbytes = None
@@ -1193,16 +1088,12 @@ def _persist_to_disk(
             step_{N:04d}[_{category}]_{focus_id}.json
             step_{N:04d}[_{category}]_{focus_id}_img0.png   (sidecar)
 
-    The category tag is included so two force_replan triggers at the
-    same step (e.g. actor_failure + budget_exhausted in-turn retry)
-    each get their own dump instead of overwriting each other.
+    The category tag keeps two same-step triggers (e.g. actor_failure +
+    budget_exhausted in-turn retry) from overwriting each other.
 
-    Each JSON contains the full text prompt messages, raw LLM response
-    (or None on LLM failure), parsed structured result (or None on
-    parse failure), cache_status, and the cache signature.
-    image_url base64 payloads are stripped from the JSON and saved
-    as sidecar PNG files instead, so the dump stays in the KB range.
-    """
+    JSON holds the prompt messages, raw response (None on LLM failure), parsed
+    result (None on parse failure), cache_status and signature; image_url
+    payloads are stripped to sidecar PNGs."""
     if not results_dir:
         return
     try:

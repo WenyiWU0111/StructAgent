@@ -1,28 +1,19 @@
 """SheetPerceiver — calc-side analogue of DocPerceiver.
 
-Probes the live LibreOffice Calc workbook via UNO and produces a compact
-text block describing each sheet's structure (dimensions, header row,
-column types, data sample head+tail, formula samples, merged ranges,
-charts/pivots), injected into the planner prompt as the "WORKBOOK
-STRUCTURE" block.
+Probes the live LibreOffice Calc workbook via UNO into a compact text block
+per sheet (dimensions, header row, column types, head+tail data sample,
+formula samples, merged ranges, charts), injected into the planner prompt as
+the "WORKBOOK STRUCTURE" block. Runs at task start and after every cli_run_uno
+mutation. Read-only — never calls store().
 
-Triggered at task start + after every cli_run_uno mutation, mirroring
-DocPerceiver. Read-only — never calls store(), so the probe is safe.
+Token budget (calc data dwarfs writer prose): per-sheet head N_HEAD + tail
+N_TAIL rows; wide sheets capped to first N_COLS_HEAD + last N_COLS_TAIL cols;
+multi-sheet capped to K_SHEETS, rest summarized as a count.
 
-Token-budget strategy (calc data is much larger than writer prose):
-  * Per-sheet sample: first N_HEAD + last N_TAIL data rows (default 10+5).
-  * Wide sheets: cap column count to N_COLS (first 12 + last 3 + ellipsis).
-  * Tall sheets: row count is reported but only the sample is rendered.
-  * Multi-sheet: each sheet gets its own block; cap total at K_SHEETS,
-    summarize the rest as a one-line count.
-
-UNO API reference for the cells probed:
-  * sheet.getCellByPosition(col, row)   — 0-indexed
-  * cell.getType()                       — EMPTY=0 / VALUE=1 / STRING=2 / FORMULA=3
-  * cell.getValue() / getString() / getFormula()
-  * cell.getNumberFormat()              — int ID into doc.getNumberFormats()
-  * sheet.createCursor().gotoEndOfUsedArea(True) — used-range bounds
-  * sheet.Charts.getCount()             — chart count per sheet
+UNO cells probed: getCellByPosition(col,row) 0-indexed; getType()
+EMPTY=0/VALUE=1/STRING=2/FORMULA=3; getValue/getString/getFormula;
+getNumberFormat; cursor.gotoEndOfUsedArea for used-range bounds;
+Charts.getCount per sheet.
 """
 from __future__ import annotations
 import json
@@ -579,26 +570,23 @@ def _col_letter(n: int) -> str:
 
 
 def _fmt_cell(v: Any) -> str:
-    """Compact cell rendering for the markdown block. Trims noise:
-    leading/trailing whitespace inside strings, long floats, and the
-    verbose `datetime.datetime(...)` repr (which calc serial dates
-    decode into when read by openpyxl proxies and sometimes UNO too)."""
+    """Compact cell rendering for the markdown block. Trims surrounding
+    whitespace, long floats, and the verbose datetime.datetime(...) repr that
+    calc serial dates decode into via openpyxl proxies (and sometimes UNO)."""
     if v is None:
-        return "·"   # middle-dot = empty
+        return "·"   # empty
     if isinstance(v, dict) and "f" in v:
-        # formula cell — show formula + cached value
+        # formula: show formula + cached value
         f = v.get("f", "")
         cached = v.get("v")
         if cached is not None:
             return f"{f!r}→{_fmt_cell(cached)}"
         return repr(f)
     if isinstance(v, str):
-        # Visualize whitespace-only / heavy-leading-space cells
         s = v.strip()
         if not s and v:
-            return f"<ws×{len(v)}>"
-        # Use the stripped form for display (cell internal whitespace is
-        # rarely meaningful for planner reasoning); cap length to 24.
+            return f"<ws×{len(v)}>"   # whitespace-only cell
+        # display stripped form; cap at 24
         if len(s) > 24:
             return repr(s[:21] + "…")
         return repr(s)
@@ -606,9 +594,8 @@ def _fmt_cell(v: Any) -> str:
         if v == int(v):
             return str(int(v))
         return f"{v:.4g}"
-    # datetime / date / time — show ISO-ish compact form.
-    # First by isinstance (when the proxy or UNO returns native objects),
-    # then by str-prefix detection (when only their repr made it through
+    # datetime/date/time → compact ISO-ish. By isinstance when native objects
+    # come through, else by str-prefix (when only the repr survived
     # json.dumps + default=str on the VM side).
     try:
         import datetime as _dt
@@ -621,7 +608,7 @@ def _fmt_cell(v: Any) -> str:
     except Exception:
         pass
     s = str(v)
-    # `datetime.datetime(2023, 1, 1, 0, 0)` → '2023-01-01'
+    # datetime.datetime(2023, 1, 1, 0, 0) → '2023-01-01'
     if s.startswith("datetime.datetime("):
         try:
             inner = s[len("datetime.datetime("):-1]
@@ -644,11 +631,11 @@ def _fmt_cell(v: Any) -> str:
 
 
 def _render_row(row: List[Any], col_idxs: List[int]) -> str:
-    """Render a row's cell values for the selected columns (handles wide-sheet truncation)."""
+    """Render a row's cells for the selected columns (None = truncation gap)."""
     parts = []
     for i in col_idxs:
         if i is None:
-            parts.append("…")  # column-truncation marker
+            parts.append("…")
         elif i < len(row):
             parts.append(_fmt_cell(row[i]))
         else:
@@ -657,8 +644,8 @@ def _render_row(row: List[Any], col_idxs: List[int]) -> str:
 
 
 def _pick_cols(n_cols: int) -> List[Optional[int]]:
-    """Return a list of column indices to display, with None marking the
-    truncation gap. Compact for wide sheets, full for narrow ones."""
+    """Column indices to display (None marks the truncation gap); full for
+    narrow sheets, head+tail for wide ones."""
     if n_cols <= N_COLS_HEAD + N_COLS_TAIL + 1:
         return list(range(n_cols))
     return list(range(N_COLS_HEAD)) + [None] + list(range(n_cols - N_COLS_TAIL, n_cols))
@@ -688,10 +675,8 @@ def _render_sheet(rec: Dict[str, Any]) -> List[str]:
         f"{hdr_marker}  charts={n_charts}{merged_marker} ──"
     )
     if merged:
-        # Render each merged region as A1-style range so the planner
-        # can read them off the SP block instead of guessing from the
-        # screenshot. Limit to first 20 to keep the SP compact on
-        # heavily-merged dashboards; tail summary if more.
+        # A1-style ranges so the planner reads them off the block instead of
+        # guessing from the screenshot. First 20, then a "+N more" summary.
         items = []
         for m in merged[:20]:
             sc, sr = int(m["start_col"]), int(m["start_row"])
@@ -702,10 +687,8 @@ def _render_sheet(rec: Dict[str, Any]) -> List[str]:
         lines.append(f"merged: {', '.join(items)}{more}")
     subtables = rec.get("subtables") or []
     if subtables:
-        # Explicit "this sheet is split into N tables" line — the
-        # planner shouldn't have to infer table boundaries from the
-        # middle markers. Use the first cell of each section's first
-        # row as a tag so the boundaries are easy to skim.
+        # Explicit "split into N tables" line so the planner needn't infer
+        # boundaries from the middle markers.
         parts = []
         for i, st in enumerate(subtables, start=1):
             f, l = int(st["first_row"]), int(st["last_row"])
@@ -745,9 +728,8 @@ def _render_sheet(rec: Dict[str, Any]) -> List[str]:
     lines.append("type:   " + _ct_line("type"))
     lines.append("fmt-id: " + _ct_line("fmt"))
 
-    # Data rows: head + tail. Fold consecutive all-empty rows so a
-    # sheet with 12 blank trailing rows shows as "[10-21] (×12 empty)"
-    # instead of 12 distinct lines of dots.
+    # Data rows: head + tail. Fold consecutive all-empty rows so 12 trailing
+    # blanks show as one "[10-21] (×12 empty)" line, not 12 lines of dots.
     def _is_all_empty(row, idxs):
         return all((i is None) or (i >= len(row)) or row[i] is None for i in idxs)
 
@@ -779,10 +761,9 @@ def _render_sheet(rec: Dict[str, Any]) -> List[str]:
         tail_start = rec.get("rows_tail_first_idx", n_rows - len(tail))
         omitted = n_rows - len(head) - len(tail)
         if middle:
-            # Bookend each sub-table marker with elision counts so the
-            # planner sees exactly where in the gap the second table
-            # starts (e.g. "rows 11-17 omitted" then row 18 marker).
-            prev_idx = len(head)  # 0-based row idx of first omitted
+            # Bookend each sub-table marker with elision counts so the planner
+            # sees where in the gap the second table starts.
+            prev_idx = len(head)  # 0-based idx of first omitted row
             for mk in middle:
                 r = mk["row"]
                 gap = r - prev_idx
@@ -817,10 +798,8 @@ def _render_sheet(rec: Dict[str, Any]) -> List[str]:
             addr = f"{_col_letter(fs['col'])}{fs['row']+1}"
             lines.append(f"  {addr} := {fs['f']!r}")
 
-    # Sheet-wide anomalies — surfaces cells the head+tail rendering
-    # window can't show (middle "rows omitted" gap). Lets the planner
-    # enumerate ALL matching cells for tasks like "hide every #N/A
-    # row" without having to guess from the visible sample.
+    # Sheet-wide anomalies — cells the head+tail window can't show (the
+    # omitted middle), so the planner can enumerate ALL matching cells.
     anomalies = rec.get("anomalies") or {}
     na_cells = anomalies.get("na_cells") or []
     na_total = anomalies.get("na_total", 0)
@@ -866,14 +845,10 @@ def _render_sheet(rec: Dict[str, Any]) -> List[str]:
 def render_block(parsed: Dict[str, Any]) -> str:
     if "error" in parsed:
         err = parsed["error"]
-        # Detect "no Calc doc open" specifically — the natural symptom
-        # is `desktop.getCurrentComponent()` returning the Start Center
-        # component, then `doc.Sheets` raising `AttributeError: Sheets`.
-        # Surface a strongly-worded warning so the planner doesn't
-        # fall back to its own visual hallucination of an "open"
-        # spreadsheet (Qwen3.5-VL has been observed describing a full
-        # spreadsheet's contents when the screenshot actually shows
-        # the Start Center).
+        # "No Calc doc open" symptom: getCurrentComponent() returns the Start
+        # Center, then doc.Sheets raises AttributeError: Sheets. Warn loudly
+        # so the planner doesn't hallucinate an open spreadsheet (Qwen3.5-VL
+        # has described full contents when the screen shows the Start Center).
         no_doc = ("AttributeError: Sheets" in err
                   or "no Calc document" in err.lower()
                   or "no spreadsheet" in err.lower())
@@ -986,9 +961,9 @@ def run_inspect(env, logger: Optional[logging.Logger] = None,
                 n_head: int = N_HEAD,
                 n_tail: int = N_TAIL,
                 k_sheets: int = K_SHEETS) -> Optional[str]:
-    """Execute the UNO probe in the VM, parse stdout, return a planner-ready
-    text block (or None on persistent failure). Same retry + dump
-    conventions as DocPerceiver."""
+    """Run the UNO probe in the VM, parse stdout, return a planner-ready text
+    block (None on persistent failure). Same retry/dump conventions as
+    DocPerceiver."""
     if env is None or not hasattr(env, "controller"):
         if logger: logger.info("[SheetPerceiver] env.controller unavailable")
         return None
@@ -1023,13 +998,9 @@ def run_inspect(env, logger: Optional[logging.Logger] = None,
                 pass
     if logger:
         logger.info("[SheetPerceiver] probe gave up after %d attempts", max_retries)
-    # When the last attempt's error specifically indicates "no Calc doc
-    # open" (the boilerplate's new fail-fast guard, or the natural
-    # AttributeError: Sheets symptom), we DO want to surface a warning
-    # to the planner — otherwise the planner sees no SheetPerceiver
-    # block at all and may hallucinate spreadsheet contents from a
-    # screenshot that actually shows the Start Center. render_block
-    # handles this special case and returns a strongly-worded SystemNote.
+    # If the final error is the "no Calc doc open" case, still surface the
+    # warning block (render_block special-cases it) — otherwise the planner
+    # sees no block and may hallucinate contents from a Start Center screen.
     if last_parsed is not None and "error" in last_parsed:
         err = str(last_parsed.get("error", ""))
         if ("AttributeError: Sheets" in err

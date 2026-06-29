@@ -1,36 +1,16 @@
-"""Render router-decision payloads as text blocks for prompt injection.
+"""Render router-decision payloads as recovery prompt blocks.
 
-When the failure-attribution router decides ``actor_redo`` /
-``planner_replan`` / ``fallback_planner``, the corresponding agent
-(actor or planner) needs to SEE the diagnosis content in its prompt.
-A naive "here is the JSON" injection is brittle — the agent might
-ignore it. We wrap the prose into an explicit REASONING SCAFFOLD that
-forces the model to:
+When the failure-attribution router picks ``actor_redo`` /
+``planner_replan`` / ``fallback_planner``, the target agent needs to see
+the diagnosis. Raw JSON gets ignored, so we wrap it in a reasoning
+scaffold (acknowledge cause / cite memory / name a different next step)
+under a "[Recovery context]" header.
 
-  1. acknowledge what went wrong
-  2. cite which memory recommendation it will follow
-  3. name a concrete different next step
-
-The scaffold lives inside the prompt block itself (so the model reads
-it as part of its instructions, not as fluff), and the block always
-opens with a clear "[Recovery context]" header so it's visually
-distinct from the rest of the prompt.
-
-Two renderers exposed:
-
-  render_actor_recovery_block(payload) → str
-      For the actor's decomposer prompt. Gives 4 prose fields
-      (root_cause / memory_canonical / divergence / missing_or_wrong)
-      and demands the next Thought reference each before emitting an
-      Action. Crucially OMITS any coord-level hint — the actor's own
-      grounding handles HOW.
-
-  render_planner_recovery_block(payload) → str
-      For the planner's force_replan prompt. Includes attributed role
-      + category as additional context (so planner knows whether the
-      previous loop was its own bad plan vs an actor/env/verifier
-      problem) and demands a revised plan that addresses the root
-      cause.
+render_actor_recovery_block: actor decomposer prompt. No coord hints —
+the actor's own grounding handles HOW.
+render_planner_recovery_block: planner force_replan prompt. Adds
+attributed role/category so the planner knows whether the bad loop was
+its own plan vs actor/env/verifier.
 """
 from __future__ import annotations
 
@@ -49,18 +29,12 @@ def _bullets(items: Optional[List[Any]], indent: str = "  ") -> str:
 
 
 def render_actor_recovery_block(payload: Dict[str, Any]) -> str:
-    """Render an actor-side recovery block.
+    """Actor-side recovery block, appended to the decomposer prompt.
 
-    ``payload`` is ``InterventionDecision.params`` from a router
-    decision of kind ``actor_redo``. Required fields:
-      - subgoal_id (str)
-      - root_cause_summary (str)
-      - memory_canonical_approach (str, may be empty)
-      - divergence_description (str, may be empty)
-      - missing_or_wrong (list[str], may be empty)
-
-    The block is meant to be APPENDED to the actor's decomposer
-    system prompt right before the screenshot/user message.
+    ``payload`` is ``InterventionDecision.params`` from an ``actor_redo``
+    decision. Fields: subgoal_id, root_cause_summary,
+    memory_canonical_approach, divergence_description, missing_or_wrong
+    (the last three may be empty).
     """
     rcs = (payload.get("root_cause_summary") or "").strip()
     canonical = (payload.get("memory_canonical_approach") or "").strip()
@@ -90,8 +64,7 @@ def render_actor_recovery_block(payload: Dict[str, Any]) -> str:
         lines.append(f"  {divergence}")
         lines.append("")
 
-    # Reasoning scaffold — explicit invitation to reason about the
-    # diagnose before composing the action.
+    # Reasoning scaffold: reason about the diagnosis before acting.
     lines.append("INSTRUCTIONS FOR THIS TURN:")
     lines.append("Before emitting your Action, compose your Thought so it "
                  "EXPLICITLY:")
@@ -118,15 +91,13 @@ def render_actor_recovery_block(payload: Dict[str, Any]) -> str:
 
 def render_planner_recovery_block(payload: Dict[str, Any],
                                   focus_id: Optional[str] = None) -> str:
-    """Render a planner-side recovery block.
+    """Planner-side recovery block for the force_replan prompt.
 
-    ``payload`` is ``InterventionDecision.params`` from a router
-    decision of kind ``planner_replan`` or ``fallback_planner``. The
-    full diagnosis dict lives under ``payload['diagnosis']`` (a
-    FailureAttribution.to_dict() output).
-
-    Block is injected into the planner's force_replan prompt where the
-    existing v1 ``[Stuck diagnosis ...]`` block went.
+    ``payload`` is ``InterventionDecision.params`` from a
+    ``planner_replan`` / ``fallback_planner`` decision; the full
+    diagnosis dict (FailureAttribution.to_dict()) is under
+    ``payload['diagnosis']``. Replaces the v1 ``[Stuck diagnosis ...]``
+    block.
     """
     diag = payload.get("diagnosis") or {}
     rcs = (diag.get("root_cause_summary") or "").strip()

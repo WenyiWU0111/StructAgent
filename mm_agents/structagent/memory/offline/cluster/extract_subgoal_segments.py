@@ -1,28 +1,16 @@
 """Phase 3 L1 — Step 1: flatten the unified pool into subgoal segments.
 
-A "segment" is one (subgoal, key_action) pair from a single trajectory.
-4725 records × ~4.7 subgoal/task → ~22K segments. We persist them as a
-JSONL so the clustering + polish stages can stream without re-loading
-the full pool.
+A segment is one (subgoal, key_action) pair from a trajectory (~22K
+total). Persisted as JSONL so clustering + polish can stream without
+reloading the full pool.
 
-Output: ``results/unified_memory/_l1_segments_raw.jsonl``
-  Each line is a JSON object:
-    {
-      "task_hash": str,           # 12-char hash, matches L2/L3a outputs
-      "task_id":   str,           # original task_id, kept for traceability
-      "domain":    str,
-      "source":    "internal" | "agentnet" | "mind2web",
-      "seg_idx":   int,
-      "subgoal":   str,           # text — embedding key for L1 clustering
-      "key_action": str | dict,   # the concrete action taken on this step
-                                  # (string for some sources, dict with
-                                  # "action" / "tool_or_widget" keys for
-                                  # others)
-      "instruction": str,         # task-level instruction (for polish context)
-    }
+Output: ``results/unified_memory/_l1_segments_raw.jsonl``. Each line:
+task_hash (12-char, matches L2/L3a), task_id, domain, source, seg_idx,
+subgoal (embedding key for clustering), key_action (str or {action,
+tool_or_widget}), instruction.
 
-The seg_idx pairs sg[i] with ka[i]; if their lengths differ we use
-``min(len(sg), len(ka))`` and drop trailing entries.
+sg[i] is paired with ka[i]; on length mismatch we keep
+``min(len(sg), len(ka))`` and drop the trailing entries.
 """
 from __future__ import annotations
 

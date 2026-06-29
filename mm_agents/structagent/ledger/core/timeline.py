@@ -1,22 +1,19 @@
-"""Event Timeline — primary working memory for the planner-actor agent.
+"""Event timeline — the agent's primary working memory.
 
-Replaces v1 ledger's append-only `done[]` with a structured event stream
-that supports outcome reversion, key-node attribution, and human-readable
-review. The planner reads a compact rendering of this timeline (event-
-granularity table + outcome view) instead of the legacy 3-screenshot
-window.
+Structured event stream replacing v1's append-only `done[]`; supports
+outcome reversion, key-node attribution, and human-readable review. The
+planner reads a compact rendering (event table + outcome view) instead of
+the legacy 3-screenshot window.
 
-Two-layer structure:
-  StepRecord    — one per planner turn; raw observation + decision + KeyNodes
-  TimelineEvent — a group of consecutive StepRecords sharing one subgoal
+Two layers:
+  StepRecord    — one per planner turn (observation + decision + KeyNodes)
+  TimelineEvent — consecutive StepRecords sharing one subgoal
 
-`OutcomeStateCache` maintains derived outcome state (pending / verified /
-reverted) incrementally as KeyNodes arrive — O(K) per turn instead of
-walking the full timeline.
+OutcomeStateCache derives outcome state (pending/verified/reverted)
+incrementally as KeyNodes arrive — O(K) per turn, no full-timeline walk.
 
-This module has NO LLM calls. The detector lives in
-``key_node_detector.py``; the agent in ``qwen25vl_agent_planner.py``
-orchestrates the lifecycle.
+No LLM calls here. Detector lives in key_node_detector.py; the agent
+(qwen25vl_agent_planner.py) orchestrates the lifecycle.
 """
 from __future__ import annotations
 
@@ -34,7 +31,7 @@ OUTCOME_PENDING = "pending"
 OUTCOME_VERIFIED = "verified"
 OUTCOME_REVERTED = "reverted"
 
-# Confidence levels (LLM self-rates; ordinal labels are more reliable than floats)
+# Confidence levels (LLM self-rates; ordinal labels beat floats here)
 CONF_LOW = "low"
 CONF_MEDIUM = "medium"
 CONF_HIGH = "high"
@@ -68,39 +65,34 @@ MAX_REVERT_COUNT = 3
 
 @dataclass
 class KeyNode:
-    """One detected meaningful state transition relevant to outcomes/strategy.
+    """A detected state transition relevant to outcomes/strategy.
 
-    Emitted by ``key_node_detector.detect_key_nodes`` per turn.
-    Must carry concrete ``evidence`` (an a11y row quote or visual phrase).
+    Emitted per turn by key_node_detector.detect_key_nodes. Must carry
+    concrete ``evidence`` (an a11y row quote or visual phrase).
     """
     kind: str               # KN_* above
     target: str             # outcome_id (for satisfied/invalidated) or human label
     evidence: str           # ≤ 240 chars, concrete quote or visual description
     confidence: str         # CONF_LOW | CONF_MEDIUM | CONF_HIGH
     detected_at_step: int
-    # Provenance of an outcome KeyNode: "deterministic" (a file_grep /
-    # url_match / shell_command / calc_verify re-check against live VM state)
-    # or "llm" (a vision/LLM judge). Used by OutcomeStateCache to refuse an
-    # LLM-sourced invalidation of an outcome that a deterministic check
-    # confirmed — a deterministic verdict can only be overturned by another
-    # deterministic verdict, never by a (hallucination-prone) LLM judge.
-    # Default "" keeps older persisted records deserializing cleanly.
+    # Provenance: "deterministic" (file_grep/url_match/shell_command/
+    # calc_verify re-check against live VM state) or "llm" (vision/LLM
+    # judge). A deterministic confirmation can only be overturned by
+    # another deterministic verdict, never by a hallucination-prone LLM
+    # judge. Default "" keeps older persisted records deserializing.
     source: str = ""
 
     def enters_derivation(self) -> bool:
-        """Should this KeyNode update the OutcomeStateCache?
-
-        Low-confidence KeyNodes are recorded in the timeline (for planner
-        visibility / debug) but excluded from authoritative state derivation.
-        """
+        """Whether this KeyNode updates OutcomeStateCache. Low-confidence
+        nodes are kept in the timeline for visibility but excluded from
+        authoritative state derivation."""
         return self.confidence in _CONF_ENTERS_DERIVATION
 
 
 @dataclass
 class StepRecord:
     """Raw per-turn data. ``screenshot_b64`` is always persisted; the
-    prompt-rendering layer chooses which step's screenshot to actually
-    embed in the planner message.
+    render layer picks which step's screenshot to embed in the prompt.
     """
     step_idx: int
     timestamp: str = ""                 # ISO datetime
@@ -116,12 +108,10 @@ class StepRecord:
     planner_done_assessment: Optional[str] = None  # YES | NO
     # detected
     key_nodes: List[KeyNode] = field(default_factory=list)
-    # perceiver (turn-level subgoal verdict + relevant_controls etc.).
-    # Populated by _pre_planner when use_perceiver is on; None when
-    # perceiver is off OR perceive() returned None on this turn. Kept
-    # as Any to avoid a circular import (perceiver imports from
-    # timeline). Consumers use duck-typing on .subgoal_check / .coverage
-    # / .relevant_controls / .visual_focus.
+    # Perceiver snapshot (turn-level subgoal verdict, relevant_controls,
+    # etc.). Set by _pre_planner when use_perceiver is on; None otherwise.
+    # Typed Any to avoid a circular import (perceiver imports timeline);
+    # consumers duck-type on .subgoal_check / .coverage / etc.
     snapshot: Optional[Any] = None
 
 
@@ -138,10 +128,9 @@ class TimelineEvent:
     ended_at_step: Optional[int] = None
     steps: List[StepRecord] = field(default_factory=list)
     outcome: str = EV_ONGOING            # EV_*
-    # Populated when the event closes as ABANDONED_REPLAN: the planner's
-    # one-sentence <Bottleneck> at close-time, captured so the renderer
-    # can show "WHY this event was abandoned" without the planner
-    # needing to scroll back through old prompts.
+    # Planner's one-sentence <Bottleneck> at close-time (set when the
+    # event closes ABANDONED_REPLAN). Lets the renderer show WHY it was
+    # abandoned without scrolling back through old prompts.
     closing_reason: Optional[str] = None
 
     @property
@@ -161,36 +150,28 @@ class TimelineEvent:
 # --------------------------------------------------------------------------- #
 
 
-#: After this many DONE rejections targeting an outcome whose
-#: deterministic verifier persistently returns False, the KeyNode
-#: dispatcher routes that outcome to the LLM-judge path. Override via
-#: env ``DONE_REJECTED_FALLBACK_THRESHOLD``.
+#: After this many DONE rejections on an outcome whose deterministic
+#: verifier keeps returning False, the dispatcher routes it to the
+#: LLM-judge path. Override via env DONE_REJECTED_FALLBACK_THRESHOLD.
 DONE_REJECTED_FALLBACK_THRESHOLD = 5
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Verifier-spec reauthor gates (G1 / G2 / G4 — see initializer.py for the
-# corresponding LLM call).
-#
-# G1 (LLM agreement):  consecutive FRESH diagnoses must agree on
-#                       ``verifier_mismatch`` this many times before we
-#                       trust the classification enough to act on it.
-# G2 (cumulative pain): the deterministic verifier must have rejected DONE
-#                       on this outcome at least this many times — guards
-#                       against re-authoring on flukes.
-# G4 (budget):          re-author at most this many times per outcome per
-#                       task — re-authoring is itself an LLM call and we
-#                       don't want a runaway loop on a stubborn task.
+# Verifier-spec reauthor gates (G1/G2/G4 — LLM call in initializer.py).
+#   G1: consecutive FRESH diagnoses agreeing on verifier_mismatch before
+#       we trust the classification.
+#   G2: deterministic verifier must have rejected DONE this many times —
+#       guards against reauthoring on flukes.
+#   G4: per-outcome reauthor budget — reauthoring is itself an LLM call;
+#       cap to avoid runaway loops on a stubborn task.
 VERIFIER_REAUTHOR_MIN_STRIKES = 2
 VERIFIER_REAUTHOR_MIN_DONE_REJECTIONS = 2
 VERIFIER_REAUTHOR_MAX_PATCHES = 5
 
-# In-step self-healing loop: when the deterministic verifier rejects a
-# pending outcome AND the diagnoser classifies the failure as
-# ``verifier_mismatch``, KeyNode re-authors the spec and re-runs the
-# verifier within the SAME step — actor never sees the broken spec.
-# Up to this many (diagnose → reauthor → re-verify) rounds per outcome
-# per step. Shares ``patch_applied`` budget with the post-step path.
+# In-step self-healing: when the verifier rejects a pending outcome AND
+# the diagnoser says ``verifier_mismatch``, reauthor the spec and re-run
+# in the SAME step so the actor never sees the broken spec. Max rounds
+# per outcome per step; shares the ``patch_applied`` budget.
 INSTEP_REAUTHOR_MAX_ROUNDS = 5
 
 
@@ -198,31 +179,22 @@ INSTEP_REAUTHOR_MAX_ROUNDS = 5
 class OutcomeStateCache:
     """Incrementally maintained view of outcome states.
 
-    Updated on each new StepRecord by walking only that step's KeyNodes
-    — never the full timeline. Persisted to traj.jsonl alongside the
-    timeline; full re-derivation from timeline is reserved for replay
-    tools.
+    Updated per StepRecord by walking only that step's KeyNodes, never
+    the full timeline. Persisted to traj.jsonl; full re-derivation is
+    reserved for replay tools.
 
-    Beyond the core state machine, this cache also retains diagnostic
-    state used by the planner-feedback path:
-
-      - ``done_rejected_count``: per-outcome count of DONE rejections.
-        After ``DONE_REJECTED_FALLBACK_THRESHOLD`` rejections without a
-        verified flip, the dispatcher drops the deterministic verifier
-        for that outcome and asks the LLM judge instead — rescues
-        cases where init_ledger wrote an unsatisfiable spec.
-
-      - ``last_verifier_trace``: most-recent ``verify_with_trace``
-        output dict per outcome. Fed into the planner's force_replan
-        prompt as a "[Verifier Feedback]" block so the planner sees
-        WHAT was checked and WHAT didn't match — not just "still
-        pending".
-
-      - ``file_baseline_size`` / ``file_baseline_hash``: snapshot of
-        the file_grep target file at first observation. Compared
-        against the current verifier trace to derive a "file changed
-        since first observation?" boolean — a strong signal of whether
-        the actor's edits are reaching disk.
+    It also retains diagnostic state for the planner-feedback path:
+      - done_rejected_count: per-outcome DONE rejections. After
+        DONE_REJECTED_FALLBACK_THRESHOLD without a verified flip, the
+        dispatcher drops the deterministic verifier and asks the LLM
+        judge — rescues an unsatisfiable spec from init_ledger.
+      - last_verifier_trace: latest verify_with_trace dict per outcome,
+        rendered into force_replan so the planner sees WHAT was checked
+        and what didn't match, not just "still pending".
+      - file_baseline_size / file_baseline_hash: file_grep target snapshot
+        at first observation, compared against the current trace to derive
+        "file changed since first observation?" — a strong signal of
+        whether the actor's edits are reaching disk.
     """
     states: Dict[str, str] = field(default_factory=dict)
     last_satisfy_step: Dict[str, int] = field(default_factory=dict)
@@ -232,44 +204,35 @@ class OutcomeStateCache:
     last_verifier_trace: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     file_baseline_size: Dict[str, int] = field(default_factory=dict)
     file_baseline_hash: Dict[str, str] = field(default_factory=dict)
-    # True once an outcome reached VERIFIED via a DETERMINISTIC KeyNode
-    # (source=="deterministic"). While True, an LLM-sourced invalidation is
-    # refused — only another deterministic verdict can revert it. Prevents the
-    # false-negative trap where a deterministic verifier transiently can't read
-    # the just-changed state (e.g. Chrome caches Bookmarks in memory and
-    # flushes to disk lazily) and an LLM judge then overturns a real
-    # achievement on stale visual evidence (the star icon, a closed dialog).
+    # True once an outcome reached VERIFIED via a deterministic KeyNode.
+    # While True, an LLM invalidation is refused — only another
+    # deterministic verdict reverts it. Guards the false-negative trap
+    # where the verifier transiently can't read just-changed state (e.g.
+    # Chrome caches Bookmarks in memory, flushes lazily) and an LLM judge
+    # overturns a real achievement on stale visual evidence.
     verified_by_deterministic: Dict[str, bool] = field(default_factory=dict)
-    # Diagnosis memoization. ``last_diagnosis_signature[oid]`` is a
-    # cheap hash of the last verifier trace at the time we ran the
-    # LLM diagnoser; ``last_diagnosis[oid]`` is the LLM's resulting
-    # text. We re-run the LLM only when the trace signature changes
-    # (file size, per-pattern match counts, or file_content_hash) —
-    # bounding LLM calls to "actor did something new since last
-    # diagnosis", typically 3-5 per task instead of one per turn.
+    # Diagnosis memoization. signature = cheap hash of the verifier trace
+    # at diagnose-time; last_diagnosis = the LLM's text. Re-run the LLM
+    # only when the signature changes (file size, per-pattern counts,
+    # content hash) — bounds calls to "actor did something new", ~3-5 per
+    # task instead of per turn.
     last_diagnosis_signature: Dict[str, str] = field(default_factory=dict)
     last_diagnosis: Dict[str, str] = field(default_factory=dict)
-    # Root-cause classification history. ``last_diagnosis_cause`` is the
-    # most recent classification. ``verifier_mismatch_strikes`` counts
-    # how many CONSECUTIVE FRESH (non-cached) LLM calls have classified
-    # this outcome as ``verifier_mismatch``; resets to 0 whenever a
-    # fresh call returns ``planner_action``. Used by the agent to gate
-    # auto-reauthor of the verifier spec (G1: strikes >= 2).
+    # Root-cause history. verifier_mismatch_strikes counts CONSECUTIVE
+    # FRESH LLM calls classifying this outcome as verifier_mismatch;
+    # resets on any planner_action. Gates auto-reauthor (G1: strikes >= 2).
     last_diagnosis_cause: Dict[str, str] = field(default_factory=dict)
     verifier_mismatch_strikes: Dict[str, int] = field(default_factory=dict)
-    # Per-outcome counter of how many times we've reauthored its
-    # verifier spec. Capped at 1 (G4) — if the reauthored spec also
-    # fails, we let the K-fallback path take over instead of patching
-    # again.
+    # Per-outcome reauthor count (G4). Once capped, fall through to the
+    # K-fallback path instead of patching again.
     patch_applied: Dict[str, int] = field(default_factory=dict)
 
     def get_state(self, outcome_id: str) -> str:
         return self.states.get(outcome_id, OUTCOME_PENDING)
 
     def record_done_rejection(self, bad_outcome_ids: List[str]) -> None:
-        """Bump per-outcome DONE-rejection counter. Called by the
-        agent each time ``can_accept_done_claim`` returns False, with
-        the list of outcomes that caused the rejection."""
+        """Bump the DONE-rejection counter for each outcome that caused
+        a can_accept_done_claim failure."""
         for oid in bad_outcome_ids:
             self.done_rejected_count[oid] = (
                 self.done_rejected_count.get(oid, 0) + 1
@@ -280,9 +243,8 @@ class OutcomeStateCache:
 
     def should_fall_back_to_llm(self, outcome_id: str,
                                  threshold: Optional[int] = None) -> bool:
-        """True iff this outcome has been rejected ``threshold`` times
-        — caller should drop deterministic verify and hand the outcome
-        to the LLM judge."""
+        """True once this outcome has been rejected ``threshold`` times —
+        caller drops deterministic verify and hands it to the LLM judge."""
         if threshold is None:
             try:
                 import os as _os
@@ -297,12 +259,10 @@ class OutcomeStateCache:
     def record_verifier_trace(
         self, outcome_id: str, trace: Dict[str, Any]
     ) -> None:
-        """Stash the most-recent ``verify_with_trace`` trace dict for
-        this outcome. Called by ``key_node_detector`` after each
-        deterministic verify run. The latest trace is rendered into
-        the planner's force_replan prompt as concrete diagnostic
-        feedback (patterns checked, per-pattern matches, file size
-        and modification status)."""
+        """Stash the latest verify_with_trace dict (called by
+        key_node_detector after each deterministic run). Rendered into
+        force_replan as concrete diagnostic feedback. Also records the
+        first-seen file size/hash as the baseline."""
         if not isinstance(trace, dict):
             return
         self.last_verifier_trace[outcome_id] = dict(trace)
@@ -316,13 +276,10 @@ class OutcomeStateCache:
             self.file_baseline_hash[outcome_id] = ch
 
     def file_changed_since_baseline(self, outcome_id: str) -> Optional[bool]:
-        """Compare baseline vs latest trace for ``outcome_id`` to infer
-        whether the actor has touched the verifier-target file yet.
+        """Whether the actor has touched the verifier-target file yet.
 
-        Returns:
-          True   — file size or hash differs from baseline (modified)
-          False  — both size and hash match baseline (unchanged)
-          None   — baseline / current data unavailable; can't tell
+        Returns True (size or hash differs), False (both match), or None
+        (baseline/current data unavailable).
         """
         last = self.last_verifier_trace.get(outcome_id) or {}
         base_size = self.file_baseline_size.get(outcome_id)
@@ -347,9 +304,9 @@ class OutcomeStateCache:
             if kn.kind == KN_OUTCOME_SATISFIED:
                 self.states[kn.target] = OUTCOME_VERIFIED
                 self.last_satisfy_step[kn.target] = step.step_idx
-                # Remember HOW it was verified so a later LLM judge cannot
-                # overturn a deterministic confirmation. A deterministic
-                # re-satisfy upgrades the flag; an LLM re-satisfy clears it.
+                # Track HOW it was verified: deterministic re-satisfy sets
+                # the flag, LLM re-satisfy clears it (so a later LLM judge
+                # can't overturn a deterministic confirmation).
                 self.verified_by_deterministic[kn.target] = (
                     getattr(kn, "source", "") == "deterministic")
             elif kn.kind == KN_OUTCOME_INVALIDATED:
@@ -357,16 +314,14 @@ class OutcomeStateCache:
                     continue
                 if step.step_idx <= self.last_satisfy_step.get(kn.target, -1):
                     continue
-                # A deterministic confirmation can only be overturned by
-                # another DETERMINISTIC verdict — never by an LLM judge.
-                # ("unavailable / can't-read-it" ≠ "refuted"; same principle
-                # as the DoneAuditor unavailable≠refutation fix.)
+                # Deterministic confirmation overturned only by another
+                # deterministic verdict, never by an LLM judge ("can't read
+                # it" ≠ "refuted" — same as the DoneAuditor fix).
                 if (self.verified_by_deterministic.get(kn.target)
                         and getattr(kn, "source", "") != "deterministic"):
                     continue
                 if self.revert_count.get(kn.target, 0) >= MAX_REVERT_COUNT:
-                    # flap protection: ignore further reverts on this outcome
-                    continue
+                    continue  # flap protection
                 self.states[kn.target] = OUTCOME_REVERTED
                 self.last_invalidate_step[kn.target] = step.step_idx
                 self.revert_count[kn.target] = self.revert_count.get(kn.target, 0) + 1
@@ -394,8 +349,8 @@ class OutcomeStateCache:
         timeline: List[TimelineEvent],
         all_outcome_ids: List[str],
     ) -> "OutcomeStateCache":
-        """Full rebuild — used by replay tools and integrity checks. Online,
-        the agent maintains the cache incrementally and never calls this."""
+        """Full rebuild for replay tools / integrity checks. Online the
+        agent maintains the cache incrementally and never calls this."""
         cache = cls()
         for ev in timeline:
             for s in ev.steps:
@@ -417,14 +372,10 @@ def append_step(
     step: StepRecord,
     current_subgoal: str,
 ) -> TimelineEvent:
-    """Decide event membership for a freshly-completed StepRecord and
-    attach it. Returns the event the step ended up in.
+    """Attach a finished StepRecord to its event; return that event.
 
-    Event open/close rules:
-      - timeline empty → new event
-      - last event already closed (outcome != ongoing) → new event
-      - subgoal text changed → new event (implicit boundary)
-      - else → append to last event
+    New event when: timeline empty, last event already closed, or subgoal
+    text changed. Otherwise append to the last event.
     """
     last = _last_event(timeline)
     open_new = (
@@ -455,10 +406,8 @@ def close_current_event(
 ) -> None:
     """Apply a terminal outcome to the currently-ongoing event.
 
-    ``reason`` (optional) — one-sentence string captured from the
-    planner's <Bottleneck> at close-time. Stored on the event for
-    renderers to surface so the timeline shows WHY each abandoned
-    event ended, not just THAT it ended.
+    ``reason`` (optional): planner's <Bottleneck> at close-time, stored
+    so renderers can show WHY an abandoned event ended.
     """
     last = _last_event(timeline)
     if last is None or last.outcome != EV_ONGOING:
@@ -470,20 +419,15 @@ def close_current_event(
 
 
 def event_outcome_for_decision(decision: Optional[str], done: Optional[str]) -> str:
-    """Map a (planner_decision, done_assessment) pair to the outcome of
-    the PREVIOUS event (the one whose subgoal the planner just judged).
+    """Map (decision, done) to the PREVIOUS event's outcome.
 
-    Semantics — `done` reflects the previous subgoal's success, decision
-    governs the upcoming plan:
-      done=YES + CONTINUE → previous subgoal completed; advance queue   → committed
-      done=YES + REPLAN   → previous subgoal completed; plan rewritten  → committed
-      done=NO  + CONTINUE → previous subgoal failed; will retry it      → ONGOING (do not close)
-      done=NO  + REPLAN   → previous subgoal failed; plan rewritten     → abandoned_replan
-      DONE                → task end; previous subgoal status is
-                            assumed completed for the close              → ended_done
-    Ambiguous combinations (e.g. done=None + REPLAN) default to
-    abandoned_replan only when REPLAN — REPLAN typically follows a
-    detected failure even when the structured assessment is missing.
+    `done` = previous subgoal's success; decision governs the next plan:
+      YES + CONTINUE/REPLAN → committed
+      NO  + CONTINUE        → ongoing (don't close, will retry)
+      NO  + REPLAN          → abandoned_replan
+      DONE                  → ended_done (prev subgoal assumed done)
+    Ambiguous combos (e.g. done=None) default to abandoned_replan only on
+    REPLAN, which usually follows a failure even without a clean assessment.
     """
     if decision == "DONE":
         return EV_ENDED_DONE
@@ -491,7 +435,7 @@ def event_outcome_for_decision(decision: Optional[str], done: Optional[str]) -> 
         return EV_COMMITTED
     if decision == "REPLAN":
         return EV_ABANDONED_REPLAN
-    # done=NO + CONTINUE (or unknowns with CONTINUE) — leave ongoing
+    # done=NO + CONTINUE (or unknown + CONTINUE) — leave ongoing
     return EV_ONGOING
 
 
@@ -540,9 +484,8 @@ def _summarize_event_keynodes(ev: TimelineEvent) -> str:
 # --------------------------------------------------------------------------- #
 # Render-layer grouping (P1) — collapse consecutive REPLAN-in-place events
 # whose subgoals are near-rephrasings ("scroll down" vs "scroll down further")
-# into one compact group. The underlying event list is NOT mutated; this
-# only affects what the planner sees in the prompt. Persistence + replay
-# tools still see the granular event sequence.
+# into one compact group. Render-only; the event list is not mutated, so
+# persistence/replay still see the granular sequence.
 # --------------------------------------------------------------------------- #
 
 _TIMELINE_GROUP_STOPWORDS = frozenset({
@@ -558,11 +501,10 @@ _TIMELINE_GROUP_STOPWORDS = frozenset({
 
 
 def _timeline_subgoal_signature(subgoal: str) -> set:
-    """Token-set used to decide whether two consecutive events describe
-    the same strategy. Matches the spirit of ``ledger._review_signature``
-    but keeps a separate stopword list tuned for subgoal-style strings
-    (drops 'scroll'/'click'/'reveal' etc. so the discriminating tokens
-    are domain nouns like 'sidebar', 'color', 'filter')."""
+    """Token-set for deciding whether two events describe the same
+    strategy. Like ledger._review_signature but with a stopword list tuned
+    for subgoals (drops 'scroll'/'click'/'reveal' so the discriminating
+    tokens are domain nouns like 'sidebar', 'color', 'filter')."""
     if not subgoal:
         return set()
     import re as _re
@@ -582,16 +524,11 @@ def _group_consecutive_similar(
     *,
     threshold: float = 0.5,
 ) -> List[List[TimelineEvent]]:
-    """Walk events left-to-right; merge each event into the previous
-    group iff its subgoal signature has Jaccard >= ``threshold`` with
-    the LAST event in the group. Single-event groups are kept as-is.
-
-    Only groups events with the SAME outcome class — e.g. an abandoned
-    "scroll sidebar" and a committed "scroll sidebar" stay separate so
-    the rendered group can carry one consistent outcome label. (The
-    user-visible scroll-loop pattern is many consecutive ABANDONED
-    events with similar subgoals; we group those.)
-    """
+    """Merge each event into the previous group when its subgoal Jaccard
+    >= ``threshold`` against the group's last event AND they share an
+    outcome class. Same-class only so the group carries one consistent
+    outcome label (e.g. an abandoned vs committed "scroll sidebar" stay
+    separate; the scroll-loop pattern is many consecutive ABANDONEDs)."""
     groups: List[List[TimelineEvent]] = []
     for ev in events:
         ev_sig = _timeline_subgoal_signature(ev.subgoal)
@@ -609,10 +546,8 @@ def _group_consecutive_similar(
 
 
 def _truncate_at_word(text: str, max_len: int) -> str:
-    """Truncate ``text`` to at most ``max_len`` chars, preferring a word
-    boundary. If the natural cut would chop a word, back up to the
-    last whitespace within the last 16 chars; if no whitespace there,
-    fall back to a hard cut + ellipsis."""
+    """Truncate to ``max_len`` chars at a word boundary, backing up to the
+    last space within the final 16 chars; hard-cut + ellipsis otherwise."""
     if not text or len(text) <= max_len:
         return text or ""
     cut = text[:max_len]
@@ -642,8 +577,8 @@ def _format_ev_range(group: List[TimelineEvent]) -> str:
 
 
 def _group_outcome_label(group: List[TimelineEvent]) -> str:
-    """Outcome cell text. For multi-event groups of abandoned events,
-    surface the retry count as the dominant signal: ``✗ abandoned (6× REPLAN)``."""
+    """Outcome cell text. Multi-event abandoned groups surface the retry
+    count: ``✗ abandoned (6× REPLAN)``."""
     n_events = len(group)
     n_steps = sum(ev.n_steps for ev in group)
     last_outcome = group[-1].outcome
@@ -660,9 +595,8 @@ def _group_outcome_label(group: List[TimelineEvent]) -> str:
 
 
 def _group_keynodes_summary(group: List[TimelineEvent]) -> str:
-    """Union of KeyNodes across a grouped run, deduped on
-    (kind, target, step). Keeps the same compact format as the single-
-    event summarizer so the column reads identically."""
+    """Union of KeyNodes across a group, deduped on (kind, target, step),
+    rendered via the single-event summarizer so the column reads the same."""
     seen = set()
     fake_ev = TimelineEvent(
         event_idx=-1, subgoal="", started_at_step=0, steps=[],
@@ -673,16 +607,14 @@ def _group_keynodes_summary(group: List[TimelineEvent]) -> str:
             if sig in seen:
                 continue
             seen.add(sig)
-            # Borrow the single-event summarizer by appending dummy
-            # steps holding only the unique KeyNodes.
+            # Feed the single-event summarizer dummy steps of unique KeyNodes.
             fake_step = StepRecord(step_idx=kn.detected_at_step, key_nodes=[kn])
             fake_ev.steps.append(fake_step)
     return _summarize_event_keynodes(fake_ev)
 
 
 def _group_closing_reasons(group: List[TimelineEvent]) -> str:
-    """Concatenate distinct closing_reasons across a group, newest first.
-    Keeps total length bounded so the timeline doesn't explode."""
+    """Distinct closing_reasons across a group, newest first, length-bounded."""
     seen: List[str] = []
     for ev in reversed(group):
         r = (ev.closing_reason or "").strip()
@@ -695,7 +627,7 @@ def _group_closing_reasons(group: List[TimelineEvent]) -> str:
         if is_dup:
             continue
         seen.append(r)
-        if len(seen) >= 2:  # at most 2 distinct reasons per group
+        if len(seen) >= 2:  # cap distinct reasons per group
             break
     return " | ".join(seen)
 
@@ -708,18 +640,11 @@ def render_timeline_for_planner(
 ) -> str:
     """Compact event-granularity table for the planner prompt.
 
-    Render-layer grouping (P1) collapses consecutive events whose
-    subgoals are near-rephrasings of each other AND share an outcome
-    class into one compact ``[evN-M grouped × R retries]`` block. This
-    stops "scroll down... / scroll down further... / scroll down in
-    sidebar..." from showing as 6 separate ``✗ abandoned`` rows.
-
-    The underlying event list is NOT mutated — only the rendered
-    string is grouped. Persistence and replay see the raw events.
-
-    Closing reasons (planner's <Bottleneck> at close-time) are
-    surfaced underneath each abandoned row so the planner sees WHY
-    each strategy was abandoned, not just THAT it was.
+    P1 grouping collapses consecutive near-rephrasing events sharing an
+    outcome class into one block, so "scroll down / scroll down further /
+    scroll down in sidebar" doesn't show as 6 separate ``✗ abandoned``
+    rows. Render-only; persistence/replay see raw events. Closing reasons
+    are surfaced under each abandoned row (WHY it was abandoned).
     """
     if not timeline:
         return "[Task Event Timeline] (empty — task just started)"
@@ -743,13 +668,13 @@ def render_timeline_for_planner(
         first = group[0]
         ev_str = _format_ev_range(group)
         steps_str = _format_steps_range(group)
-        # Subgoal cell — show first event's subgoal (canonical), word-
-        # boundary truncate. For grouped runs, append "(+N variants)".
+        # Subgoal cell — first event's subgoal, word-truncated; grouped
+        # runs append "(+N rephrasings)".
         canonical = first.subgoal or ""
         subgoal_cell = _truncate_at_word(canonical, subgoal_col_width)
         if len(group) > 1:
             extra = f"  (+{len(group)-1} rephrasings)"
-            # Keep total within column width; truncate canonical further if needed
+            # Keep total within column width.
             if len(subgoal_cell) + len(extra) > subgoal_col_width:
                 subgoal_cell = _truncate_at_word(
                     canonical, subgoal_col_width - len(extra))
@@ -761,10 +686,8 @@ def render_timeline_for_planner(
             f"{subgoal_cell:<{subgoal_col_width}} | {outcome_cell:<28} | "
             f"{kn_cell[:120]}"
         )
-        # Reason continuation row — only for abandoned outcomes that
-        # have at least one closing_reason captured. Aligns the
-        # "reason:" text under the subgoal column so it visually
-        # belongs to the row above.
+        # Reason continuation row for abandoned outcomes with a captured
+        # closing_reason; indented under the subgoal column.
         last_outcome = group[-1].outcome
         if last_outcome == EV_ABANDONED_REPLAN:
             reasons = _group_closing_reasons(group)
@@ -784,23 +707,14 @@ def _strategy_spans_from_history(
     strategy_history: List[Any],   # List[StrategyEvent]
     final_step: int,
 ) -> List[Dict[str, Any]]:
-    """Convert a flat list of StrategyEvents into [start, end) spans.
+    """Convert a flat StrategyEvent list into [start, end) spans.
 
-    A span runs from the step the strategy first became active to either:
-      - the step where the next ``switch`` event committed (exclusive), or
-      - ``final_step + 1`` if this is the active span.
+    A span runs from when a strategy became active until the next
+    ``switch`` (exclusive), or ``final_step + 1`` for the active span.
+    ``install``/``switch`` start a span; ``same`` refines within it.
 
-    ``same`` events stay within the current span (they're refines, not
-    boundaries). ``install`` and ``switch`` events START a new span.
-
-    Returned dicts are duck-typed; each carries:
-      - strategy_text: the strategy in effect during the span
-      - start_step: int (inclusive)
-      - end_step: int (exclusive — i.e. the first step that's NOT part
-        of the span; for active span this is ``final_step + 1``)
-      - is_active: bool
-      - replan_count: number of ``same`` events within the span
-        (i.e. how many times the planner re-confirmed the strategy)
+    Each dict carries strategy_text, start_step (incl), end_step (excl),
+    is_active, and replan_count (number of ``same`` re-confirmations).
     """
     spans: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
@@ -808,7 +722,6 @@ def _strategy_spans_from_history(
         kind = getattr(ev, "kind", "")
         if kind in ("install", "switch"):
             if current is not None:
-                # Close the previous span at this switch's step_idx
                 current["end_step"] = ev.step_idx
                 current["is_active"] = False
                 spans.append(current)
@@ -817,7 +730,7 @@ def _strategy_spans_from_history(
                 "start_step": getattr(ev, "step_idx", 0)
                                 if kind == "install"
                                 else getattr(ev, "step_idx", 0),
-                "end_step": final_step + 1,  # placeholder; updated when next switch
+                "end_step": final_step + 1,  # placeholder; set by next switch
                 "is_active": True,
                 "replan_count": 0,
             }
@@ -833,7 +746,7 @@ def _events_in_span(
     start_step: int,
     end_step: int,
 ) -> List[Any]:
-    """Slice timeline events whose started_at_step ∈ [start_step, end_step)."""
+    """Events whose started_at_step ∈ [start_step, end_step)."""
     return [
         ev for ev in timeline
         if start_step <= getattr(ev, "started_at_step", 0) < end_step
@@ -843,8 +756,8 @@ def _events_in_span(
 def _keynodes_in_events(
     events: List[Any],
 ) -> List[Tuple[int, str, str, str]]:
-    """Flatten KeyNodes across events. Returns
-    ``[(step_idx, kind, target, evidence_short), ...]`` sorted by step."""
+    """Flatten KeyNodes to ``[(step_idx, kind, target, evidence_short), ...]``
+    sorted by step."""
     kns: List[Tuple[int, str, str, str]] = []
     for ev in events:
         for s in getattr(ev, "steps", []) or []:
@@ -892,17 +805,16 @@ def _span_outcome_label(
         if n_keynodes_satisfied > 0:
             return f"⏵ ACTIVE (advancing, {n_keynodes_satisfied} outcome verified)"
         return "⏵ ACTIVE — ongoing"
-    # Inactive span (was switched away from)
+    # Inactive span (switched away from)
     if n_keynodes_satisfied > 0:
-        # span made progress but planner still switched — usually means
-        # next strategy is a refinement / sub-step
+        # made progress but planner switched anyway — usually the next
+        # strategy is a refinement / sub-step
         return f"✓ committed (advanced {n_keynodes_satisfied}, then refined)"
     return "✗ ABANDONED (no outcome verified during span)"
 
 
 def _span_close_reason(events: List[Any]) -> Optional[str]:
-    """Pull the most informative closing_reason from the events in a span.
-    Prefer the last event's reason; fall back to any earlier non-empty one."""
+    """Most-recent non-empty closing_reason in a span (last event first)."""
     for ev in reversed(events):
         r = (getattr(ev, "closing_reason", "") or "").strip()
         if r:
@@ -920,29 +832,20 @@ def render_timeline_grouped_by_strategy(
 ) -> str:
     """Render PAST (abandoned / committed-then-refined) strategy spans.
 
-    The ACTIVE span is intentionally NOT rendered: its strategy text,
-    current subgoal, and recent actions already appear in the planner's
-    ``[Current plan]`` / ``[Current subgoal]`` / ``[Recent actions]``
-    blocks, and re-stating them under a "task timeline" header used to
-    mislead the model — the bullet labelled ``current step`` was just
-    the focus subgoal echoed back, planner read it as "this is what you
-    should do next" and lost the rest of the prompt's nuance.
+    The ACTIVE span is deliberately skipped — its strategy, subgoal, and
+    recent actions already appear in [Current plan]/[Current subgoal]/
+    [Recent actions], and re-stating them under a "timeline" header misled
+    the model (the echoed focus subgoal got read as "do this next").
 
-    What this block UNIQUELY carries:
-      • the strategy text of each previously-tried approach,
-      • the abandon reason and (if available) curator verdict,
-      • the KeyNode chain that fired during the abandoned span.
+    This block uniquely carries each past approach's strategy text, abandon
+    reason (+ curator verdict if any), and the KeyNode chain that fired —
+    so it's only worth rendering when something was actually abandoned.
 
-    None of those appear elsewhere — they justify keeping the block, but
-    only when something was actually abandoned.
+    Returns "" when there are no past spans; callers MUST skip the block
+    on empty rather than emit a header with no body.
 
-    Returns "" when there are no past spans (single-strategy task so
-    far, or pre-commit phase). Callers MUST skip block rendering on
-    empty string instead of emitting a header with no body.
-
-    ``curator_strategy_notes`` (optional): mapping ``strategy_text → note``
-    populated from the dead-end curator's per-strategy analysis. When
-    provided, each span box gets a ``curator: <verdict>`` line.
+    ``curator_strategy_notes`` (optional): strategy_text → note from the
+    dead-end curator; adds a ``curator: <verdict>`` line per span.
     """
     if not strategy_history:
         return ""
@@ -957,8 +860,7 @@ def render_timeline_grouped_by_strategy(
     if not spans:
         return ""
 
-    # Filter out the active span — its content duplicates Current plan /
-    # Current subgoal / Recent actions blocks. We only render PAST spans.
+    # Drop the active span — duplicates Current plan / subgoal / actions.
     past_spans = [s for s in spans if not s["is_active"]]
     if not past_spans:
         return ""
@@ -993,11 +895,9 @@ def render_timeline_grouped_by_strategy(
             f"{', ' + str(span['replan_count']) + ' same-strategy REPLANs' if span['replan_count'] else ''}"
         )
 
-        # KeyNode chain — only show if there are any
         if kns:
             lines.append(f"│   key nodes: {_format_keynode_chain(kns)}")
 
-        # Subgoal bullets — list distinct subgoal texts tried in this span
         unique, overflow = _unique_subgoals(
             span_events, cap=bullet_cap_per_span)
         if unique:
@@ -1013,7 +913,6 @@ def render_timeline_grouped_by_strategy(
                 f"│   abandon reason: "
                 f"{_truncate_at_word(reason, 200)}")
 
-        # Curator note — surfaced if available
         if curator_strategy_notes:
             note = curator_strategy_notes.get(span["strategy_text"] or "")
             if note:
@@ -1028,11 +927,10 @@ def render_timeline_grouped_by_strategy(
 def _compute_focus_outcome_id(
     required_outcomes: List[Any],
 ) -> Optional[str]:
-    """First pending outcome whose ``depends_on`` are all verified.
-    Mirrors ``ProgressLedger.next_focus_outcome`` but lives here so
-    the renderer can run without an importable ledger object (the
-    renderer takes duck-typed args). A1: reads state from per-outcome
-    fields instead of a separate cache."""
+    """First pending outcome whose deps are all verified. Mirrors
+    ProgressLedger.next_focus_outcome but lives here so the renderer runs
+    on duck-typed args without an importable ledger. A1: reads state from
+    per-outcome fields, not a separate cache."""
     by_id = {getattr(o, "id", None): o for o in required_outcomes}
     for o in required_outcomes:
         if getattr(o, "state", OUTCOME_PENDING) == OUTCOME_VERIFIED:
@@ -1053,39 +951,25 @@ def render_verifier_feedback(
     call_llm: Optional[Callable] = None,
     model: Optional[str] = None,
 ) -> str:
-    """Render a concrete diagnostic block for ONE outcome's verifier
-    state — fed into the planner's force_replan prompt. Shows:
+    """Diagnostic block for ONE outcome's verifier state, fed into
+    force_replan: the spec, the latest trace (per-pattern hits, file
+    size, modification status), a file-content preview, the DONE-rejection
+    count, and a root-cause hint.
 
-      • the verifier specification (kind / file_path / patterns /
-        visual gates)
-      • the most recent verifier trace (per-pattern hits, file size,
-        file modification status since first observation)
-      • a preview of the current file content (first ~800 chars)
-      • how many times this outcome has caused a DONE rejection
-      • root-cause analysis + actionable hint
+    With ``call_llm`` the hint is an LLM diagnosis (reads file content +
+    spec, 2-4 sentences); otherwise a heuristic fallback. LLM calls are
+    memoized on last_diagnosis_signature so unchanged-state force_replans
+    re-use the prior diagnosis.
 
-    When ``call_llm`` is provided, the analysis is produced by an LLM
-    that reads the file content + verifier spec and writes a 2-4
-    sentence diagnosis. Otherwise falls back to the heuristic hint
-    (kept for offline tests). LLM calls are memoized on the outcome's
-    last_diagnosis_signature so repeated force_replans without state
-    change re-use the prior diagnosis.
-
-    Returns "" when no diagnostic info is available (no verifier or
-    no trace recorded yet — caller skips the section). A1: reads
-    trace / done-rejection count / diagnosis cache directly off the
-    Outcome instance (was previously OutcomeStateCache).
-    A3: prefers ``outcome.evidence[-1].verifier_trace`` (the full,
-    no-truncation trace from bundle_assembler.build) over the legacy
-    ``outcome.last_verifier_trace`` dict. Falls back to the legacy
-    field when no Evidence has been appended yet, so behavior is
-    identical on tasks where A2's assembler never ran (e.g. legacy
-    traj.jsonl replays)."""
+    Returns "" when no verifier or no trace yet (caller skips the section).
+    A1: reads trace / rejection count / diagnosis cache off the Outcome.
+    A3: prefers outcome.evidence[-1].verifier_trace (full trace from
+    bundle_assembler.build) over the legacy last_verifier_trace, falling
+    back when no Evidence exists (legacy traj.jsonl replays)."""
     verify = getattr(outcome, "verify", None)
     if verify is None:
         return ""
-    # A3: prefer the structured Evidence trace, fall back to the
-    # legacy dict for back-compat.
+    # A3: prefer the structured Evidence trace, fall back to legacy dict.
     trace: Dict[str, Any] = {}
     ev_list = getattr(outcome, "evidence", None) or []
     if ev_list:
@@ -1121,11 +1005,9 @@ def render_verifier_feedback(
             lines.append(f"    text_contains:  {list(verify.text_contains)}")
         if getattr(verify, "state_contains", None):
             lines.append(f"    state_contains: {list(verify.state_contains)}")
-        # Dual-channel safety net (the visual gates) — important
-        # diagnostic context for "why a11y matched but DONE rejected":
-        # if the visual gate failed, the LLM judge correctly stayed
-        # at pending. Showing this back to the planner helps it know
-        # which side to fix (the a11y row OR the visible UI state).
+        # Visual gates explain "a11y matched but DONE rejected": a failed
+        # gate kept the LLM judge at pending. Showing them tells the
+        # planner which side to fix (a11y row vs visible UI state).
         vmh = list(getattr(verify, "visual_must_hold", []) or [])
         vmn = list(getattr(verify, "visual_must_not_hold", []) or [])
         if vmh:
@@ -1221,18 +1103,15 @@ def render_verifier_feedback(
 
 
 def _trace_signature(trace: Dict[str, Any]) -> str:
-    """Cheap fingerprint of a verifier trace — used to detect whether
-    the actor has produced new state (or the spec has been reauthored)
-    since the last LLM diagnosis. Different signature = fresh diagnose
-    call; same signature = cache-hit (skips LLM)."""
+    """Cheap fingerprint of a verifier trace; detects whether the actor
+    produced new state (or the spec was reauthored) since the last
+    diagnosis. New signature = fresh diagnose; same = cache hit."""
     parts = [
         str(trace.get("file_size_bytes", "?")),
         str(trace.get("file_content_hash", "?")),
-        # shell_command discriminator: exit_code + first 100 chars of
-        # stdout/stderr. Without this, all shell_command failures
-        # collapse to the same signature ('?|?') and the diagnoser
-        # cache-hits forever — blocking the in-step healing loop from
-        # observing the new spec's trace.
+        # shell_command discriminator: without exit_code + stdout, all
+        # shell failures collapse to '?|?' and cache-hit forever, starving
+        # the in-step healing loop of the new spec's trace.
         f"ec:{trace.get('exit_code', '?')}",
     ]
     sh = (trace.get("stdout_head", "") or "")[:100].strip()
@@ -1252,38 +1131,31 @@ def _diagnose_outcome(
     *,
     call_llm: Optional[Callable], model: Optional[str],
 ) -> str:
-    """Produce a 2-4 sentence diagnosis of why this outcome's verifier
-    keeps returning False, AND classify the root cause.
+    """2-4 sentence diagnosis of why the verifier keeps returning False,
+    plus a root-cause classification.
 
-      • If ``call_llm`` is provided: ask LLM (the file content head is
-        consumed INTERNALLY so the planner-visible block stays compact)
-        and cache by trace signature so unchanged state re-uses the
-        prior diagnosis.
-      • Otherwise: heuristic fallback (no root-cause tag).
+    With ``call_llm``: ask the LLM (file head consumed internally to keep
+    the planner block compact), cached by trace signature. Otherwise a
+    heuristic fallback (no root-cause tag).
 
-    Side effects (A1: mutated on the Outcome instance directly):
-      • outcome.last_diagnosis_signature = trace signature
-      • outcome.last_diagnosis           = diagnosis text
-      • outcome.last_diagnosis_cause     = "planner_action" | "verifier_mismatch"
-      • outcome.verifier_mismatch_strikes incremented (or reset) on
-        FRESH LLM calls only — cache hits don't touch the strikes counter.
+    Side effects on the Outcome (A1): last_diagnosis_signature,
+    last_diagnosis, last_diagnosis_cause, and verifier_mismatch_strikes —
+    the strikes counter moves on FRESH LLM calls only, not cache hits.
 
-    Returns the rendered diagnosis text. Caller (the planner-prompt
-    rendering path) wants only the text; the agent reads the cause
-    fields off the Outcome to gate G1 + reauthor decisions."""
+    Returns the diagnosis text; the agent reads the cause fields off the
+    Outcome to gate G1 + reauthor decisions."""
     sig = _trace_signature(trace)
     cached_sig = outcome.last_diagnosis_signature
     if cached_sig is not None and cached_sig == sig:
         cached = outcome.last_diagnosis
         if cached:
-            # Cache hit. Don't touch strikes counter — strikes counts
-            # FRESH LLM agreements only, not cached re-renders.
+            # Cache hit — don't touch strikes (FRESH calls only).
             return cached
     if call_llm is None:
         diag_text = _derive_diagnosis_hint(verify, trace, outcome)
         outcome.last_diagnosis_signature = sig
         outcome.last_diagnosis = diag_text
-        # heuristic path doesn't classify root cause → leave field as-is
+        # heuristic path doesn't classify → leave cause field as-is
         return diag_text
     try:
         result = _llm_diagnose(outcome, verify, trace, call_llm, model)
@@ -1299,8 +1171,7 @@ def _diagnose_outcome(
     outcome.last_diagnosis = diag_text
     if cause in ("planner_action", "verifier_mismatch"):
         outcome.last_diagnosis_cause = cause
-        # Strikes: increment on consecutive verifier_mismatch FRESH
-        # diagnoses; reset on any planner_action.
+        # Strikes: bump on verifier_mismatch, reset on planner_action.
         if cause == "verifier_mismatch":
             outcome.verifier_mismatch_strikes = (
                 outcome.verifier_mismatch_strikes + 1
@@ -1361,13 +1232,11 @@ def _llm_diagnose(
     outcome: Any, verify: Any, trace: Dict[str, Any],
     call_llm: Callable, model: Optional[str],
 ) -> Dict[str, str]:
-    """One-shot LLM diagnosis call. Returns ``{"text": <diagnosis>,
-    "root_cause": "planner_action" | "verifier_mismatch" | ""}``.
-    ``root_cause`` is "" when the tag couldn't be parsed.
+    """One-shot LLM diagnosis. Returns ``{"text", "root_cause"}`` where
+    root_cause is "" when the tag couldn't be parsed.
 
-    The file_content_head goes INTO this LLM's input (so it can read
-    the actual file content) but only the ``text`` portion is rendered
-    into the planner-visible prompt — keeping that block compact."""
+    The file_content_head feeds this LLM's input but only ``text`` reaches
+    the planner-visible prompt, keeping that block compact."""
     kind = getattr(verify, "kind", "?")
     desc = getattr(outcome, "description", "") or ""
     hint = getattr(outcome, "evidence_hint", "") or ""
@@ -1411,14 +1280,11 @@ def _llm_diagnose(
             f"{getattr(verify, 'expected_exit_code', 0)}"
         )
     elif kind in ("calc_verify", "impress_verify"):
-        # Structured verifiers: the framework builds the python3 body
-        # from a fixed op+kwargs schema. The "spec" the LLM should
-        # diagnose is the list of checks, NOT a shell command string.
-        # Without rendering this, the LLM sees only ``kind:
-        # impress_verify`` with zero detail and tends to guess
-        # ``verifier_mismatch`` — which is almost always wrong here
-        # because these specs are deterministic-built and can't be
-        # "off"; FAIL means the actor hasn't reached the target state.
+        # Structured verifiers: the framework builds the body from a fixed
+        # op+kwargs schema, so the "spec" to diagnose is the check list,
+        # not a shell string. Without it the LLM sees only the kind and
+        # guesses verifier_mismatch — almost always wrong, since these
+        # specs can't be "off"; a FAIL means the actor isn't at target yet.
         checks_attr = "calc_checks" if kind == "calc_verify" else "impress_checks"
         checks = list(getattr(verify, checks_attr, None) or [])
         user_parts.append(
@@ -1494,11 +1360,9 @@ def _llm_diagnose(
             user_parts.append(head[:600])
             user_parts.append("```")
     elif kind in ("calc_verify", "impress_verify"):
-        # Structured verifiers report which check failed (1-based)
-        # via the stdout body — e.g. ``FAIL: check[0] 'font_props'``.
-        # The trace echoes the wrapped exec output; render it raw so
-        # the LLM can locate which kwarg in the checks list is the
-        # offending one.
+        # Structured verifiers report the failed check in stdout (e.g.
+        # ``FAIL: check[0] 'font_props'``). Render the raw exec output so
+        # the LLM can locate the offending kwarg.
         user_parts.append(f"  exit_code: {trace.get('exit_code')}")
         vreason = trace.get("verdict_reason") or ""
         if vreason:
@@ -1524,8 +1388,8 @@ def _llm_diagnose(
         "max_tokens": 250,
         "temperature": 0.0,
         "top_p": 0.9,
-        # Disable Qwen3.5's <think> block (same reasoning as init_ledger):
-        # the diagnosis is short and structured; thinking just eats tokens.
+        # Disable Qwen3.5's <think> block (as init_ledger): short
+        # structured output, thinking just burns tokens.
         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     }
     out = call_llm(payload, model)
@@ -1537,9 +1401,8 @@ def _llm_diagnose(
             out = out[len(prefix):].lstrip()
     if out.endswith("```"):
         out = out[:-3].rstrip()
-    # Parse the [ROOT_CAUSE: ...] tag (typically on the final line) and
-    # strip it out of the planner-visible diagnosis text. We pick the
-    # LAST occurrence in case the model echoes the tag earlier in prose.
+    # Parse + strip the [ROOT_CAUSE: ...] tag; take the LAST occurrence
+    # in case the model echoes it earlier in prose.
     matches = list(_ROOT_CAUSE_TAG_RE.finditer(out))
     cause = ""
     if matches:
@@ -1552,9 +1415,9 @@ def _derive_diagnosis_hint(
     verify: Any, trace: Dict[str, Any],
     outcome: Any,
 ) -> str:
-    """Heuristic single-paragraph hint based on verifier kind +
-    pattern hit/miss + file change status. Pure-function so it's
-    cheap and testable. A1: file-change check reads off the Outcome."""
+    """Heuristic hint from verifier kind + pattern hit/miss + file-change
+    status. Pure function (cheap, testable). A1: file-change reads off the
+    Outcome."""
     kind = getattr(verify, "kind", "?")
     if kind == "file_grep":
         chg = outcome.file_changed_since_baseline()
@@ -1623,18 +1486,15 @@ def render_outcome_view(
     failed_paths: Optional[List[Any]] = None,
     completed_strategies: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """Render derived outcome state with single-focus marker.
+    """Render derived outcome state with a single-focus marker.
 
-    The first pending outcome whose dependencies are all verified is
-    marked ``▶ FOCUS ◀``. The planner is told to attack THIS one
-    milestone in isolation; downstream pending outcomes are shown as
-    ``[blocked]`` so the planner doesn't try to skip ahead.
+    The first pending outcome with all deps verified gets ``▶ FOCUS ◀``;
+    downstream pending outcomes show ``[blocked]`` so the planner attacks
+    one milestone at a time instead of skipping ahead.
 
-    ``completed_strategies``: optional list of dicts produced by the
-    dead-end curator's ``strategy_outcome_satisfied`` verdict, each
-    of form ``{"strategy": <text>, "satisfied_outcomes": [<id>, ...]}``.
-    Rendered as a "Completed Strategies" block so the planner does not
-    re-propose a strategy whose outcome the agent has already produced.
+    ``completed_strategies``: optional dicts from the curator's
+    strategy_outcome_satisfied verdict ({"strategy", "satisfied_outcomes"});
+    rendered so the planner won't re-propose an already-produced strategy.
     """
     focus_id = _compute_focus_outcome_id(required_outcomes)
     by_id = {getattr(o, "id", None): o for o in required_outcomes}
@@ -1647,8 +1507,7 @@ def render_outcome_view(
         deps = list(getattr(o, "depends_on", []) or [])
         deps_str = ""
         if deps:
-            # Annotate each dep with its current state glyph so the
-            # planner can see at a glance what's blocking this one.
+            # Glyph each dep's state so the planner sees what's blocking.
             dep_glyphs = []
             for d in deps:
                 d_o = by_id.get(d)
@@ -1658,9 +1517,8 @@ def render_outcome_view(
                 dep_glyphs.append(f"{glyph}{d}")
             deps_str = f"  [needs: {', '.join(dep_glyphs)}]"
 
-        # Multi-app: surface which app each outcome is verified in so
-        # the planner sees the per-app structure. Empty for single-app
-        # tasks (o.app is None) → every outcome line is unchanged.
+        # Multi-app: tag each outcome's app so the planner sees per-app
+        # structure. Empty for single-app tasks (o.app is None).
         _app = getattr(o, "app", None)
         if _app:
             deps_str = f"  [app={_app}]" + deps_str
@@ -1683,20 +1541,16 @@ def render_outcome_view(
             )
             n_reverted += 1
         else:
-            # Pending. Mark as FOCUS if it's the active one, else
-            # mark blocked when its deps aren't all verified.
+            # Pending: FOCUS if active, else blocked when deps unmet.
             if o.id == focus_id:
                 lines.append(
                     f"  ▶ FOCUS ◀  {o.id:<28} — hint: "
                     f"{(o.evidence_hint or '')[:120]}{deps_str}"
                 )
-                # Surface the actual verify FAIL reason every turn (not
-                # only on force_replan). `stdout_head` is always set once
-                # verify has run; `last_diagnosis` is populated once a
-                # prior force_replan computed it. Keeps the planner aware
-                # of the concrete failure mode on regular planning turns.
-                # A3: prefer the structured Evidence trace; fall back to
-                # the legacy field when no Evidence has been appended.
+                # Surface the verify FAIL reason every turn, not just on
+                # force_replan, so the planner sees the concrete failure
+                # mode on regular turns. A3: prefer the Evidence trace,
+                # fall back to the legacy field.
                 trace: Dict[str, Any] = {}
                 ev_list = getattr(o, "evidence", None) or []
                 if ev_list:
@@ -1712,10 +1566,8 @@ def render_outcome_view(
                     diag_short = diag.replace("\n", " ")[:200]
                     lines.append(f"      diagnosis: {diag_short}")
             else:
-                # Pending and either blocked-by-deps OR ordered-after-focus
-                # (we render in source order so anything after focus is
-                # implicitly "later"). Use [blocked] when deps actually
-                # gate it, [pending] otherwise.
+                # Pending, after focus in source order. [blocked] when
+                # deps actually gate it, [pending] otherwise.
                 deps_blocked = any(
                     (by_id.get(d) is None
                      or getattr(by_id[d], "state", OUTCOME_PENDING) != OUTCOME_VERIFIED)
@@ -1754,15 +1606,11 @@ def render_outcome_view(
             f"➜ Active focus: '{focus_id}'. Plan ONLY for this one milestone "
             f"this turn; later pending outcomes are blocked until it verifies."
         )
-    # Completed strategies block — surfaced from the curator's
-    # ``strategy_outcome_satisfied`` verdicts. The planner historically
-    # re-proposed strategies whose outcome was already [verified] (e.g.
-    # "create Sheet2 via Sheet menu" after sheet2_created [verified]),
-    # because nothing in the prompt explicitly retired completed
-    # strategies — failed_paths only carried dead-ends, the OLD plan
-    # stayed in context, and the planner reused its stale strategy
-    # verbatim. Listing satisfied strategies here makes the retirement
-    # explicit.
+    # Completed strategies, from the curator's strategy_outcome_satisfied
+    # verdicts. Without this the planner re-proposed strategies whose
+    # outcome was already [verified] (e.g. "create Sheet2 via Sheet menu"
+    # after sheet2_created): nothing retired them, the old plan stayed in
+    # context, and the stale strategy got reused verbatim.
     if completed_strategies:
         lines.append("")
         lines.append(
@@ -1778,26 +1626,21 @@ def render_outcome_view(
             outs_tag = (", ".join(outs)) if outs else "?"
             lines.append(f"  ✓ #{i}. \"{text}\"  → produced: {outs_tag}")
     if failed_paths:
-        # A4: failures are filtered by ``target_outcome_id``. The planner
-        # replanning toward focus_id only sees the dead-ends that
-        # already failed against THIS outcome — past noise from other
-        # outcomes' attempts is hidden so the prompt is targeted.
-        # Failures with target_outcome_id == None remain visible to all
-        # foci (genuinely cross-cutting actor-flailing patterns the
+        # A4: filter failures by target_outcome_id so replanning toward
+        # focus_id only sees dead-ends against THIS outcome. target=None
+        # failures stay visible everywhere (cross-cutting patterns the
         # curator couldn't pin to one outcome).
         def _is_relevant(fp) -> bool:
             tid = getattr(fp, "target_outcome_id", None)
             if tid is None:
-                return True              # cross-cutting — show everywhere
+                return True              # cross-cutting
             if focus_id is None:
-                return True              # no focus → show every entry
-            return tid == focus_id       # filter to focus outcome
+                return True              # no focus
+            return tid == focus_id
 
         relevant_fps = [fp for fp in failed_paths if _is_relevant(fp)]
 
-        # Two-layer split (strategy vs action). Within each layer,
-        # entries targeting the focus outcome render first, then any
-        # uncategorized cross-cutting entries.
+        # Two-layer split: strategy vs action.
         strategy_fps = [fp for fp in relevant_fps
                         if getattr(fp, "level", "action") == "strategy"]
         action_fps = [fp for fp in relevant_fps
@@ -1823,8 +1666,7 @@ def render_outcome_view(
             block.append(f"           Outcome:   {why[:240]}")
             return block
 
-        # When focus is set, headline reflects the per-outcome scope so
-        # the planner knows the list is filtered.
+        # Headline reflects the per-outcome scope when focus is set.
         focus_label = (f" for outcome `{focus_id}`" if focus_id else "")
 
         if strategy_fps:

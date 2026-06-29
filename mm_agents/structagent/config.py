@@ -1,22 +1,17 @@
-"""config.py — single typed source of truth for Causal-Agent runtime flags.
+"""Typed source of truth for Causal-Agent runtime flags.
 
-All flags are environment-driven (the runner exports them before launch).
-``CAConfig.from_env()`` reads the environment and returns an immutable snapshot.
-The agent resolves it ONCE at construction (``self.cfg``) and every site reads
-``self.cfg.*`` — there are no scattered ``os.environ`` reads or repeated
-``from_env()`` calls in the per-step path.
+Flags are env-driven; ``CAConfig.from_env()`` returns an immutable snapshot,
+resolved once at agent construction so the per-step path reads ``self.cfg.*``
+instead of scattered ``os.environ`` lookups.
 
-Boolean truthiness is UNIFORM across every flag: ``{1, true, yes, on}``
-(case-insensitive) → True; everything else, including unset, → False. Two flags
-keep a non-boolean shape: ``perceiver`` (int-valued) and ``memory_version``
-(free string); the feasibility knobs are ints.
+Boolean truthiness is uniform: ``{1,true,yes,on}`` (case-insensitive) → True,
+else False (incl. unset). Exceptions: ``perceiver`` (int), ``memory_version``
+(string), feasibility knobs (ints).
 
-Out of scope on purpose (read at point of use, NOT agent feature flags):
-  - Secrets (OPENROUTER_API_KEY / DASHSCOPE_*) — never land in a logged config.
-  - Paths (OSWORLD_REPO_ROOT / OSWORLD_RESULTS_DIR) — see ``_paths.py``.
-  - Model names / offline-pipeline knobs (VERIFIER_POLISH_MODEL, BUILD_VERSION…).
-  - Retrieval-singleton knobs (MEMORY_BANK_VERSION / MEMORY_TOP_K) — owned by the
-    memory subsystem at import; folding them in is deferred to the memory reorg.
+Deliberately out of scope (read at point of use, not feature flags):
+secrets (OPENROUTER_API_KEY / DASHSCOPE_*, kept out of logged config), paths
+(see ``_paths.py``), model names / offline-pipeline knobs, and retrieval
+singletons (MEMORY_BANK_VERSION / MEMORY_TOP_K, owned by the memory subsystem).
 """
 from __future__ import annotations
 
@@ -42,9 +37,8 @@ def _int_flag(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class CAConfig:
-    """Immutable snapshot of the agent's runtime feature flags. Build with
-    :meth:`from_env`; never construct directly so the env stays the single
-    source of truth. Resolve once at agent construction and read ``self.cfg.*``."""
+    """Immutable snapshot of runtime feature flags. Build via :meth:`from_env`,
+    not directly, so the env stays the single source of truth."""
 
     # — ledger / verification —
     disable_ledger: bool              # DISABLE_LEDGER — turn the ledger off entirely
@@ -54,13 +48,12 @@ class CAConfig:
     feasibility_verdict: bool         # ENABLE_FEASIBILITY_VERDICT — Fix 1: judge INFEASIBLE at replan>=K
     feasibility_verdict_k: int        # FEASIBILITY_VERDICT_K — consecutive replans before judging INFEASIBLE
     feasibility_recheck_every: int    # FEASIBILITY_RECHECK_EVERY — re-judge cadence (in replans)
-    domain_coding_gate: bool          # ENABLE_DOMAIN_CODING_GATE — GUI-only domains (chrome/gimp/thunderbird): no cli_run/edit_json + decomposer gets domain knowledge + verifier/memory prefer GUI
+    domain_coding_gate: bool          # ENABLE_DOMAIN_CODING_GATE — GUI-only domains (chrome/gimp/thunderbird): no cli_run/edit_json, decomposer gets domain knowledge, verifier/memory prefer GUI
     actor_burst_max_turns: int        # ACTOR_BURST_MAX_TURNS — max actor turns per subgoal before force_replan
     actor_burst_no_effect_limit: int  # ACTOR_BURST_NO_EFFECT_LIMIT — consecutive no_effect verdicts before force_replan
 
     # — done-auditor / stuck-diagnosis: ENV PART ONLY —
-    #   loop.py OR's these with the matching constructor kwarg, so the
-    #   effective switch is ``ctor_kwarg or <env part>``.
+    #   loop.py OR's these with the matching ctor kwarg: effective = kwarg or env.
     done_auditor_env: bool                 # ENABLE_DONE_AUDITOR
     stuck_diagnosis_injection_env: bool    # ENABLE_STUCK_DIAGNOSIS_INJECTION
 

@@ -1,14 +1,12 @@
-"""Ledger records — structured data the ledger accumulates per task / outcome.
+"""Ledger records the ledger accumulates per task / outcome.
 
-  - Evidence / Artifact      : verifier-output artifacts (one per verify run).
-  - Failure                  : per-Outcome failed-branch record.
-  - Fact                     : captured working-memory value.
-  - build_* (bundle_assembler): verify-trace -> Evidence record.
+  - Evidence / Artifact: verifier-output artifacts (one per verify run).
+  - Failure: per-Outcome failed-branch record.
+  - Fact: captured working-memory value.
+  - build(): verify-trace -> Evidence record.
 
-Merged from evidence.py / failure.py / bundle_assembler.py / fact.py
-(Phase 1 declutter: 4 tiny dataclass modules -> one records module).
-Intra-deps (Failure->Artifact, bundle_assembler->Evidence) are now
-same-module references; ordering preserves them."""
+Merged from evidence.py / failure.py / bundle_assembler.py / fact.py.
+Definition order preserves the intra-module references."""
 from __future__ import annotations
 
 import json
@@ -23,18 +21,11 @@ from typing import Any, Dict, List, Optional, Tuple
 # =========================================================================
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Evidence status — set by the cascade machinery (A8+).
-#
-# LIVE        — verifier confirmed this outcome and nothing has
-#               invalidated it yet (default state for fresh Evidence).
-# STALE       — the source outcome was REVERTED via reverify (A8); any
-#               downstream outcome whose Evidence consumed this slot
-#               should not trust it any more.
-# INVALIDATED — explicitly marked invalid by something else (e.g.
-#               human intervention via the planned ``invalidate_evidence``
-#               action). Not reached automatically in A2.
-# ──────────────────────────────────────────────────────────────────────
+# Evidence status, set by the cascade machinery.
+#   LIVE        — verifier confirmed, nothing has invalidated it (default).
+#   STALE       — source outcome was REVERTED via reverify; downstream
+#                 outcomes that consumed this slot should not trust it.
+#   INVALIDATED — explicitly marked invalid (e.g. invalidate_evidence action).
 EVIDENCE_LIVE = "live"
 EVIDENCE_STALE = "stale"
 EVIDENCE_INVALIDATED = "invalidated"
@@ -42,13 +33,9 @@ EVIDENCE_INVALIDATED = "invalidated"
 
 @dataclass
 class Artifact:
-    """A sub-piece of evidence — a screenshot crop, a matched file line
-    region, an extracted a11y row, etc. Kept loose-typed (kind + blob)
-    so we can grow the set without schema migrations.
-
-    A2: nothing populates this yet. A3+ uses screenshot crops and
-    matched-line snippets when bundle_assembler has them in hand.
-    """
+    """A sub-piece of evidence (screenshot crop, matched line region, a11y
+    row, ...). Loose-typed (kind + blob) so the set can grow without schema
+    migrations."""
     kind: str                                # "screenshot_crop" | "matched_lines" | "a11y_row" | ...
     payload: Any                             # JSON-serializable
     label: Optional[str] = None
@@ -58,11 +45,9 @@ class Artifact:
 class Evidence:
     """One verifier run's structured output, attached to the Outcome.
 
-    Built by ``bundle_assembler.build()`` immediately after
-    ``verify_with_trace`` returns and the KeyNode is decided.
-    Appended to ``Outcome.evidence`` (list, latest last). Persists
-    in traj.jsonl alongside the rest of the ledger.
-    """
+    Built by ``build()`` once ``verify_with_trace`` returns and the KeyNode is
+    decided. Appended to ``Outcome.evidence`` (latest last); persists in
+    traj.jsonl."""
     triggering_keynode: Optional[Any]        # KeyNode (the detection that fired this verify)
     verifier_kind: str                       # file_grep / url_match / a11y_match / shell_command / calc_verify / ...
     verifier_trace: Dict[str, Any]           # full trace from verify_with_trace (no truncation)
@@ -81,7 +66,7 @@ class Evidence:
 # =========================================================================
 
 
-# Levels mirror the existing FailedPath levels for compat at A4.
+# Levels mirror the FailedPath levels for compat.
 FAILURE_STRATEGY = "strategy"
 FAILURE_ACTION = "action"
 
@@ -96,9 +81,8 @@ ES_KEYNODE = "keynode"
 class Failure:
     """A dead-end record at one of two granularities (see ``level``).
 
-    Same semantics as FailedPath but scoped per-Outcome (A4 migration).
-    Fields preserved 1:1 so the relocation does not change persistence
-    shape — only the *container* changes.
+    Same semantics as FailedPath, scoped per-Outcome. Fields preserved 1:1 so
+    the persistence shape is unchanged.
     """
     path: str
     why: str
@@ -110,8 +94,7 @@ class Failure:
     last_observed_at_step: int = 0
     observation_count: int = 1
 
-    # New A2 fields. Default-empty so legacy data round-trips through
-    # __init__ without TypeErrors.
+    # Default-empty so legacy data round-trips through __init__.
     related_strategy_id: Optional[str] = None
     artifacts: List[Artifact] = field(default_factory=list)
 
@@ -134,36 +117,26 @@ def build(
 ) -> Evidence:
     """Build one Evidence record from a verify_with_trace run.
 
-    Inputs:
-      outcome             — the Outcome being verified (for verifier_kind
-                            and step-span derivation; we read
-                            outcome.verify.kind and
-                            outcome.last_satisfy_step).
-      verdict             — the verifier's True/False/None return.
-      trace               — the trace dict the verifier returned.
-                            None / non-dict → coerced to empty dict.
-      triggering_keynode  — the KeyNode that was decided (may be None
-                            on a failed verify or when KeyNode emission
-                            was suppressed).
-      step_idx            — the step index this verify ran in.
-      strategy_text       — the planner's <strategy> text (if any).
-      bound_slots         — slot values bound by THIS verify run (the
-                            verifier slot binder fills these). Empty
-                            dict on a verify with no slot bindings.
+    Args:
+      outcome: the Outcome being verified (read for verifier_kind and
+        last_satisfy_step).
+      verdict: the verifier's True/False/None return.
+      trace: the verifier's trace dict; None/non-dict coerced to empty.
+      triggering_keynode: the decided KeyNode (None on a failed verify or
+        when KeyNode emission was suppressed).
+      step_idx: the step this verify ran in.
+      strategy_text: the planner's <strategy> text, if any.
+      bound_slots: slot values bound by THIS verify run; empty if none.
 
-    Returns a fully-populated Evidence ready to be appended to
-    outcome.evidence. status is LIVE; cascade machinery (A8) may flip
-    it later.
+    Status is LIVE; the cascade machinery may flip it later.
     """
     verifier_kind = "?"
     if outcome is not None and getattr(outcome, "verify", None) is not None:
         verifier_kind = getattr(outcome.verify, "kind", "?")
 
     # step_span = (first step in this attempt, this verify step).
-    # "first step in this attempt" = last_satisfy_step + 1 if the
-    # outcome has been verified before (we're re-verifying after a
-    # revert/recheck); otherwise 0 (the agent has been working on it
-    # from the start).
+    # First step = last_satisfy_step + 1 if re-verifying after a
+    # revert/recheck; else 0 (worked on from the start).
     last_sat = getattr(outcome, "last_satisfy_step", None) if outcome is not None else None
     first_step = (last_sat + 1) if isinstance(last_sat, int) else 0
     span: Tuple[int, int] = (first_step, step_idx)
@@ -203,16 +176,14 @@ class Fact:
     """One captured working-memory value.
 
     Fields:
-      name                  — flat key (e.g. "unpaid_emails", "doc_path")
-      value                 — JSON-serializable payload
-      type                  — informative type tag (see FACT_TYPE_* above)
-      source_outcome_id     — Outcome id that produced this value,
-                              or ``"global"`` for task-wide captures
-                              (which live in ``ledger.global_facts``)
-      source_step           — step at which the value was captured
-      last_verified_at_step — step the value was last re-verified live
-                              (mirrors source_step on creation; bumped
-                              when a verifier confirms the source again)
+      name: flat key (e.g. "unpaid_emails", "doc_path").
+      value: JSON-serializable payload.
+      type: informative type tag (see FACT_TYPE_* above).
+      source_outcome_id: producing Outcome id, or "global" for task-wide
+        captures (which live in ``ledger.global_facts``).
+      source_step: step the value was captured at.
+      last_verified_at_step: step the value was last re-verified live;
+        mirrors source_step on creation, bumped when the source is confirmed.
     """
     name: str
     value: Any
@@ -222,11 +193,8 @@ class Fact:
     last_verified_at_step: int = 0
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Rendering — A6 switches the planner / decomposer prompts from the
-# legacy ``_notebook`` dict + ``actions.handlers.notebook.render`` to the per-
-# outcome Facts view rendered by this function.
-# ──────────────────────────────────────────────────────────────────────
+# Rendering: the planner/decomposer prompts use this per-outcome Facts view
+# instead of the legacy _notebook dict.
 
 _TRUNC_NOTE_LEN = 240
 
@@ -242,10 +210,9 @@ def render_working_memory(
 ) -> Optional[str]:
     """Render the live ``working_memory()`` view into a prompt block.
 
-    Output mirrors the legacy ``[Notebook]`` block but groups Facts by
-    their source (focus outcome first, other outcomes, then global)
-    and surfaces ``_kind=extract_info`` payloads as a structured
-    sub-section per file. Returns None when there's nothing live.
+    Groups Facts by source (focus outcome, other outcomes, global) and
+    surfaces ``_kind=extract_info`` payloads as a per-file sub-section.
+    Returns None when nothing is live.
     """
     if not facts:
         return None
@@ -274,8 +241,7 @@ def render_working_memory(
     def _render_bucket(bucket, header):
         if not bucket:
             return
-        # split notes vs extract_info payloads (latter has structured
-        # {_kind: "extract_info", query, extracted}).
+        # Split notes vs extract_info payloads ({_kind, query, extracted}).
         notes, extracts = [], []
         for name, f in bucket:
             if (isinstance(f.value, dict)
@@ -287,9 +253,8 @@ def render_working_memory(
             out.append(f"\n{header} — notes ({len(notes)}):")
             for name, f in notes:
                 v = f.value
-                # _notebook-wrapped {"_kind":"note","value":...} payloads
-                # land here in mixed dual-write states; surface the
-                # inner value when present.
+                # _notebook-wrapped {"_kind":"note","value":...} payloads land
+                # here in mixed dual-write states; surface the inner value.
                 if isinstance(v, dict) and v.get("_kind") == "note":
                     v = v.get("value")
                 if isinstance(v, (dict, list)):
