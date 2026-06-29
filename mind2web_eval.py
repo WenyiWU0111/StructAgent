@@ -1,34 +1,13 @@
-"""Unified single-example loop for text-answer tasks.
+"""Mind2Web evaluation bridge.
 
-Covers three benchmarks today, all of which share the same shape:
-  1. The agent navigates a browser (or any GUI surface).
-  2. At task end, it emits a textual answer string via a sentinel.
-  3. The score is computed AFTER env termination from
-       (a) the answer string + (b) the trajectory's screenshots
-       (and optionally the gold reference data when available).
-
-Benchmarks routed here (and the eval they dispatch to):
-
-  • WebVoyager / Mind2Web-executable  → ``web_judge.judge_webvoyager``
-    LLM-as-judge over (intent + answer + last 5 screenshots). No gold
-    reference; the judge model decides SUCCESS / NOT SUCCESS. Routed
-    when ``example.get("_eval_mode")`` is ``"llm_judge"`` (the default).
-
-  • MMInA  → ``mmina_adapter.evaluate_mmina``
-    Gold-reference eval (string match / URL match / LLM fuzzy match).
-    More precise than LLM-as-judge when gold answers exist. Routed when
-    ``example.get("_eval_mode") == "gold_reference"``.
-
-Sentinel: the planner prompt instructs the model to emit
-``finished(answer="...")``. The agent's detection layer ALSO accepts the
-legacy ``ANSWER(...)`` shape for backward-compat with wiki_search_executor
-and any MMInA-era replay. Both populate ``self._text_answer``.
+Captures the agent's text answer when needed, collects key screenshots, and
+scores a finished web episode with the answer-blind Online-Mind2Web grader
+(``web_judge_online_m2w.WebJudge``). Also hosts the judge LLM-client factory.
+WebVoyager / MMInA grading are not part of this release.
 """
 from __future__ import annotations
 
 import base64
-import dataclasses
-import datetime
 import json
 import logging
 import os
@@ -36,61 +15,98 @@ import re
 import time
 from typing import Any, List, Optional
 
-from lib_results_logger import log_task_completion, write_trajectory_html
-from web_judge import (
-    extract_web_answer,
-    judge_webvoyager,
-    make_judge_client,
-)
+from mm_agents import model_endpoints as ME
+from web_judge_online_m2w import WebJudge
 
 logger = logging.getLogger("desktopenv.experiment")
 
+_FINISHED_RE = re.compile(
+    r"finished\s*\(\s*answer\s*=\s*[\"\']?(?P<a>.*?)[\"\']?\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
 
-def _dump_agent_runtime_config(agent, example_result_dir: str) -> None:
-    cfg = getattr(agent, "cfg", None)
-    if cfg is None:
-        return
+_DEFAULT_LOCAL_VLLM_URL = ME.server_url("qwen35-vl")
+
+def extract_web_answer(text: Optional[str]) -> str:
+    """Pull the ``finished(answer="...")`` payload out of an agent reply.
+
+    Tolerates single/double quotes and trailing whitespace. Returns ""
+    when no match — caller can decide whether to score against the
+    screenshots alone or skip.
+    """
+    if not text:
+        return ""
+    m = _FINISHED_RE.search(text)
+    if not m:
+        return ""
+    return (m.group("a") or "").strip().strip("'").strip('"')
+
+
+def make_local_vllm_client(base_url: Optional[str] = None) -> Any:
+    """Local vllm (Qwen3.5-9B / qwen35-vl). The default vllm endpoint
+    served by the actor stack — reusing it for the judge means no extra
+    network hop, no OpenRouter quota issues, no empty-content surprises.
+    """
+    import openai
+    return openai.OpenAI(
+        base_url=base_url or _DEFAULT_LOCAL_VLLM_URL,
+        api_key="EMPTY")
+
+
+def make_openrouter_client(api_key: Optional[str] = None) -> Any:
+    """Fallback OpenRouter client for the qwen/qwen3.5-27b judge model.
+    Only consulted when ``judge_model`` clearly points at a remote model.
+    """
+    import os
+    import openai
+    key = (api_key
+           or os.environ.get("OPENROUTER_API_KEY")
+           or os.environ.get("OPEN_ROUTER_API_KEY"))
+    if not key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY not set; cannot reach remote judge")
+    return openai.OpenAI(base_url="https://openrouter.ai/api/v1",
+                          api_key=key)
+
+
+def make_judge_client(model: str) -> Tuple[Any, str]:
+    """Resolve (client, real_model_name) for a judge ``model`` string.
+
+    Routing rules (resolved via the model_endpoints registry so any
+    served local alias works — e.g. a stronger ``vllm_qwen35-27b`` judge,
+    which the Online-Mind2Web 3-stage grader needs; the 9B is too weak for
+    its per-screenshot relevance scoring):
+      • ``provider/model`` (slash) or ``anthropic/`` / ``openai/`` /
+        ``google/`` / ``qwen/`` prefix → OpenRouter.
+      • A registry alias (optionally ``vllm_``-prefixed) that maps to a
+        local endpoint → local vllm at its URL + served model name.
+      • Anything else → local 9B (``Qwen/Qwen3.5-9B``).
+
+    Returns (openai.OpenAI client, fully-qualified model name suitable
+    for the resolved endpoint).
+    """
+    from mm_agents import model_endpoints as ME
+    m = (model or "").strip()
+    lower = m.lower()
+    # Explicit remote provider routing.
+    has_provider = "/" in m or lower.startswith(
+        ("anthropic/", "openai/", "google/", "qwen/"))
+    if has_provider:
+        return make_openrouter_client(), m
+    # Local vllm alias via the registry (strip an optional vllm_ prefix).
+    key = m[len("vllm_"):] if lower.startswith("vllm_") else m
     try:
-        payload = (
-            dataclasses.asdict(cfg)
-            if dataclasses.is_dataclass(cfg)
-            else dict(getattr(cfg, "__dict__", {}) or {})
-        )
-        payload.update({
-            "verifier_model": getattr(agent, "verifier_model", None),
-            "planner_model": getattr(agent, "model", None),
-            "decomposer_model": getattr(agent, "decomposer_model", None),
-            "grounding_model": getattr(agent, "grounding_model", None),
-            "effective_enable_boundary_verify": getattr(
-                agent, "_boundary_verify_on", None),
-            "effective_enable_actor_burst": getattr(
-                agent, "_actor_burst_on", None),
-            "effective_actor_burst_max_turns": getattr(
-                agent, "_ACTOR_BURST_MAX_TURNS", None),
-            "effective_actor_burst_no_effect_limit": getattr(
-                agent, "_ACTOR_BURST_NO_EFFECT_LIMIT", None),
-            "effective_actor_burst_debug": getattr(
-                agent, "_actor_burst_debug", None),
-            "effective_enable_done_auditor": getattr(
-                agent, "enable_done_auditor", None),
-            "done_auditor_model": getattr(agent, "done_auditor_model", None),
-            "done_auditor_max_per_task": getattr(
-                agent, "done_auditor_max_per_task", None),
-            "done_auditor_budget_remaining": getattr(
-                agent, "_done_audit_budget_remaining", None),
-            "done_audit_reject_count": getattr(
-                agent, "_done_audit_reject_count", None),
-            "effective_enable_stuck_diagnosis_injection": getattr(
-                agent, "enable_stuck_diagnosis_injection", None),
-        })
-        with open(
-            os.path.join(example_result_dir, "structagent_config.json"),
-            "w",
-            encoding="utf-8",
-        ) as f:
-            json.dump(payload, f, indent=2, sort_keys=True)
-    except Exception as e:
-        logger.warning("Failed to dump StructAgent config: %s", e)
+        if ME.is_known(key) and not ME.is_openrouter(key):
+            return (make_local_vllm_client(ME.server_url(key)),
+                    ME.model_name(key))
+    except Exception:
+        pass
+    # Unknown — default to local 9B.
+    return make_local_vllm_client(), "Qwen/Qwen3.5-9B"
+
+
+
+
 
 
 # ── Sentinel extraction ───────────────────────────────────────────────
@@ -369,23 +385,13 @@ def _run_judge(
             return 0.0, f"<online-m2w error: {e}>"
         return max(0.0, min(1.0, float(score))), judge_raw
 
-    # Default: LLM-as-judge (WebVoyager grader). Picks local vllm by
-    # default for stability; set JUDGE_MODEL=qwen/qwen3.5-27b for OpenRouter.
-    if judge_client is None:
-        try:
-            judge_client, judge_model = make_judge_client(judge_model)
-        except Exception as e:
-            logger.error("[Eval] no judge client (%s); scoring 0", e)
-            return 0.0, f"<no judge client: {e}>"
-    score, judge_raw = judge_webvoyager(
-        intent=instruction,
-        agent_answer=agent_answer,
-        screenshots_b64=screenshots_b64,
-        client=judge_client,
-        model=judge_model,
-        n_screenshots=n_screenshots_for_judge,
+    # No other web grader ships in this release. WebVoyager (response-believing)
+    # grading was removed; every web task here is a Mind2Web task scored by the
+    # answer-blind Online-Mind2Web grader above.
+    raise NotImplementedError(
+        "Only the Online-Mind2Web grader is included; the task did not resolve "
+        "to a mind2web eval (check example['_text_answer_domain'])."
     )
-    return max(0.0, min(1.0, float(score))), judge_raw
 
 
 # ── Baseline-framework helpers (Agent-S3 / VLAA-GUI / OS-Symphony) ───
@@ -404,30 +410,6 @@ def text_answer_eval_mode(example: dict) -> Optional[str]:
     if (example.get("evaluator") or {}).get("func") == "llm_judge_webvoyager":
         return "llm_judge"
     return None
-
-
-def rewrite_text_answer_instruction(
-    instruction: str, sentinel_prefix: str
-) -> str:
-    """W-P0: task hints name the main harness's ``finished(answer=...)``
-    sentinel. Swap in the calling framework's own answer channel (e.g.
-    ``agent.done(return_value=`` for S3/VLAA), and for tasks whose raw
-    intent carries no hint at all (mind2web), append the same emission
-    preamble the main harness uses — with the framework's action name.
-    Semantics unchanged; only the action spelling differs per framework.
-    """
-    out = instruction.replace("finished(answer=", sentinel_prefix)
-    if sentinel_prefix not in out:
-        out = (
-            out.rstrip()
-            + "\n\nIMPORTANT: This task requires you to emit a final "
-              "answer. After completing the navigation/search/filter "
-              "steps, your last action MUST be "
-              f"``{sentinel_prefix}\"<your answer here>\")`` — a concise "
-              "sentence summarising what you found or what was done. "
-              "Without this final emission the task is scored as failed."
-        )
-    return out
 
 
 def collect_step_screenshots_b64(
@@ -592,238 +574,3 @@ def score_text_answer(
 # ── Main loop ─────────────────────────────────────────────────────────
 
 
-def run_single_example_text_answer(
-    agent, env, example, max_steps, instruction, args, example_result_dir,
-    scores,
-    judge_client: Any = None,
-    judge_model: Optional[str] = None,
-    n_screenshots_for_judge: int = 5,
-):
-    """Run one text-answer task and write result.txt + answer.txt.
-
-    Dispatches eval based on ``example["_eval_mode"]``:
-      - ``"gold_reference"`` → mmina_adapter.evaluate_mmina (string /
-                                URL / fuzzy-match against gold)
-      - ``"llm_judge"`` (default) → web_judge.judge_webvoyager
-                                     (vision LLM over screenshots)
-    """
-    eval_mode = example.get("_eval_mode") or "llm_judge"
-    # Resolve judge model: explicit arg > env > local default. Local
-    # vllm Qwen3.5-9B is the most reliable option (no quota / no
-    # rate-limit empty-content surprises seen with OpenRouter).
-    if judge_model is None:
-        judge_model = (os.environ.get("JUDGE_MODEL", "").strip()
-                       or "vllm_qwen35-vl")
-
-    runtime_logger = setup_logger(example, example_result_dir)
-    env.reset(task_config=example)
-
-    try:
-        agent.reset(runtime_logger, vm_ip=env.vm_ip)
-    except Exception:
-        agent.reset(runtime_logger)
-
-    related_apps = example.get("related_apps", ["chrome"])
-    # Mirror lib_run_single's per-task agent setup so we don't drop
-    # state that the agent / decomposer / memory layer expects.
-    agent._related_apps = list(related_apps)
-    agent._current_domain = related_apps[0] if related_apps else "chrome"
-    agent._vm_ip = getattr(env, "vm_ip", None)
-    agent._chromium_port = getattr(env, "chromium_port", 9222)
-    # All debug dumpers (planner_memory_debug, perceiver_debug,
-    # stuck_diagnosis, digester audit, audit_debug, etc.) read
-    # ``self._results_dir`` and silent-skip when it's None. Set per
-    # task so artifacts land in the standard OSWorld per-task subdir.
-    agent._results_dir = example_result_dir
-    _dump_agent_runtime_config(agent, example_result_dir)
-    # OSWorld convention: tag the instruction with [<domain>] so the
-    # planner / decomposer's domain-specific hint injection picks the
-    # right block. Without this, the planner sees an un-tagged web task
-    # and may inject the wrong domain context.
-    _instr_tag = (
-        "multi_apps" if len(related_apps) > 1 else
-        (related_apps[0] if related_apps else "chrome"))
-    if not instruction.lstrip().startswith("["):
-        instruction = f"[{_instr_tag}] {instruction}"
-    # Answer channel (``finished(answer="...")``) is needed ONLY by domains
-    # whose SCORING reads the agent's answer: webvoyager (the judge reads it)
-    # and mmina_* (gold-reference match). mind2web is graded by the answer-blind
-    # Online-Mind2Web grader, so it runs as a NORMAL OSWorld task — it
-    # terminates via the DONE-gate + done-auditor (no finished(answer) preamble,
-    # sentinel, or planner instruction).
-    _ans_domain = (example.get("_text_answer_domain")
-                   or example.get("_web_domain")
-                   or example.get("_mmina_domain") or "")
-    _answer_channel = _needs_answer_channel(_ans_domain)
-    if (_answer_channel
-            and "finished(answer" not in instruction
-            and "ANSWER(" not in instruction):
-        instruction = (
-            instruction.rstrip()
-            + "\n\nIMPORTANT: This task requires you to emit a final "
-              "answer. After completing the navigation/search/filter "
-              "steps, your last action MUST be "
-              "``finished(answer=\"<your answer here>\")`` — a concise "
-              "sentence summarising what you found or what was done. "
-              "Without this final emission the task is scored as "
-              "failed."
-        )
-
-    # Answer-channel flag: drives the finished(answer) sentinel detection
-    # (loop.py) + the planner's finished(answer) instruction. OFF for mind2web
-    # → the agent uses the normal OSWorld DONE logic (DONE-gate + done-auditor).
-    agent._is_text_answer_task = _answer_channel
-    agent._text_answer = None
-    agent._text_answer_domain = (
-        example.get("_text_answer_domain")
-        or example.get("_web_domain")
-        or example.get("_mmina_domain")
-        or getattr(agent, "_text_answer_domain", None))
-
-    # Chrome boot wait. Same value as MMInA / web runners.
-    time.sleep(20)
-    obs = env._get_obs()
-
-    done = False
-    step_idx = 0
-    steps_for_html: List[dict] = []
-    initial_plan = None
-    memory_text = None
-    all_actions: List[str] = []
-    all_responses: List[str] = []
-    final_screenshots_b64: List[str] = []
-
-    env.controller.start_recording()
-
-    while not done and step_idx < max_steps:
-        response, actions = agent.predict(
-            instruction, obs, env=env, wall_step_idx=step_idx)
-
-        if step_idx == 0:
-            initial_plan = getattr(agent, "current_plan", None)
-            memory_text = getattr(agent, "memory_steps_text", None)
-
-        current_plan = getattr(agent, "current_plan", None)
-        next_step_hint = getattr(agent, "next_step_hint", None)
-        observations = getattr(agent, "observations", None)
-        current_subgoal = getattr(agent, "current_subgoal", None)
-        planner_decision = getattr(agent, "planner_decision", None)
-        planner_response = getattr(agent, "planner_response", None)
-
-        all_responses.append(response or "")
-
-        if getattr(agent, "all_done_after_step", False):
-            logger.info("Agent reported done — terminating episode.")
-            ss = _b64_screenshot(obs)
-            if ss:
-                final_screenshots_b64.append(ss)
-            done = True
-            break
-
-        for action in actions:
-            action_timestamp = datetime.datetime.now().strftime(
-                "%Y%m%d@%H%M%S%f")
-            logger.info("Step %d: %s", step_idx + 1, action)
-            all_actions.append(str(action))
-
-            obs, reward, done, info = env.step(
-                action, args.sleep_after_execution)
-
-            with open(os.path.join(example_result_dir, "traj.jsonl"), "a") as f:
-                f.write(json.dumps({
-                    "step_num": step_idx + 1,
-                    "action_timestamp": action_timestamp,
-                    "action": action,
-                    "response": response,
-                    "reward": reward,
-                    "done": done,
-                    "info": info,
-                }))
-                f.write("\n")
-
-            screenshot_b64 = _b64_screenshot(obs)
-            if screenshot_b64:
-                final_screenshots_b64.append(screenshot_b64)
-            steps_for_html.append({
-                "screenshot_b64": screenshot_b64,
-                "response": response,
-                "action": action,
-                "reward": reward,
-                "done": done,
-                "info": info,
-                "plan": current_plan,
-                "next_step_hint": next_step_hint,
-                "observations": observations,
-                "current_subgoal": current_subgoal,
-                "planner_decision": planner_decision,
-                "planner_response": planner_response,
-            })
-            if done:
-                logger.info("The episode is done.")
-                break
-        step_idx += 1
-
-    time.sleep(3)
-
-    # ── Answer extraction (dual-sentinel) ──────────────────────────────
-    agent_answer = (getattr(agent, "_text_answer", None) or "").strip()
-    if not agent_answer:
-        for txt in reversed(all_responses):
-            cand = extract_text_answer(txt)
-            if cand:
-                agent_answer = cand
-                break
-    if not agent_answer:
-        pr = getattr(agent, "planner_response", "") or ""
-        agent_answer = extract_text_answer(pr)
-
-    # ── Force-extract + judge + persist via the SHARED scorer ──────────
-    # score_text_answer is the single scoring path for every harness
-    # (this planner runner and the S3/VLAA/Symphony baselines), so all
-    # rows are judged byte-identically. force_extract_model preserves the
-    # old behaviour here (the agent's own model alias drives the rescue
-    # call, not the judge's).
-    score = score_text_answer(
-        example=example,
-        instruction=instruction,
-        agent_answer=agent_answer,
-        screenshots_b64=final_screenshots_b64,
-        env=env,
-        example_result_dir=example_result_dir,
-        judge_client=judge_client,
-        judge_model=judge_model,
-        n_screenshots_for_judge=n_screenshots_for_judge,
-        force_extract_llm=(getattr(agent, "call_llm", None)
-                           if getattr(agent, "_is_text_answer_task", False)
-                           else None),
-        force_extract_model=(getattr(agent, "model", None)
-                             or "vllm_qwen35-vl"),
-        action_history=all_actions,
-    )
-    scores.append(score)
-
-    # write_trajectory_html no longer accepts initial_plan — Step 1's
-    # ``plan`` field is byte-identical to it (see lib_results_logger
-    # docstring). Pass only the supported kwargs.
-    write_trajectory_html(
-        example_result_dir,
-        instruction=instruction,
-        steps=steps_for_html,
-        final_score=score,
-        memory_text=memory_text,
-    )
-    log_task_completion(example, score, example_result_dir, args)
-    env.controller.end_recording(
-        os.path.join(example_result_dir, "recording.mp4"))
-
-
-def setup_logger(example, example_result_dir):
-    runtime_logger = logging.getLogger(
-        f"text_answer.{example.get('id', 'unknown')}")
-    runtime_logger.setLevel(logging.INFO)
-    for h in list(runtime_logger.handlers):
-        runtime_logger.removeHandler(h)
-    runtime_logger.addHandler(
-        logging.FileHandler(os.path.join(example_result_dir, "runtime.log"))
-    )
-    return runtime_logger

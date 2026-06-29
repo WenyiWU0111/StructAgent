@@ -91,7 +91,7 @@ def main() -> None:
                     help="overwrite result.txt with the new score")
     a = ap.parse_args()
 
-    from web_judge import make_judge_client
+    from mind2web_eval import make_judge_client
     from web_judge_online_m2w import WebJudge
 
     client, model = make_judge_client(a.judge_model)

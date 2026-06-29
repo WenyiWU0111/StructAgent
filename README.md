@@ -158,7 +158,8 @@ StructAgent/
 ├── desktop_env/             # OSWorld environment (from xlang-ai/OSWorld)
 ├── evaluation_examples/     # OSWorld + Mind2Web task configs
 ├── scripts/                 # runner, vLLM serving, Mind2Web re-scoring
-├── lib_run_single*.py       # per-task OSWorld / text-answer loops
+├── lib_run_single.py        # per-task loop (OSWorld + Mind2Web)
+├── mind2web_eval.py         # Mind2Web grading bridge + judge client factory
 ├── web_judge_online_m2w.py  # answer-blind Online-Mind2Web grader
 └── docs/                    # ENVIRONMENT / MODELS / REPRODUCE
 ```

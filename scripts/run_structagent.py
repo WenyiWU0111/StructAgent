@@ -17,27 +17,18 @@ from multiprocessing import current_process
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import lib_run_single
-import lib_run_single_text_answer
 from desktop_env.desktop_env import DesktopEnv
 from desktop_env.api_env import APIDesktopEnv
 from mm_agents.structagent import StructAgent
 
-# Domains whose tasks emit a text answer at termination (via
-# ``finished(answer="...")`` or legacy ``ANSWER(...)``) and are scored
-# by lib_run_single_text_answer instead of OSWorld's env.evaluate().
-# Two eval modes are dispatched per ``example["_eval_mode"]``:
-#   • "llm_judge"      → web_judge.judge_webvoyager (vision LLM)
-#   • "gold_reference" → mmina_adapter.evaluate_mmina (string/url match)
-# Add a domain here when wiring a new text-answer benchmark.
-TEXT_ANSWER_DOMAINS = {"webvoyager", "mind2web"}
-# MMInA domain names are dynamic (``mmina_wikipedia``, ``mmina_shopping``,
-# etc) — recognise by prefix so we don't have to enumerate.
-TEXT_ANSWER_DOMAIN_PREFIXES = ("mmina_",)
+# Web (Mind2Web) tasks run through the same loop as OSWorld but are scored by
+# the answer-blind Online-Mind2Web grader (mind2web_eval) instead of
+# env.evaluate(). They are tagged so run_single_example picks the right scorer.
+TEXT_ANSWER_DOMAINS = {"mind2web"}
 
 
 def _is_text_answer_domain(domain: str) -> bool:
-    return (domain in TEXT_ANSWER_DOMAINS
-            or any(domain.startswith(p) for p in TEXT_ANSWER_DOMAIN_PREFIXES))
+    return domain in TEXT_ANSWER_DOMAINS
 
 # Global variables for signal handling
 active_environments = []
@@ -327,37 +318,22 @@ def run_env_tasks(task_queue, args: argparse.Namespace, shared_scores: list):
                 os.makedirs(example_result_dir, exist_ok=True)
                 try:
                     if _is_text_answer_domain(domain):
-                        # Text-answer benchmarks (webvoyager / mind2web /
-                        # mmina_*) skip env.evaluate() and use the unified
-                        # text-answer runner — eval mode dispatched per
-                        # ``example["_eval_mode"]``.
+                        # Mind2Web web tasks run through the SAME loop as
+                        # OSWorld; only the scoring differs. Tag the example so
+                        # run_single_example scores it with the answer-blind
+                        # Online-Mind2Web grader instead of env.evaluate().
                         example["_text_answer_domain"] = domain
-                        if "_eval_mode" not in example:
-                            example["_eval_mode"] = (
-                                "gold_reference"
-                                if domain.startswith("mmina_")
-                                else "llm_judge")
-                        lib_run_single_text_answer.run_single_example_text_answer(
-                            agent,
-                            env,
-                            example,
-                            args.max_steps,
-                            example["instruction"],
-                            args,
-                            example_result_dir,
-                            shared_scores,
-                        )
-                    else:
-                        lib_run_single.run_single_example(
-                            agent,
-                            env,
-                            example,
-                            args.max_steps,
-                            example["instruction"],
-                            args,
-                            example_result_dir,
-                            shared_scores,
-                        )
+                        example["_eval_mode"] = "llm_judge"
+                    lib_run_single.run_single_example(
+                        agent,
+                        env,
+                        example,
+                        args.max_steps,
+                        example["instruction"],
+                        args,
+                        example_result_dir,
+                        shared_scores,
+                    )
                 except Exception as e:
                     import traceback
                     logger.error(f"Exception in {current_process().name} {domain}/{example_id}: {e}")

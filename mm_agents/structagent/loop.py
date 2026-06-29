@@ -1304,7 +1304,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
         # readers.
         if (self._is_text_answer_task or self._is_mmina_task) \
                 and actor_response:
-            from lib_run_single_text_answer import extract_text_answer
+            from mind2web_eval import extract_text_answer
             _ta = extract_text_answer(actor_response)
             if _ta:
                 self._text_answer = _ta
@@ -2019,7 +2019,7 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                 if ((self._is_text_answer_task or self._is_mmina_task)
                         and not self._text_answer
                         and self.planner_response):
-                    from lib_run_single_text_answer import extract_text_answer
+                    from mind2web_eval import extract_text_answer
                     _ta = extract_text_answer(self.planner_response)
                     if _ta:
                         self._text_answer = _ta

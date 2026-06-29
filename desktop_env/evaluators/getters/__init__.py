@@ -61,8 +61,7 @@ def get_raw_intent(env, config):
 
 
 def get_agent_final_response_and_screenshots(env, config):
-    """Defensive result-getter for webvoyager/mind2web tasks. Real
-    value comes from lib_run_single_text_answer reading traj.jsonl + screenshot
-    files from disk after the run; this stub is only here to keep the
-    OSWorld config loader happy."""
+    """Defensive result-getter for Mind2Web tasks. Real value comes from
+    mind2web_eval reading the run's screenshots + action history after the
+    run; this stub is only here to keep the OSWorld config loader happy."""
     return {"final_response": "", "screenshots_b64": []}

@@ -164,19 +164,18 @@ def infeasible():
 
 
 def llm_judge_webvoyager(*args, **kwargs):
-    """Stub so OSWorld's config loader can parse webvoyager / mind2web
-    task configs (their ``evaluator.func`` advertises this name for
-    semantic clarity). The actual judging happens in
-    ``lib_run_single_text_answer.py`` over the on-disk trajectory +
-    screenshots — it must NEVER reach ``env.evaluate()``. The matching
-    getters live in ``getters/__init__.py``: ``get_raw_intent`` +
-    ``get_agent_final_response_and_screenshots``.
+    """Stub so OSWorld's config loader can parse Mind2Web task configs
+    (their ``evaluator.func`` advertises this name). The actual judging
+    happens in ``mind2web_eval.py`` (the answer-blind Online-Mind2Web
+    grader) over the on-disk trajectory + screenshots — it must NEVER
+    reach ``env.evaluate()``. ``run_single_example`` detects these tasks
+    via ``mind2web_eval.text_answer_eval_mode`` and routes them to the
+    grader. The matching getters live in ``getters/__init__.py``:
+    ``get_raw_intent`` + ``get_agent_final_response_and_screenshots``.
 
-    If you see this raised, a text-answer task was routed to the wrong
-    runner — use ``scripts/run_text_answer_planner.sh`` (which goes
-    through the unified ``TEXT_ANSWER_DOMAINS`` fork in
-    ``run_multienv_qwen25vl_planner.py``).
+    If you see this raised, a Mind2Web task reached env.evaluate() — run
+    it through ``scripts/run.sh`` with a ``test_mind2web*.json`` manifest.
     """
     raise NotImplementedError(
-        "llm_judge_webvoyager is handled by lib_run_single_text_answer, "
-        "not env.evaluate(); use scripts/run_text_answer_planner.sh")
+        "llm_judge_webvoyager is handled by mind2web_eval (Online-Mind2Web "
+        "grader), not env.evaluate(); run via scripts/run.sh")
