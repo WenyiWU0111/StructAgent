@@ -175,7 +175,10 @@ def _emit_script(call_lines: List[str], domain: Optional[str],
     from ..uno.cli_run_uno_helpers import build_runtime_script
     code = "\n".join(list(call_lines) + ["print('PASS')"])
     try:
-        return build_runtime_script(code, domain=domain or "libreoffice_writer")
+        # Ops library/setup must match the ACTION's domain (writer), not the
+        # active-window __current_domain (cli_run_uno binds ``doc`` by service
+        # type; focus is irrelevant). See impress/actions for the bug context.
+        return build_runtime_script(code, domain="libreoffice_writer")
     except ValueError as e:
         if logger:
             logger.warning("[writer action] build failed: %s", e)

@@ -111,6 +111,17 @@ def _dump_eval_result_files(env, example, example_result_dir):
 def run_single_example(agent, env, example, max_steps, instruction, args, example_result_dir, scores):
     runtime_logger = setup_logger(example, example_result_dir)
     all_actions = []  # accumulated action strings (for the Mind2Web grader)
+    # Raw POST-step observation screenshots (b64), accumulated in-memory for
+    # the answer-blind Online-Mind2Web grader. This main harness writes NO
+    # step_*.png to disk (screenshots live only in trajectory.html), so the
+    # disk-reading collect_step_screenshots_b64() would return []. We pass
+    # THIS list instead — identical to the OSWorld-refactor text-answer runner
+    # (raw post-step obs + the final obs on DONE; the grader reads the last 5).
+    final_screenshots_b64 = []
+    # Only mind2web tasks are scored from screenshots; for every other task
+    # this list is unused, so skip the accumulation to avoid holding ~100
+    # base64 PNGs in memory per OSWorld run.
+    _collect_judge_shots = mind2web_eval.is_mind2web_task(example)
 
     # NOTE: no infeasible short-circuit here by design. OSWorld hides which tasks
     # are infeasible from the agent (evaluator metadata is never passed to predict),
@@ -235,6 +246,10 @@ def run_single_example(agent, env, example, max_steps, instruction, args, exampl
             screenshot_b64_final = None
             if isinstance(obs, dict) and obs.get("screenshot"):
                 screenshot_b64_final = base64.b64encode(obs["screenshot"]).decode("ascii")
+                # Final observation for the Mind2Web grader (the last frame the
+                # grader reads to judge completion). Matches OSWorld-refactor.
+                if _collect_judge_shots:
+                    final_screenshots_b64.append(screenshot_b64_final)
             a11y_text_final = None
             if isinstance(obs, dict) and obs.get("accessibility_tree"):
                 try:
@@ -358,6 +373,11 @@ def run_single_example(agent, env, example, max_steps, instruction, args, exampl
                 obs.get("screenshot") if isinstance(obs, dict) else None
             )
             obs, reward, done, info = env.step(action, args.sleep_after_execution)
+            # Raw post-step screenshot for the answer-blind Mind2Web grader
+            # (in-memory; see final_screenshots_b64). Matches OSWorld-refactor.
+            if _collect_judge_shots and isinstance(obs, dict) and obs.get("screenshot"):
+                final_screenshots_b64.append(
+                    base64.b64encode(obs["screenshot"]).decode("ascii"))
 
             logger.info("Reward: %.2f", reward)
             logger.info("Done: %s", done)
@@ -525,7 +545,7 @@ def run_single_example(agent, env, example, max_steps, instruction, args, exampl
                 logger.info("The episode is done.")
                 break
         step_idx += 1
-    if mind2web_eval.text_answer_eval_mode(example):
+    if mind2web_eval.is_mind2web_task(example):
         # Mind2Web web task: score with the answer-blind Online-Mind2Web grader
         # (the task's evaluator is a stub; env.evaluate() does not apply). The
         # grader judges from the raw intent + action history + key screenshots
@@ -534,8 +554,7 @@ def run_single_example(agent, env, example, max_steps, instruction, args, exampl
             example=example,
             instruction=instruction,
             agent_answer="",
-            screenshots_b64=mind2web_eval.collect_step_screenshots_b64(
-                example_result_dir),
+            screenshots_b64=final_screenshots_b64,
             env=env,
             example_result_dir=example_result_dir,
             action_history=all_actions,

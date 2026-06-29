@@ -397,19 +397,18 @@ def _run_judge(
 # ── Baseline-framework helpers (Agent-S3 / VLAA-GUI / OS-Symphony) ───
 
 
-def text_answer_eval_mode(example: dict) -> Optional[str]:
-    """Detect whether an OSWorld-format task config is a text-answer task.
+def is_mind2web_task(example: dict) -> bool:
+    """Whether an OSWorld-format task config is a Mind2Web web task.
 
-    Returns ``"gold_reference"`` / ``"llm_judge"`` or None for plain
-    OSWorld tasks (whose score comes from env.evaluate()). Detection keys:
-    the MMInA converter stamps ``_eval_mode``; mind2web / webvoyager
-    configs carry ``evaluator.func == "llm_judge_webvoyager"``.
+    Mind2Web tasks are graded by the answer-blind Online-Mind2Web grader
+    (``score_text_answer``) instead of ``env.evaluate()``. Their configs are
+    tagged either with ``_eval_mode`` (set by the dispatcher) or with
+    ``evaluator.func == "llm_judge_webvoyager"`` (set by the task converter).
+    Plain OSWorld tasks return False.
     """
     if example.get("_eval_mode"):
-        return example["_eval_mode"]
-    if (example.get("evaluator") or {}).get("func") == "llm_judge_webvoyager":
-        return "llm_judge"
-    return None
+        return True
+    return (example.get("evaluator") or {}).get("func") == "llm_judge_webvoyager"
 
 
 def collect_step_screenshots_b64(

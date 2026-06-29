@@ -169,7 +169,7 @@ def llm_judge_webvoyager(*args, **kwargs):
     happens in ``mind2web_eval.py`` (the answer-blind Online-Mind2Web
     grader) over the on-disk trajectory + screenshots — it must NEVER
     reach ``env.evaluate()``. ``run_single_example`` detects these tasks
-    via ``mind2web_eval.text_answer_eval_mode`` and routes them to the
+    via ``mind2web_eval.is_mind2web_task`` and routes them to the
     grader. The matching getters live in ``getters/__init__.py``:
     ``get_raw_intent`` + ``get_agent_final_response_and_screenshots``.
 

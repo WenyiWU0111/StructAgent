@@ -1593,11 +1593,15 @@ class StructAgent(LLMClient, ActionCompile, Actor, ActorBurstController,
                     self._current_domain = _new_dom
                     # Force the perceiver to re-probe for the new app.
                     self._doc_inspect_dirty = True
-                    # Auto-focus the new app's window so the actor never
-                    # has to switch windows through the GUI — window
-                    # juggling (dock-click / Alt+Tab) is the largest
-                    # source of multi-app churn. Best-effort.
-                    self._activate_app_for_domain(env, _new_dom)
+                    # Auto-focus the new app's window so the actor never has to
+                    # window-juggle (dock-click / Alt+Tab). ONLY on the planner's
+                    # explicit <step app=> intent ("planner step"). NOT on the
+                    # phase-board fallback: a stuck phase board would otherwise
+                    # yank focus away from the app the agent is actively typing
+                    # in (observed 6f4073b8: Calc keystrokes lost as focus
+                    # snapped back to a stuck chrome phase). Best-effort.
+                    if _switch_src == "planner step":
+                        self._activate_app_for_domain(env, _new_dom)
             except Exception as _e:
                 logger.warning(
                     "[MultiApp] domain switch check failed: %s", _e)

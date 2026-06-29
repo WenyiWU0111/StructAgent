@@ -874,7 +874,13 @@ def _emit_script(call_lines: List[str], domain: Optional[str],
     from ..uno.cli_run_uno_helpers import build_runtime_script
     code = "\n".join(list(call_lines) + ["print('PASS')"])
     try:
-        return build_runtime_script(code, domain=domain)
+        # The UNO ops library + setup MUST match the ACTION's domain (impress),
+        # NOT the active-window/__current_domain — cli_run_uno re-binds ``doc``
+        # by document service type, so window focus is irrelevant. Routing by
+        # __current_domain loaded the wrong ops lib when another app was focused
+        # (6f4073b8/eb303e01: impress_set_notes under a Writer window → the
+        # Writer ops lib has no op_impress_set_notes → every call failed).
+        return build_runtime_script(code, domain="libreoffice_impress")
     except ValueError as e:
         if logger:
             logger.warning("[impress action] build failed: %s", e)

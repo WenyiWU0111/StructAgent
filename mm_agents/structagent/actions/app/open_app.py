@@ -37,7 +37,7 @@ _APP_SPECS: Dict[str, Tuple[List[str], List[str]]] = {
     "libreoffice_calc":    (["LibreOffice Calc"],    ["soffice", "--calc"]),
     "libreoffice_impress": (["LibreOffice Impress"], ["soffice", "--impress"]),
     "vs_code":             (["Visual Studio Code"],  ["code"]),
-    "chrome":              (["Chromium", "Chrome"],  ["google-chrome"]),
+    "chrome":              (["Chromium", "Chrome"],  ["google-chrome", "--remote-debugging-port=1337"]),
     "os":                  (["Terminal"],            ["x-terminal-emulator"]),
 }
 
