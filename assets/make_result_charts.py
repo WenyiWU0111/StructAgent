@@ -31,7 +31,7 @@ OSS = "#9A84C8"
 VLAA = "#6E6685"
 FRONT_BASE = "#B4A7D2"  # frontier baselines (muted)
 
-fig = plt.figure(figsize=(16.5, 5.2))
+fig = plt.figure(figsize=(16.5, 4.5))
 gs = fig.add_gridspec(1, 2, width_ratios=[1.9, 1.5], wspace=0.28)
 axL = fig.add_subplot(gs[0, 0])
 axR = fig.add_subplot(gs[0, 1])
@@ -64,7 +64,7 @@ for gname, vals in groups:
 axL.set_xticks(xticks); axL.set_xticklabels(xlabels, fontsize=14.5, fontweight="bold")
 axL.set_ylim(YB, 74)
 axL.set_ylabel("OSWorld-Verified success rate (%)", fontsize=12.5, fontweight="bold")
-axL.set_title("Open backbones (self-run)",
+axL.set_title("Open backbones",
               fontsize=15, fontweight="bold", pad=10, loc="left", color=INK)
 for t in axL.get_yticklabels():
     t.set_fontsize(10.5); t.set_fontweight("bold")
@@ -106,7 +106,7 @@ axR.set_xticks(xr)
 axR.set_xticklabels([f[0] for f in front], fontsize=9.5, fontweight="bold",
                     color=INK, rotation=24, ha="right", rotation_mode="anchor")
 axR.set_ylim(YBR, 82)
-axR.set_title("Frontier backbones (reported)",
+axR.set_title("Frontier backbones",
               fontsize=15, fontweight="bold", pad=10, loc="left", color=INK)
 for t in axR.get_yticklabels():
     t.set_fontsize(10.5); t.set_fontweight("bold")
@@ -121,7 +121,7 @@ print("wrote assets/results_osworld.png")
 tiers = ["Wooden", "Stone", "Iron", "Golden", "Redstone"]
 ours_sr = [100.0, 70.0, 64.7, 85.7, 57.1]
 opt_sr = [98.6, 92.4, 46.7, 8.5, 25.0]
-fig2, ax2 = plt.subplots(figsize=(9.8, 3.9))
+fig2, ax2 = plt.subplots(figsize=(9.8, 3.4))
 xi = np.arange(len(tiers)); bw = 0.37
 ax2.bar(xi - bw / 2, ours_sr, bw, color=OURS, zorder=3, edgecolor=OURS_EDGE,
         linewidth=1.3, label="StructAgent (ours)")
