@@ -36,24 +36,13 @@ import openai
 logger = logging.getLogger("mm_agents.decomposer_actor")
 
 
-# Inline grounding directive — appended to the decomposer system prompt by
-# actor.py. Single source of truth; edit only here.
-INLINE_GROUNDING_INSTRUCTION = (
-    "[INLINE GROUNDING MODE]\n"
-    "For EVERY action that targets a UI element, in ADDITION to "
-    "the existing \"target\" text field you MUST include the "
-    "element's location read directly from the screenshot, as "
-    "coordinates normalized to a 0-1000 grid (top-left = 0,0; "
-    "bottom-right = 1000,1000):\n"
-    "  - click / left_double / right_single: add \"point\": [x, y]\n"
-    "  - drag: add \"start_point\": [x, y] and \"end_point\": [x, y]\n"
-    "  - scroll: add \"anchor_point\": [x, y]\n"
-    "Keep the \"target\" text field too (used for logging). Do NOT "
-    "add coordinates to non-spatial actions (type / hotkey / wait "
-    "/ navigate / cli_run / edit_json / calc_* / impress_* / "
-    "writer_* / note_write / extract_info / open_app).\n"
-    "Example: {\"action\": \"click\", \"target\": \"the Submit "
-    "button\", \"point\": [840, 560]}"
+# Per-model grounding (variants + image prep + coord conversion) lives in
+# grounding_contract. INLINE_GROUNDING_INSTRUCTION re-exported as the default.
+from mm_agents.structagent.core.actor.grounding_contract import (
+    DEFAULT_INSTRUCTION as INLINE_GROUNDING_INSTRUCTION,
+    grounding_instruction as _grounding_instruction,
+    prepare_screenshot as _prepare_screenshot,
+    point_to_pixels as _contract_point_to_pixels,
 )
 
 
@@ -513,6 +502,9 @@ def _compose_action_line(
     *,
     screen_w: int,
     screen_h: int,
+    model: Optional[str] = None,
+    sent_w: int = 0,
+    sent_h: int = 0,
 ) -> Optional[str]:
     """Translate one decomposer step into a UI-TARS action line.
 
@@ -524,7 +516,8 @@ def _compose_action_line(
 
     def _resolve(target_text: str,
                  point_val: Any) -> Optional[Tuple[int, int]]:
-        px = _point_to_pixels(point_val, screen_w, screen_h)
+        px = _contract_point_to_pixels(
+            point_val, model, sent_w, sent_h, screen_w, screen_h)
         if px is None:
             logger.warning("inline: missing/bad point %r (target %r)",
                            point_val, (target_text or "")[:60])
@@ -802,14 +795,20 @@ def call_decomposer_actor(
     (``[{"screenshot_b64": ..., "response": ...}]``).
     """
     screen_w, screen_h = int(screen_size[0]), int(screen_size[1])
-    screenshot_b64 = base64.b64encode(screenshot_bytes).decode("ascii")
+    # Per-model: Claude gets a resized image + absolute-px contract; others original.
+    _sent_bytes, _sent_w, _sent_h = _prepare_screenshot(
+        decomposer_model, screenshot_bytes)
+    screenshot_b64 = base64.b64encode(_sent_bytes).decode("ascii")
+    _system_prompt = (
+        decomposer_system_template + "\n\n"
+        + _grounding_instruction(decomposer_model, _sent_w, _sent_h))
 
     # 1) Decomposer call
     try:
         decomposer_text = _call_decomposer(
             client=decomposer_client,
             model=decomposer_model,
-            system_prompt=decomposer_system_template,
+            system_prompt=_system_prompt,
             subgoal=subgoal,
             screenshot_b64=screenshot_b64,
             user_instruction=instruction,
@@ -837,7 +836,7 @@ def call_decomposer_actor(
             decomposer_text = _call_decomposer(
                 client=decomposer_client,
                 model=decomposer_model,
-                system_prompt=decomposer_system_template,
+                system_prompt=_system_prompt,
                 subgoal=subgoal,
                 screenshot_b64=screenshot_b64,
                 user_instruction=(instruction +
@@ -937,6 +936,7 @@ def call_decomposer_actor(
     for step in steps:
         line = _compose_action_line(
             step, screen_w=screen_w, screen_h=screen_h,
+            model=decomposer_model, sent_w=_sent_w, sent_h=_sent_h,
         )
         if line:
             action_lines.append(line)

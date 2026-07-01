@@ -5,7 +5,6 @@
 # a switch you can flip from the command line, e.g.:
 #
 #   MODEL=vllm_qwen35-vl NUM_ENVS=8 bash scripts/run.sh                 # OSWorld (default split)
-#   MODEL=minimax-m3 bash scripts/run.sh                                # OpenRouter backbone, no GPU
 #   TEST_ALL_META_PATH=evaluation_examples/test_mind2web.json bash scripts/run.sh   # Mind2Web
 #   USE_FAILURE_ATTRIBUTION=0 ENABLE_DONE_AUDITOR=0 bash scripts/run.sh # ablate features
 #

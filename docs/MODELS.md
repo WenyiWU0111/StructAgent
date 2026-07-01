@@ -18,7 +18,7 @@ Aliases map to `(served_name, base_url)` in
 
 - `vllm_qwen35-vl`  → Qwen/Qwen3.5-9B  @ `localhost:8010`
 - `vllm_qwen35-27b` → Qwen/Qwen3.5-27B @ `localhost:8012`
-- `minimax-m3`, `claude-opus`, `gemini`, `gpt-4o`, … → OpenRouter (needs `OPENROUTER_API_KEY`)
+- `claude-opus`, `claude-sonnet`, `gemini`, `gpt-4o`, … → OpenRouter (needs `OPENROUTER_API_KEY`)
 
 Override any endpoint without editing code:
 ```bash
@@ -41,5 +41,7 @@ plugin/DeepGEMM/ninja). The minimal equivalent is just `vllm serve <model> --por
 
 ## Hosted (OpenRouter)
 
-No GPU required — set `OPENROUTER_API_KEY` in `.env` and run with `--model minimax-m3`
-(the paper's open-model SOTA backbone) or any other OpenRouter alias.
+Set `OPENROUTER_API_KEY` in `.env` to route any OpenRouter alias — handy for the
+Mind2Web judge or for experimenting with a hosted verifier (e.g. `--verifier_model
+claude-sonnet`). The planner/actor/grounding stack is built for the local Qwen3.5
+models; support for other backbones (e.g. the paper's MiniMax-M3) is coming soon.

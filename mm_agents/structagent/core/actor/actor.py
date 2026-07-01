@@ -65,7 +65,7 @@ class Actor:
         """Inline-grounding actor path. Returns UI-TARS Thought/Action text
         so the downstream parser sees a consistent shape."""
         from mm_agents.structagent.core.actor.decomposer_actor import (
-            call_decomposer_actor, INLINE_GROUNDING_INSTRUCTION,
+            call_decomposer_actor,
         )
 
         dec_alias = self.decomposer_model or self.model
@@ -241,10 +241,8 @@ class Actor:
                 # One-shot: clear so the next subgoal doesn't re-receive it.
                 self._pending_actor_recovery_payload = None
 
-        # Directive that makes the decomposer emit a 0-1000 ``point`` (plus
-        # start/end/anchor_point for drag/scroll) per spatial action;
-        # decomposer_actor reads these coordinates directly.
-        rendered = rendered + "\n\n" + INLINE_GROUNDING_INSTRUCTION
+        # Inline-grounding directive is appended per-model inside
+        # call_decomposer_actor (only the call site knows the resized dims).
 
         # Apply online debug runtime prompt patch (actor target)
         rendered = self._compose_system_prompt(rendered, role="actor")

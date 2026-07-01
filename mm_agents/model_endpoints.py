@@ -51,7 +51,6 @@ _REGISTRY: dict[str, Tuple[str, str]] = {
     "qwen3.7-plus":      ("qwen/qwen3.7-plus",                    _OPENROUTER),
     "kimi-k2.6":         ("moonshotai/kimi-k2.6",                 _OPENROUTER),
     "qwen3.5-397b-a17b": ("qwen/qwen3.5-397b-a17b",              _OPENROUTER),
-    "minimax-m3":        ("minimax/minimax-m3",                   _OPENROUTER),
 }
 
 

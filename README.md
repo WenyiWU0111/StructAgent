@@ -36,6 +36,22 @@ With the open **MiniMax-M3** backbone, StructAgent reaches a **new open-model st
 the art on OSWorld**; the same design transfers to **Mind2Web** web tasks. See the
 [paper](https://arxiv.org/abs/XXXX.XXXXX) for full results, ablations, and analysis.
 
+## Results snapshot
+
+<p align="center">
+  <img src="assets/results_osworld.png" width="100%" alt="OSWorld-Verified results">
+</p>
+
+On **OSWorld-Verified**, StructAgent raises open Qwen3.5 backbones by **+74% (9B)**
+and **+97% (27B)** in relative success rate over the single-model agent, and beats
+every open-source agent framework at matched settings. With the **MiniMax-M3**
+backbone it reaches **78.9%** — the best overall, above frontier single models and
+their agent frameworks. It also generalizes to open-world **Minecraft** ([below](#minecraft))
+and to **Mind2Web** web tasks. See the [paper](https://arxiv.org/abs/XXXX.XXXXX)
+for full per-domain tables and ablations.
+
+Demo video: coming soon.
+
 ## Why it's different
 
 | Raw signal | StructAgent structure |
@@ -64,6 +80,11 @@ cp .env.example .env             # then fill in keys for the models you use
 
 ## Model setup
 
+> **Models & scope.** This release implements StructAgent for **Qwen3.5-9B / 27B**
+> (the models we serve locally). The paper's state-of-the-art uses **MiniMax-M3**;
+> because its grounding and tool-calling differ from Qwen's, the MiniMax-M3
+> integration is **coming soon**.
+
 StructAgent talks to any OpenAI-compatible endpoint. Pick **one** of:
 
 **A. Local open models via vLLM** (recommended for OSWorld; reproduces the paper):
@@ -76,10 +97,11 @@ bash scripts/serve_qwen35_27b.sh
 docker compose -f scripts/docker-compose.vllm.yml up -d
 ```
 
-**B. Hosted models via OpenRouter** (no GPU needed — e.g. the paper's MiniMax-M3):
+**B. Hosted models via OpenRouter** (no GPU needed — mainly for the Mind2Web judge
+or to experiment with a hosted planner/verifier):
 ```bash
 echo "OPENROUTER_API_KEY=sk-..." >> .env
-# then run with  --model minimax-m3  (or claude-opus, gemini, gpt-4o, ...)
+# then pass e.g.  --verifier_model claude-sonnet  (or gemini, gpt-4o, ...)
 ```
 
 Model aliases and their endpoints live in [`mm_agents/model_endpoints.py`](mm_agents/model_endpoints.py);
@@ -106,10 +128,9 @@ MODEL=vllm_qwen35-vl VERIFIER_MODEL=vllm_qwen35-27b MAX_STEPS=50 \
   TEST_ALL_META_PATH=evaluation_examples/test_mind2web.json bash scripts/run.sh
 ```
 
-> Running the paper's open-model SOTA backbone? Use `MODEL=minimax-m3` (OpenRouter,
-> no GPU). The experience-memory layers are **off by default**; download the
-> prebuilt banks (`python scripts/download_memory.py`) and run with `MEMORY=on`
-> to enable them. See [`docs/CONFIG.md`](docs/CONFIG.md).
+> The experience-memory layers are **off by default**; download the prebuilt banks
+> (`python scripts/download_memory.py`) and run with `MEMORY=on` to enable them.
+> See [`docs/CONFIG.md`](docs/CONFIG.md).
 
 **4. Inspect results:**
 ```bash
@@ -149,6 +170,22 @@ from mm_agents.structagent import StructAgent
 agent = StructAgent(model="vllm_qwen35-vl", verifier_model="vllm_qwen35-27b")
 actions = agent.predict(instruction, obs)   # obs = {"screenshot": ..., "accessibility_tree": ...}
 ```
+
+## Minecraft
+
+The paper also studies StructAgent's design in an open-world **Minecraft** setting:
+the same verifier-derived State and role-separated execution carry over, with
+inventory-delta probes standing in for accessibility/file probes. This is a
+**separate, independent implementation**, maintained in its own repository:
+
+**→ [github.com/AayushSalvi/StructAgent-Minecraft](https://github.com/AayushSalvi/StructAgent-Minecraft)**
+
+<p align="center">
+  <img src="assets/results_minecraft.png" width="78%" alt="Minecraft success rate by crafting tier">
+</p>
+
+Across five crafting tiers, StructAgent is competitive with Optimus-1 and pulls
+clearly ahead on the harder **Iron / Golden / Redstone** tiers.
 
 ## Repository layout
 

@@ -15,7 +15,8 @@ MODEL=vllm_qwen35-vl VERIFIER_MODEL=vllm_qwen35-27b NUM_ENVS=8 \
   VERSION=repro bash scripts/run.sh
 ```
 Shard across machines with `TEST_ALL_META_PATH=evaluation_examples/test_nogdrive_sub{1,2,3}.json`.
-To reproduce the **open-model SOTA**, use `MODEL=minimax-m3` (needs `OPENROUTER_API_KEY`).
+The released runner reproduces the **Qwen3.5-9B / 27B** results (`MODEL=vllm_qwen35-vl`
+/ `vllm_qwen35-27b`); the paper's MiniMax-M3 SOTA backbone is coming soon.
 All paper capabilities are on by default; see [`CONFIG.md`](CONFIG.md) to ablate.
 
 ## 3. Mind2Web (answer-blind Online-Mind2Web judge)
