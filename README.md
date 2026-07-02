@@ -50,7 +50,12 @@ their agent frameworks. It also generalizes to open-world **Minecraft** ([below]
 and to **Mind2Web** web tasks. See the [paper](https://arxiv.org/abs/XXXX.XXXXX)
 for full per-domain tables and ablations.
 
-Demo video: coming soon.
+<p align="center">
+  <a href="https://huggingface.co/datasets/WenyiWU0111/structagent-page-assets/resolve/main/aether_demo.mp4">
+    <img src="assets/demo_poster.png" width="70%" alt="Watch the demo">
+  </a><br>
+  <i>▶ Full demo — Aether AI's architecture &amp; current projects (click to play, with sound)</i>
+</p>
 
 ## Why it's different
 
