@@ -19,7 +19,7 @@ import os
 import sys
 import tarfile
 
-DEFAULT_REPO = os.environ.get("STRUCTAGENT_MEMORY_REPO", "your-org/structagent-memory")
+DEFAULT_REPO = os.environ.get("STRUCTAGENT_MEMORY_REPO", "WenyiWU0111/structagent-memory")
 TARBALL = "structagent_memory.tar.gz"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

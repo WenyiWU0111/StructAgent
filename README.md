@@ -67,7 +67,7 @@ Demo video: coming soon.
 ## Installation
 
 ```bash
-git clone https://github.com/your-org/StructAgent.git
+git clone https://github.com/WenyiWU0111/StructAgent.git
 cd StructAgent
 
 conda create -n structagent python=3.10 -y
