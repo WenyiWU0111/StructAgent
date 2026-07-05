@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
-  <a href="https://arxiv.org/abs/XXXX.XXXXX"><img src="https://img.shields.io/badge/paper-arXiv-b31b1b.svg" alt="Paper"></a>
+  <a href="StructAgent_paper.pdf"><img src="https://img.shields.io/badge/paper-PDF-b31b1b.svg" alt="Paper"></a>
   <img src="https://img.shields.io/badge/python-%E2%89%A53.10-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/benchmarks-OSWorld%20%7C%20Mind2Web-7C3AED.svg" alt="Benchmarks">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs welcome">
@@ -34,7 +34,7 @@ between a **planner**, an **actor**, and a **verifier**:
 
 With the open **MiniMax-M3** backbone, StructAgent reaches a **new open-model state of
 the art on OSWorld**; the same design transfers to **Mind2Web** web tasks. See the
-[paper](https://arxiv.org/abs/XXXX.XXXXX) for full results, ablations, and analysis.
+[paper](StructAgent_paper.pdf) for full results, ablations, and analysis.
 
 ## Results snapshot
 
@@ -47,7 +47,7 @@ and **+97% (27B)** in relative success rate over the single-model agent, and bea
 every open-source agent framework at matched settings. With the **MiniMax-M3**
 backbone it reaches **78.9%** — the best overall, above frontier single models and
 their agent frameworks. It also generalizes to open-world **Minecraft** ([below](#minecraft))
-and to **Mind2Web** web tasks. See the [paper](https://arxiv.org/abs/XXXX.XXXXX)
+and to **Mind2Web** web tasks. See the [paper](StructAgent_paper.pdf)
 for full per-domain tables and ablations.
 
 <p align="center">
