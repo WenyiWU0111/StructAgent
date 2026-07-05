@@ -8,6 +8,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
   <a href="StructAgent_paper.pdf"><img src="https://img.shields.io/badge/paper-PDF-b31b1b.svg" alt="Paper"></a>
+  <a href="https://wenyiwu0111.github.io/structagent-page/"><img src="https://img.shields.io/badge/project-page-7C3AED.svg" alt="Project Page"></a>
   <img src="https://img.shields.io/badge/python-%E2%89%A53.10-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/benchmarks-OSWorld%20%7C%20Mind2Web-7C3AED.svg" alt="Benchmarks">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs welcome">
