@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
-  <a href="StructAgent_paper.pdf"><img src="https://img.shields.io/badge/paper-PDF-b31b1b.svg" alt="Paper"></a>
+  <a href="https://arxiv.org/abs/2607.11388"><img src="https://img.shields.io/badge/arXiv-2607.11388-b31b1b.svg" alt="Paper"></a>
   <a href="https://wenyiwu0111.github.io/structagent-page/"><img src="https://img.shields.io/badge/project-page-7C3AED.svg" alt="Project Page"></a>
   <img src="https://img.shields.io/badge/python-%E2%89%A53.10-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/benchmarks-OSWorld%20%7C%20Mind2Web-7C3AED.svg" alt="Benchmarks">
@@ -35,7 +35,7 @@ between a **planner**, an **actor**, and a **verifier**:
 
 With the open **MiniMax-M3** backbone, StructAgent reaches a **new open-model state of
 the art on OSWorld**; the same design transfers to **Mind2Web** web tasks. See the
-[paper](StructAgent_paper.pdf) for full results, ablations, and analysis.
+[paper](https://arxiv.org/abs/2607.11388) for full results, ablations, and analysis.
 
 ## Results snapshot
 
@@ -48,7 +48,7 @@ and **+97% (27B)** in relative success rate over the single-model agent, and bea
 every open-source agent framework at matched settings. With the **MiniMax-M3**
 backbone it reaches **78.9%** — the best overall, above frontier single models and
 their agent frameworks. It also generalizes to open-world **Minecraft** ([below](#minecraft))
-and to **Mind2Web** web tasks. See the [paper](StructAgent_paper.pdf)
+and to **Mind2Web** web tasks. See the [paper](https://arxiv.org/abs/2607.11388)
 for full per-domain tables and ablations.
 
 <p align="center">
@@ -211,9 +211,9 @@ StructAgent/
 
 ```bibtex
 @article{wu2026structagent,
-  title   = {StructAgent: Towards a Controllable Causal System for Long-horizon Computer-Use Agents},
+  title   = {StructAgent: Harness Long-horizon Digital Agents with Unified Causal Structure},
   author  = {Wu, Wenyi and Zhu, Sibo and Zhou, Kun and Salvi, Aayush and Song, Zixuan and Huang, Biwei},
-  journal = {arXiv preprint arXiv:XXXX.XXXXX},
+  journal = {arXiv preprint arXiv:2607.11388},
   year    = {2026}
 }
 ```
